@@ -20,12 +20,22 @@ mkdir -p $NANOCHAT_BASE_DIR
 
 # install uv (if not already installed)
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# add uv to PATH (the installer puts it in ~/.local/bin)
+export PATH="$HOME/.local/bin:$PATH"
 # create a .venv local virtual environment (if it doesn't exist)
 [ -d ".venv" ] || uv venv
 # install the repo dependencies
 uv sync --extra gpu
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
+
+# -----------------------------------------------------------------------------
+# System dependencies (Python dev headers needed for Triton/torch compilation)
+
+if ! dpkg -s python3-dev &> /dev/null; then
+    echo "Installing python3-dev (required for Python.h)..."
+    sudo apt-get update && sudo apt-get install -y python3-dev
+fi
 
 # -----------------------------------------------------------------------------
 # wandb setup
