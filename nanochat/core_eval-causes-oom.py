@@ -232,47 +232,30 @@ def evaluate_task(model, tokenizer, data, device, task_meta, batch_size=64):
         example_info.append((global_idx, item.get('gold', None), len(tokens), seq_offset))
 
     # ---- Phase 2: Forward all sequences through the model in batches ----
-    # Sort sequences by length so similar-length sequences are batched together,
-    # minimizing padding waste. Also dynamically cap batch sizes: the padded token
-    # count (B * max_T) in each batch must stay under a budget to avoid OOM on the
-    # logits tensor (B * T * vocab_size).
-    pad_token_id = tokenizer.get_bos_token_id()
+    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
     seq_results = [None] * len(sequences)
-    sorted_order = sorted(range(len(sequences)), key=lambda i: len(sequences[i][0]))
-    max_bt = batch_size * 512  # B*T token budget (controls peak GPU memory)
 
-    # Greedily build batches that respect both the sequence count and token budget
-    batches = []
-    cur_batch, cur_max_len = [], 0
-    for idx in sorted_order:
-        seq_len = len(sequences[idx][0])
-        new_max_len = max(cur_max_len, seq_len)
-        if cur_batch and ((len(cur_batch) + 1) * new_max_len > max_bt or len(cur_batch) >= batch_size):
-            batches.append(cur_batch)
-            cur_batch, cur_max_len = [idx], seq_len
-        else:
-            cur_batch.append(idx)
-            cur_max_len = new_max_len
-    if cur_batch:
-        batches.append(cur_batch)
-
-    for batch_indices in batches:
-        tokens_list = [sequences[idx][0] for idx in batch_indices]
+    for i in range(0, max(len(sequences), 1), batch_size):
+        batch = sequences[i:i + batch_size]
+        if not batch:
+            break
+        tokens_list = [s[0] for s in batch]
         input_ids = stack_sequences(tokens_list, pad_token_id).to(device)
         # Forward the model, get the autoregressive loss and argmax prediction at each token
         losses, predictions = forward_model(model, input_ids)
 
-        # See if the losses/predictions come out correctly
-        for j, idx in enumerate(batch_indices):
-            _, si, ei = sequences[idx]
+         # See if the losses/predictions come out correctly
+        for j, (_, si, ei) in enumerate(batch):
             if task_type == 'language_modeling':
                 # predictions[i] predict input_ids[i+1] autoregressively
                 predicted = predictions[j, si-1:ei-1]
                 actual = input_ids[j, si:ei]
-                seq_results[idx] = torch.all(predicted == actual).item()
+                seq_results[i + j] = torch.all(predicted == actual).item()
             else:  # multiple_choice or schema
                 # For MC/schema: find the option with lowest average loss
-                seq_results[idx] = losses[j, si-1:ei-1].mean().item()
+                seq_results[i + j] = losses[j, si-1:ei-1].mean().item()
+            else:
+                raise ValueError(f"Unsupported task type: {task_type}")
 
     # ---- Phase 3: Aggregate per-example correctness ----
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)

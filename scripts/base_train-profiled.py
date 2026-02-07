@@ -11,6 +11,18 @@ If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Ex
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
+# =================================================
+# Small helper for timestamping.
+from zoneinfo import ZoneInfo
+import datetime as dt
+
+def get_timestamp(timezone_str: str = "America/Los_Angeles") -> str:
+    tz = ZoneInfo(timezone_str)
+    now = dt.datetime.now(tz)
+    return now.strftime("%Y-%m-%d_%H%M%S")
+
+# =================================================
+
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
@@ -23,6 +35,7 @@ from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -80,12 +93,41 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# =================================================
+# Set up logging directories based on run name (RUN_ID set after compute_init for sync)
+RUN_NAME = args.run
+LOG_DIR = f"logs/{RUN_NAME}-profiled"
+# =================================================
+
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+
+# =================================================
+# Generate RUN_ID on rank 0 and broadcast to all ranks for consistent trace filenames
+import torch.distributed as dist
+if master_process:
+    RUN_ID = f"{get_timestamp()} - {RUN_NAME}"
+else:
+    RUN_ID = None
+if ddp:
+    # Broadcast RUN_ID from rank 0 to all other ranks
+    if master_process:
+        run_id_list = [RUN_ID]
+    else:
+        run_id_list = [None]
+    dist.broadcast_object_list(run_id_list, src=0)
+    RUN_ID = run_id_list[0]
+else:
+    RUN_ID = f"{get_timestamp()} - {RUN_NAME}"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(f"{LOG_DIR}/traces", exist_ok=True)
+# =================================================
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -96,12 +138,14 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
+# =================================================
+# Profiler setup
+trace_filename = f"{LOG_DIR}/traces/{RUN_ID} - Rank {ddp_rank:2d}.json.gz"
+# =================================================
+
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
-
-# Will be populated after model is initialized and used to update wandb config
-training_setup_stats = {}
 
 # Flash Attention status
 if HAS_FA3:
@@ -240,11 +284,9 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
-# Determine the optimization horizon based on the model size
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
-# Get the parameter counts of the model
+# Get the parameter counts of our model
 param_counts = model.num_scaling_params()
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
@@ -253,23 +295,80 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# Scaling params: transformer matrices + lm_head (gives cleanest scaling laws, see dev/LOG.md Jan 27, 2026)
-get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['lm_head']
+# 1) Use scaling laws to determine the optimal training horizon in tokens
+# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
+# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+def get_scaling_params(m):
+    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
+    params_counts = m.num_scaling_params()
+    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params)
+target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
-# Auto-compute optimal batch size based on Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-total_batch_size = args.total_batch_size
+# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
+d12_ref = build_model_meta(12) # creates the model on meta device
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
+B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+
+# 2) Now that we have the token horizon, we can calculate the optimal batch size
+# We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
+# The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
+total_batch_size = args.total_batch_size # user-provided override is possible
 if total_batch_size == -1:
-    d12_ref = build_model_meta(12) # d12 is where the optimal batch size was measured to be 2**19 tokens
-    d12_num_scaling_params = get_scaling_params(d12_ref)
-    D_REF = args.target_param_data_ratio * d12_num_scaling_params
-    B_REF = 2**19
     batch_size_ratio = target_tokens / D_REF
-    total_batch_size = 2 ** round(math.log2(B_REF * batch_size_ratio ** 0.383)) # also clamp to power of 2
+    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
+    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-# Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
+# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
+batch_lr_scale = 1.0
+batch_ratio = total_batch_size / B_REF # B/B_ref
+if batch_ratio != 1.0:
+    # SGD: linear scaling with batch size is standard (not used in nanochat)
+    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
+    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
+    batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
+    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+
+# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
+# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
+# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
+# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
+# λ = λ_ref · √(B/B_ref) · (D_ref/D)
+# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+if weight_decay_scaled != args.weight_decay:
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+optimizer = model.setup_optimizer(
+    # AdamW hyperparameters
+    unembedding_lr=args.unembedding_lr * batch_lr_scale,
+    embedding_lr=args.embedding_lr * batch_lr_scale,
+    scalar_lr=args.scalar_lr * batch_lr_scale,
+    adam_betas=(args.adam_beta1, args.adam_beta2),
+    # Muon hyperparameters
+    matrix_lr=args.matrix_lr * batch_lr_scale,
+    weight_decay=weight_decay_scaled,
+)
+
+if resuming:
+    optimizer.load_state_dict(optimizer_data)
+    del optimizer_data
+
+# -----------------------------------------------------------------------------
+# Initialize the DataLoaders for train/val
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# -----------------------------------------------------------------------------
+# Calculate the number of iterations we will train for and set up the various schedulers
+
+# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
     # Override num_iterations to a specific value if given
@@ -285,82 +384,12 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations
+total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # Chinchilla is ~20
+print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# -----------------------------------------------------------------------------
-# Optimizer / data / training length related hyperparameters
-# figure out the needed gradient accumulation to reach the desired total batch size
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
-# Batch size scaling for learning rates (hyperparameters were tuned at reference batch size 2^19)
-batch_lr_scale = 1.0
-reference_batch_size = 2**19
-batch_ratio = total_batch_size / reference_batch_size
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard
-    # Muon: sqrt scaling is an assumption - not fully studied, but it's a second-order-ish optimizer
-    batch_lr_scale = batch_ratio ** 0.5
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {reference_batch_size:,})")
-
-# Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
-weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
-if args.depth != 12:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-
-# Populate training setup stats for wandb config
-training_setup_stats = {
-    "Number of parameters": num_params,
-    "Number of FLOPs per token": f"{num_flops_per_token:e}",
-    "Calculated number of iterations": num_iterations,
-    "Number of training tokens": total_tokens,
-    "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
-    "DDP world size": ddp_world_size,
-    "warmup_ratio": args.warmup_ratio,
-    "warmdown_ratio": args.warmdown_ratio,
-    "final_lr_frac": args.final_lr_frac,
-}
-
-# Update wandb config with training setup stats
-if not use_dummy_wandb:
-    wandb_run.config.update(training_setup_stats)
-
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-adam_betas = (args.adam_beta1, args.adam_beta2)
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    adam_betas=adam_betas,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-)
-
-if resuming:
-    optimizer.load_state_dict(optimizer_data)
-    del optimizer_data
-
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
-
-# -----------------------------------------------------------------------------
-# Set up hyperparameter schedulers
-
-# Learning rate scheduler
+# Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
@@ -372,19 +401,20 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer
+# Momentum scheduler for Muon optimizer (warms up to 0.95 over the first 300 steps)
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
-# Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
+# Weight decay scheduler for Muon optimizer (linearly decays to zero over the course of training)
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
 # -----------------------------------------------------------------------------
-# Loop state (variables updated by the training loop)
+# Training loop
 
+# Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
@@ -399,13 +429,48 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-# -----------------------------------------------------------------------------
+# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+assert total_batch_size % world_tokens_per_fwdbwd == 0
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# =============================================================================
+# Profiling setup
+print0(f"Chrome trace will be saved to: {trace_filename}")
+
+# Set up profiler activities
+activities = [ProfilerActivity.CPU]
+if device_type == "cuda":
+    activities.append(ProfilerActivity.CUDA)
+
+# Create profiler with schedule
+profiler = profile(
+    activities=activities,
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=False,
+    schedule=torch.profiler.schedule(wait=5, warmup=5, active=4, repeat=1),
+)
+
 # Training loop
-while True:
+profiled_steps = 0
+
+# Start profiler context
+profiler.__enter__()
+   
+for _ in range(14):
+# =============================================================================
+
+# Go!
+# while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
@@ -518,6 +583,11 @@ while True:
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
+    # =========================================================================
+    # Advance profiler schedule
+    profiler.step()
+    # =========================================================================
+
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
@@ -567,60 +637,64 @@ while True:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
 
+# ============================================================================
+# Export the chrome trace
+
+# Export chrome trace when done
+# if master_process:
+#     print0(f"Exporting chrome trace to: {trace_filename}")
+#     profiler.__exit__(None, None, None)  # Stop the profiler
+#     profiler.export_chrome_trace(trace_filename)
+#     print0(f"Chrome trace saved successfully to: {trace_filename}")
+
+# To save on all ranks:
+print(f"Exporting chrome trace to: {trace_filename}")
+profiler.__exit__(None, None, None)  # Stop the profiler
+profiler.export_chrome_trace(trace_filename)
+print(f"Chrome trace saved successfully to: {trace_filename}")
+
+# Zip up the trace files from all ranks (only master process, after barrier)
+import zipfile
+if ddp:
+    dist.barrier()  # Wait for all ranks to finish writing their traces
+if master_process:
+    zip_filename = f"{LOG_DIR}/traces/{RUN_ID}.zip"
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for rank in range(ddp_world_size):
+            trace_path = f"{LOG_DIR}/traces/{RUN_ID} - Rank {rank:2d}.json.gz"
+            if os.path.exists(trace_path):
+                zipf.write(trace_path, f"rank_{rank:02d}.json.gz")
+            else:
+                print(f"Warning: trace file not found: {trace_path}")
+    print(f"Zip file saved successfully to: {zip_filename}")
+
+# ============================================================================
+
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
-# Run final CORE evaluation on the trained model (full evaluation, not limited)
-print0("\n" + "="*80)
-print0("Running final CORE evaluation on trained model")
-print0("="*80)
-core_eval_start_time = time.time()
-model.eval()
-with disable_fp8(orig_model), autocast_ctx:
-    final_core_results = evaluate_core(orig_model, tokenizer, device, max_per_task=-1)
-core_eval_time = time.time() - core_eval_start_time
-print0(f"Final CORE metric: {final_core_results['core_metric']:.4f}")
-print0(f"CORE evaluation time: {core_eval_time:.2f}s ({core_eval_time/60:.2f}m)")
-
-# Prepare training outcomes for logging
-training_outcomes = {
-    "final/min_val_bpb": min_val_bpb if val_bpb is not None else None,
-    "final/val_bpb": val_bpb,
-    "final/core_metric": final_core_results["core_metric"],
-    "final/mfu_percent": mfu,
-    "final/total_training_flops": flops_so_far,
-    "final/total_training_time_minutes": total_training_time / 60,
-    "final/peak_memory_mib": get_max_memory() / 1024 / 1024,
-    "final/core_eval_time_seconds": core_eval_time,
-}
-
-# Log training outcomes to wandb as final metrics
-if not use_dummy_wandb:
-    wandb_run.log(training_outcomes)
-    # Also log the detailed CORE results
-    wandb_run.log({"final/core_centered_results": final_core_results["centered_results"]})
-    
-    # Log detailed per-task CORE results with "core/" prefix
-    core_detailed_metrics = {}
-    for task_label in final_core_results["results"]:
-        core_detailed_metrics[f"core/{task_label}/accuracy"] = final_core_results["results"][task_label]
-        core_detailed_metrics[f"core/{task_label}/centered_accuracy"] = final_core_results["centered_results"][task_label]
-        core_detailed_metrics[f"core/{task_label}/time_seconds"] = final_core_results["task_times"][task_label]
-    wandb_run.log(core_detailed_metrics)
-
 # Log to report
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
     user_config, # CLI args
-    training_setup_stats, # stats about the training setup
+    { # stats about the training setup
+        "Number of parameters": num_params,
+        "Number of FLOPs per token": f"{num_flops_per_token:e}",
+        "Calculated number of iterations": num_iterations,
+        "Number of training tokens": total_tokens,
+        "Tokens : Scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
+        "DDP world size": ddp_world_size,
+        "warmup_ratio": args.warmup_ratio,
+        "warmdown_ratio": args.warmdown_ratio,
+        "final_lr_frac": args.final_lr_frac,
+    },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
         "Final validation bpb": val_bpb,
-        "CORE metric": final_core_results["core_metric"],
-        "CORE eval time": f"{core_eval_time:.2f}s",
+        "CORE metric estimate": results.get("core_metric", None),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",

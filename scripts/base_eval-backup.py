@@ -226,10 +226,6 @@ def main():
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
 
-    # Compile the model for faster inference (dynamic=True handles varying sequence lengths)
-    if device_type == "cuda":
-        model = torch.compile(model, dynamic=True)
-
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
 
