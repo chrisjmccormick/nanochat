@@ -165,95 +165,127 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
-    """Evaluate a single example, return True if correct, False otherwise"""
-    item = data[idx]
+def evaluate_task(model, tokenizer, data, device, task_meta, batch_size=64):
+    """
+    Evaluate one task across many examples with batched forward passes.
+    Handles dispatch to all processes if the script is run with torchrun.
+    """
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
     continuation_delimiter = task_meta['continuation_delimiter']
-
-    # Sample few-shot examples (excluding current item)
-    fewshot_examples = []
-    if num_fewshot > 0:
-        rng = random.Random(1234 + idx)
-        available_indices = [i for i in range(len(data)) if i != idx]
-        fewshot_indices = rng.sample(available_indices, num_fewshot)
-        fewshot_examples = [data[i] for i in fewshot_indices]
-
-    # Render prompts and batch sequences based on task type
-    if task_type == 'multiple_choice':
-        prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
-        tokens, start_idxs, end_idxs = batch_sequences_mc(tokenizer, prompts)
-    elif task_type == 'schema':
-        prompts = render_prompts_schema(item, continuation_delimiter, fewshot_examples)
-        tokens, start_idxs, end_idxs = batch_sequences_schema(tokenizer, prompts)
-    elif task_type == 'language_modeling':
-        prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
-        tokens, start_idxs, end_idxs = batch_sequences_lm(tokenizer, prompts)
-    else:
-        raise ValueError(f"Unsupported task type: {task_type}")
-
-    # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
-    # In these cases, we have to truncate sequences to max length and adjust the indices
-    if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-        max_tokens = model.max_seq_len
-        new_tokens, new_start_idxs, new_end_idxs = [], [], []
-        for t, s, e in zip(tokens, start_idxs, end_idxs):
-            if len(t) > max_tokens:
-                num_to_crop = len(t) - max_tokens
-                new_tokens.append(t[-max_tokens:]) # take the last max_tokens tokens
-                new_start_idxs.append(s - num_to_crop) # shift the indices down
-                new_end_idxs.append(e - num_to_crop)
-                assert s - num_to_crop >= 0, "this should never happen right?"
-                assert e - num_to_crop >= 0, "this should never happen right?"
-            else:
-                new_tokens.append(t) # keep unchanged
-                new_start_idxs.append(s)
-                new_end_idxs.append(e)
-        tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
-
-    # Stack up all the sequences into a batch
-    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
-    input_ids = stack_sequences(tokens, pad_token_id)
-    input_ids = input_ids.to(device)
-
-    # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
-
-    # See if the losses/predictions come out correctly
-    if task_type == 'language_modeling':
-        # language modeling task is currently always batch size 1
-        si = start_idxs[0]
-        ei = end_idxs[0]
-        # predictions[i] predict input_ids[i+1] autoregressively
-        predicted_tokens = predictions[0, si-1:ei-1]
-        actual_tokens = input_ids[0, si:ei]
-        is_correct = torch.all(predicted_tokens == actual_tokens).item()
-    elif task_type in ['multiple_choice', 'schema']:
-        # For MC/schema: find the option with lowest average loss
-        mean_losses = [losses[i, si-1:ei-1].mean().item()
-                        for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
-        pred_idx = mean_losses.index(min(mean_losses))
-        is_correct = pred_idx == item['gold']
-    else:
-        raise ValueError(f"Unsupported task type: {task_type}")
-
-    return is_correct
-
-
-def evaluate_task(model, tokenizer, data, device, task_meta):
-    """
-    This function is responsible for evaluating one task across many examples.
-    It also handles dispatch to all processes if the script is run with torchrun.
-    """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    max_seq_len = getattr(model, 'max_seq_len', None)
+
+    # ---- Phase 1: Pre-process all examples assigned to this rank ----
+    # Build a flat list of sequences to forward and metadata to map them back to examples
+    sequences = []   # (tokens, start_idx, end_idx) per sequence
+    example_info = [] # (global_idx, gold, num_seqs, seq_offset) per example
+    my_indices = list(range(rank, len(data), world_size))
+
+    for global_idx in my_indices:
+        item = data[global_idx]
+
+        # Sample few-shot examples (excluding current item)
+        fewshot_examples = []
+        if num_fewshot > 0:
+            rng = random.Random(1234 + global_idx)
+            available_indices = [i for i in range(len(data)) if i != global_idx]
+            fewshot_indices = rng.sample(available_indices, num_fewshot)
+            fewshot_examples = [data[i] for i in fewshot_indices]
+
+        # Render prompts and tokenize based on task type
+        if task_type == 'multiple_choice':
+            prompts = render_prompts_mc(item, continuation_delimiter, fewshot_examples)
+            tokens, start_idxs, end_idxs = batch_sequences_mc(tokenizer, prompts)
+        elif task_type == 'schema':
+            prompts = render_prompts_schema(item, continuation_delimiter, fewshot_examples)
+            tokens, start_idxs, end_idxs = batch_sequences_schema(tokenizer, prompts)
+        elif task_type == 'language_modeling':
+            prompts = render_prompts_lm(item, continuation_delimiter, fewshot_examples)
+            tokens, start_idxs, end_idxs = batch_sequences_lm(tokenizer, prompts)
+        else:
+            raise ValueError(f"Unsupported task type: {task_type}")
+
+        # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
+        # In these cases, we have to truncate sequences to max length and adjust the indices
+        if max_seq_len is not None:
+            new_tokens, new_start_idxs, new_end_idxs = [], [], []
+            for t, s, e in zip(tokens, start_idxs, end_idxs):
+                if len(t) > max_seq_len:
+                    crop = len(t) - max_seq_len
+                    new_tokens.append(t[-max_seq_len:])  # take the last max_tokens tokens
+                    new_start_idxs.append(s - crop) # shift the indices down
+                    new_end_idxs.append(e - crop)
+                    assert s - crop >= 0, "this should never happen right?"
+                    assert e - crop >= 0, "this should never happen right?"
+                else:
+                    new_tokens.append(t)
+                    new_start_idxs.append(s)
+                    new_end_idxs.append(e)
+            tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
+
+        # Record this example's sequences
+        seq_offset = len(sequences)
+        for t, si, ei in zip(tokens, start_idxs, end_idxs):
+            sequences.append((t, si, ei))
+        example_info.append((global_idx, item.get('gold', None), len(tokens), seq_offset))
+
+    # ---- Phase 2: Forward all sequences through the model in batches ----
+    # Sort sequences by length so similar-length sequences are batched together,
+    # minimizing padding waste. Also dynamically cap batch sizes: the padded token
+    # count (B * max_T) in each batch must stay under a budget to avoid OOM on the
+    # logits tensor (B * T * vocab_size).
+    pad_token_id = tokenizer.get_bos_token_id()
+    seq_results = [None] * len(sequences)
+    sorted_order = sorted(range(len(sequences)), key=lambda i: len(sequences[i][0]))
+    max_bt = batch_size * 512  # B*T token budget (controls peak GPU memory)
+
+    # Greedily build batches that respect both the sequence count and token budget
+    batches = []
+    cur_batch, cur_max_len = [], 0
+    for idx in sorted_order:
+        seq_len = len(sequences[idx][0])
+        new_max_len = max(cur_max_len, seq_len)
+        if cur_batch and ((len(cur_batch) + 1) * new_max_len > max_bt or len(cur_batch) >= batch_size):
+            batches.append(cur_batch)
+            cur_batch, cur_max_len = [idx], seq_len
+        else:
+            cur_batch.append(idx)
+            cur_max_len = new_max_len
+    if cur_batch:
+        batches.append(cur_batch)
+
+    for batch_indices in batches:
+        tokens_list = [sequences[idx][0] for idx in batch_indices]
+        input_ids = stack_sequences(tokens_list, pad_token_id).to(device)
+        # Forward the model, get the autoregressive loss and argmax prediction at each token
+        losses, predictions = forward_model(model, input_ids)
+
+        # See if the losses/predictions come out correctly
+        for j, idx in enumerate(batch_indices):
+            _, si, ei = sequences[idx]
+            if task_type == 'language_modeling':
+                # predictions[i] predict input_ids[i+1] autoregressively
+                predicted = predictions[j, si-1:ei-1]
+                actual = input_ids[j, si:ei]
+                seq_results[idx] = torch.all(predicted == actual).item()
+            else:  # multiple_choice or schema
+                # For MC/schema: find the option with lowest average loss
+                seq_results[idx] = losses[j, si-1:ei-1].mean().item()
+
+    # ---- Phase 3: Aggregate per-example correctness ----
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-    # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
-        correct[idx] = float(is_correct)
-    # sync results across all the processes if running distributed
+    for global_idx, gold, num_seqs, offset in example_info:
+        if task_type == 'language_modeling':
+            is_correct = seq_results[offset]
+        else:
+            choice_losses = [seq_results[offset + c] for c in range(num_seqs)]
+            pred_idx = choice_losses.index(min(choice_losses))
+            is_correct = (pred_idx == gold)
+        correct[global_idx] = float(is_correct)
+
+    # ---- Phase 4: Sync results across ranks if distributed ----
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)

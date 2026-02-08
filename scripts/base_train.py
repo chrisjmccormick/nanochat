@@ -33,6 +33,8 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+from nanochat.core_eval_optim import evaluate_task as evaluate_task_optim
+from nanochat.core_eval_varlen import evaluate_task as evaluate_task_varlen
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -99,6 +101,9 @@ else:
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if not use_dummy_wandb:
+    wandb.define_metric("step")
+    wandb.define_metric("*", step_metric="step")
 
 # Will be populated after model is initialized and used to update wandb config
 training_setup_stats = {}
@@ -400,6 +405,32 @@ else:
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
+# GC event monitoring — track time spent in garbage collection per rank
+gc_total_time = 0.0          # accumulated GC wall-clock time (seconds)
+gc_event_count = 0           # number of GC collections observed
+gc_tracking_enabled = False  # only start recording after the first step completes
+
+def _gc_callback(phase, info):
+    """gc.callbacks hook: measure wall-clock time of every GC collection."""
+    global gc_total_time, gc_event_count
+    if not gc_tracking_enabled:
+        return
+    if phase == "start":
+        _gc_callback._t0 = time.perf_counter()
+    elif phase == "stop":
+        t0 = getattr(_gc_callback, "_t0", None)
+        if t0 is not None:
+            elapsed = time.perf_counter() - t0
+            gc_total_time += elapsed
+            gc_event_count += 1
+            print(f"[rank {ddp_rank}] GC event #{gc_event_count}: gen {info['generation']}, "
+                  f"collected {info['collected']} objects in {elapsed*1000:.2f}ms "
+                  f"(cumulative gc: {gc_total_time*1000:.2f}ms)")
+            _gc_callback._t0 = None
+
+gc.callbacks.append(_gc_callback)
+
+# -----------------------------------------------------------------------------
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -564,8 +595,39 @@ while True:
         gc.collect() # manually collect a lot of garbage from setup
         gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
         gc.disable() # nuclear intervention here: disable GC entirely except:
+        gc_tracking_enabled = True  # start recording GC events from now on
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
+
+# -----------------------------------------------------------------------------
+# GC stats: gather per-rank totals and log to wandb
+gc.callbacks.remove(_gc_callback)
+print(f"[rank {ddp_rank}] GC summary: {gc_total_time*1000:.2f}ms across {gc_event_count} events")
+gc_metrics = {}
+if ddp:
+    import torch.distributed as dist
+    gc_time_tensor = torch.tensor([gc_total_time], dtype=torch.float64, device=device)
+    gc_count_tensor = torch.tensor([gc_event_count], dtype=torch.long, device=device)
+    gc_all_times = [torch.zeros(1, dtype=torch.float64, device=device) for _ in range(ddp_world_size)]
+    gc_all_counts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(ddp_world_size)]
+    dist.all_gather(gc_all_times, gc_time_tensor)
+    dist.all_gather(gc_all_counts, gc_count_tensor)
+    if master_process:
+        print0("--- GC Statistics (per rank) ---")
+        for r in range(ddp_world_size):
+            t_ms = gc_all_times[r].item() * 1000
+            cnt = int(gc_all_counts[r].item())
+            print0(f"  rank {r}: {t_ms:.2f}ms across {cnt} GC events")
+            gc_metrics[f"gc/rank{r}_total_time_ms"] = t_ms
+            gc_metrics[f"gc/rank{r}_event_count"] = cnt
+        gc_metrics["gc/max_rank_time_ms"] = max(t.item() for t in gc_all_times) * 1000
+        gc_metrics["gc/total_time_ms"] = sum(t.item() for t in gc_all_times) * 1000
+else:
+    gc_metrics["gc/rank0_total_time_ms"] = gc_total_time * 1000
+    gc_metrics["gc/rank0_event_count"] = gc_event_count
+    gc_metrics["gc/max_rank_time_ms"] = gc_total_time * 1000
+    gc_metrics["gc/total_time_ms"] = gc_total_time * 1000
+wandb_run.log(gc_metrics)
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -584,6 +646,75 @@ with disable_fp8(orig_model), autocast_ctx:
 core_eval_time = time.time() - core_eval_start_time
 print0(f"Final CORE metric: {final_core_results['core_metric']:.4f}")
 print0(f"CORE evaluation time: {core_eval_time:.2f}s ({core_eval_time/60:.2f}m)")
+
+# Run optimized CORE evaluation for A/B comparison (not logged to wandb)
+print0("\n" + "="*80)
+print0("Running optimized CORE evaluation (A/B comparison)")
+print0("="*80)
+optim_eval_start_time = time.time()
+with disable_fp8(orig_model), autocast_ctx:
+    optim_core_results = evaluate_core(orig_model, tokenizer, device, max_per_task=-1,
+                                       evaluate_task_fn=evaluate_task_optim)
+optim_eval_time = time.time() - optim_eval_start_time
+print0(f"Optimized CORE metric: {optim_core_results['core_metric']:.4f}")
+print0(f"Optimized CORE evaluation time: {optim_eval_time:.2f}s ({optim_eval_time/60:.2f}m)")
+print0(f"Speedup: {core_eval_time / optim_eval_time:.2f}x")
+print0(f"Accuracy delta (optim - baseline): {optim_core_results['core_metric'] - final_core_results['core_metric']:.6f}")
+
+# Run varlen CORE evaluation with static torch.compile (not logged to wandb)
+print0("\n" + "="*80)
+print0("Running varlen CORE evaluation (compiled, static shapes)")
+print0("="*80)
+# Compile with static shapes: varlen eval uses a fixed token budget so every forward
+# call sees the same (1, budget) shape -- no dynamic=True needed, no recompilation
+compiled_model = torch.compile(orig_model)
+varlen_eval_start_time = time.time()
+with disable_fp8(orig_model), autocast_ctx:
+    varlen_core_results = evaluate_core(compiled_model, tokenizer, device, max_per_task=-1,
+                                        evaluate_task_fn=evaluate_task_varlen)
+varlen_eval_time = time.time() - varlen_eval_start_time
+print0(f"Varlen CORE metric: {varlen_core_results['core_metric']:.4f}")
+print0(f"Varlen CORE evaluation time: {varlen_eval_time:.2f}s ({varlen_eval_time/60:.2f}m)")
+print0(f"Speedup vs baseline: {core_eval_time / varlen_eval_time:.2f}x")
+print0(f"Speedup vs optimized: {optim_eval_time / varlen_eval_time:.2f}x")
+print0(f"Accuracy delta (varlen - baseline): {varlen_core_results['core_metric'] - final_core_results['core_metric']:.6f}")
+
+# Save A/B/C comparison data to disk as JSON for cross-run analysis
+if ddp_rank == 0:
+    import datetime
+    comparison_dir = os.path.join("logs", "core_eval_comparison")
+    os.makedirs(comparison_dir, exist_ok=True)
+    comparison_data = {
+        "run_name": args.run,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "training_step": step,
+        "total_training_flops": flops_so_far,
+        "baseline": {
+            "core_metric": final_core_results["core_metric"],
+            "results": final_core_results["results"],
+            "centered_results": final_core_results["centered_results"],
+            "task_times": final_core_results["task_times"],
+            "total_eval_time_seconds": core_eval_time,
+        },
+        "optimized": {
+            "core_metric": optim_core_results["core_metric"],
+            "results": optim_core_results["results"],
+            "centered_results": optim_core_results["centered_results"],
+            "task_times": optim_core_results["task_times"],
+            "total_eval_time_seconds": optim_eval_time,
+        },
+        "varlen": {
+            "core_metric": varlen_core_results["core_metric"],
+            "results": varlen_core_results["results"],
+            "centered_results": varlen_core_results["centered_results"],
+            "task_times": varlen_core_results["task_times"],
+            "total_eval_time_seconds": varlen_eval_time,
+        },
+    }
+    comparison_path = os.path.join(comparison_dir, f"{args.run}.json")
+    with open(comparison_path, 'w', encoding='utf-8') as f:
+        json.dump(comparison_data, f, indent=2)
+    print0(f"A/B/C comparison saved to: {comparison_path}")
 
 # Prepare training outcomes for logging
 training_outcomes = {
@@ -627,6 +758,15 @@ get_report().log(section="Base model training", data=[
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
     }
 ])
+
+if not use_dummy_wandb:
+    wandb.save("scripts/base_train.py")
+    wandb.save("scripts/base_eval.py")
+    wandb.save("nanochat/core_eval.py")
+    wandb.save("nanochat/core_eval_optim.py")
+    wandb.save("nanochat/core_eval_varlen.py")
+    wandb.save("nanochat/dataloader.py")
+    wandb.save(f"logs/{args.run}.log")
 
 # cleanup
 wandb_run.finish() # wandb run finish

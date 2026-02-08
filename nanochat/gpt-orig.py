@@ -73,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -95,18 +95,7 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if cu_seqlens is not None:
-            # Varlen: squeeze batch dim (B=1), use flash_attn_varlen_func
-            # Sequences are concatenated; cu_seqlens marks boundaries so attention never crosses them
-            q = q.squeeze(0)  # (T, H, D)
-            k = k.squeeze(0)
-            v = v.squeeze(0)
-            y = flash_attn.flash_attn_varlen_func(
-                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                causal=True, window_size=window_size,
-            )
-            y = y.unsqueeze(0)  # (1, T, H, D)
-        elif kv_cache is None:
+        if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
@@ -148,8 +137,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -396,49 +385,16 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def compute_varlen_cos_sin(self, T, cu_seqlens, device):
-        """Compute position-aware rotary embeddings for varlen mode.
-
-        Must be called OUTSIDE torch.compile because it involves data-dependent
-        indexing and branching on cu_seqlens that would cause graph breaks.
-
-        Returns:
-            cos_sin: tuple of (cos, sin) tensors, each (1, T, 1, head_dim/2)
-            max_seqlen: int -- longest individual sequence length in this batch
-        """
-        # Positions reset to 0 at each sequence boundary defined by cu_seqlens
-        # e.g. cu_seqlens=[0,3,7,10], T=14 -> positions=[0,1,2, 0,1,2,3, 0,1,2, 0,0,0,0]
-        # Padding tokens (beyond cu_seqlens[-1]) get position 0 -- their rotary embeddings
-        # don't matter since flash_attn_varlen_func ignores them via cu_seqlens.
-        positions = torch.arange(T, device=device, dtype=torch.long)
-        seq_ids = torch.zeros(T, dtype=torch.long, device=device)
-        boundaries = cu_seqlens[1:-1].long()
-        boundaries = boundaries[boundaries < T]  # filter out padded ghost entries at or beyond T
-        if boundaries.numel() > 0:
-            seq_ids[boundaries] = 1
-        seq_ids = seq_ids.cumsum(0)
-        positions = positions - cu_seqlens[seq_ids].long()
-        positions.clamp_(0, self.cos.size(1) - 1)  # clamp padding positions to valid range
-        cos_sin = self.cos[0, positions].unsqueeze(0), self.sin[0, positions].unsqueeze(0)
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-        return cos_sin, max_seqlen
-
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
-                cu_seqlens=None, cos_sin=None, max_seqlen=None):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        if cu_seqlens is not None:
-            # Varlen mode: cos_sin and max_seqlen must be precomputed outside torch.compile
-            # via compute_varlen_cos_sin() to avoid graph breaks from data-dependent ops.
-            assert cos_sin is not None, "Varlen mode requires pre-computed cos_sin (call compute_varlen_cos_sin outside torch.compile)"
-            assert max_seqlen is not None, "Varlen mode requires pre-computed max_seqlen (call compute_varlen_cos_sin outside torch.compile)"
-        else:
-            # Standard mode: simple slice into the rotary cache
-            # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-            T0 = 0 if kv_cache is None else kv_cache.get_pos()
-            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-            max_seqlen = None
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
@@ -447,7 +403,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

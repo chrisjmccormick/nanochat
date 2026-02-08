@@ -12,6 +12,10 @@ Usage (drop-in replacement for FA3):
 
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
+
+    # Variable-length sequences (no padding waste)
+    y = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                           max_seqlen_q, max_seqlen_k, causal=True)
 """
 import torch
 import torch.nn.functional as F
@@ -26,14 +30,16 @@ def _load_flash_attention_3():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
+        if major < 9:  # Hopper is sm90
+            from kernels import get_kernel
+            return get_kernel("kernels-community/flash-attn2").flash_attn_interface
         # FA3 kernels are compiled for Hopper (sm90) only
         # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
-        if major != 9:
-            return None
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        else:
+            import os
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            from kernels import get_kernel
+            return get_kernel('varunneal/flash-attention-3').flash_attn_interface
     except Exception:
         return None
 
@@ -169,6 +175,69 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 
 
+def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                           max_seqlen_q, max_seqlen_k,
+                           causal=False, window_size=(-1, -1)):
+    """
+    Flash Attention for variable-length sequences (no padding waste).
+
+    All sequences are concatenated into a single dimension, with cu_seqlens
+    marking the boundaries. Flash attention never attends across boundaries.
+
+    Args:
+        q, k, v: Tensors of shape (total_tokens, H, D) -- 3D, concatenated sequences
+        cu_seqlens_q: Cumulative sequence lengths for queries, shape (num_seqs+1,), int32
+        cu_seqlens_k: Cumulative sequence lengths for keys, shape (num_seqs+1,), int32
+        max_seqlen_q: Maximum query sequence length in the batch
+        max_seqlen_k: Maximum key sequence length in the batch
+        causal: Whether to use causal masking
+        window_size: (left, right) sliding window. -1 means unlimited.
+
+    Returns:
+        Output tensor of shape (total_tokens, H, D)
+    """
+    if _use_fa3():
+        return _fa3.flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            causal=causal, window_size=window_size,
+        )
+
+    # SDPA fallback: unpack varlen into padded batches, run SDPA, repack
+    num_seqs = len(cu_seqlens_q) - 1
+    H_q, D = q.shape[1], q.shape[2]
+    H_k = k.shape[1]
+    device = q.device
+
+    # Pad each sequence to max_seqlen and stack into a batch
+    q_padded = torch.zeros(num_seqs, max_seqlen_q, H_q, D, dtype=q.dtype, device=device)
+    k_padded = torch.zeros(num_seqs, max_seqlen_k, H_k, D, dtype=k.dtype, device=device)
+    v_padded = torch.zeros(num_seqs, max_seqlen_k, H_k, D, dtype=v.dtype, device=device)
+
+    for i in range(num_seqs):
+        sq = cu_seqlens_q[i+1] - cu_seqlens_q[i]
+        sk = cu_seqlens_k[i+1] - cu_seqlens_k[i]
+        q_padded[i, :sq] = q[cu_seqlens_q[i]:cu_seqlens_q[i+1]]
+        k_padded[i, :sk] = k[cu_seqlens_k[i]:cu_seqlens_k[i+1]]
+        v_padded[i, :sk] = v[cu_seqlens_k[i]:cu_seqlens_k[i+1]]
+
+    # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
+    q_sdpa = q_padded.transpose(1, 2)
+    k_sdpa = k_padded.transpose(1, 2)
+    v_sdpa = v_padded.transpose(1, 2)
+    enable_gqa = H_q != H_k
+    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+    y_padded = y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
+
+    # Gather results back into concatenated format
+    total_q = q.shape[0]
+    y = torch.zeros(total_q, H_q, D, dtype=q.dtype, device=device)
+    for i in range(num_seqs):
+        sq = cu_seqlens_q[i+1] - cu_seqlens_q[i]
+        y[cu_seqlens_q[i]:cu_seqlens_q[i+1]] = y_padded[i, :sq]
+    return y
+
+
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
@@ -176,4 +245,5 @@ from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
+    flash_attn_varlen_func=flash_attn_varlen_func,
 )

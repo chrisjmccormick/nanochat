@@ -135,11 +135,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             random_baselines[task_name] = float(random_baseline)
 
     # Evaluate each task
+    use_cuda = torch.cuda.is_available()
+    # Pre-compute column widths for aligned output
+    max_label_len = max(len(t['label']) for t in tasks)
+    max_detail_len = max(len(f"({t['num_fewshot'][0]}-shot, type: {t['icl_task_type']})") for t in tasks)
     results = {}
     centered_results = {}
-    task_times = {}
     for task in tasks:
-        start_time = time.time()
         label = task['label']
         task_meta = {
             'task_type': task['icl_task_type'],
@@ -147,7 +149,8 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             'num_fewshot': task['num_fewshot'][0],
             'continuation_delimiter': task.get('continuation_delimiter', ' ')
         }
-        print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
+        detail = f"({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})"
+        print0(f"Evaluating: {label:<{max_label_len}} {detail:<{max_detail_len}} ... ", end='', flush=True)
 
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
         with open(data_path, 'r', encoding='utf-8') as f:
@@ -159,20 +162,24 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
+        if use_cuda:
+            torch.cuda.synchronize()
+        start_time = time.time()
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        if use_cuda:
+            torch.cuda.synchronize()
+        elapsed = time.time() - start_time
+
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
-        elapsed = time.time() - start_time
-        task_times[label] = elapsed
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     out = {
         "results": results,
         "centered_results": centered_results,
-        "task_times": task_times,
         "core_metric": core_metric
     }
     return out
@@ -218,6 +225,10 @@ def main():
         token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
+
+    # Compile the model for faster inference (dynamic=True handles varying sequence lengths)
+    if device_type == "cuda":
+        model = torch.compile(model, dynamic=True)
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")

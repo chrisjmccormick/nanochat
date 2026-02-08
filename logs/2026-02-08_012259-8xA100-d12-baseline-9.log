@@ -1,0 +1,79 @@
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 92274.69it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 184549.38it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 216099.97it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 204147.54it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 146004.25it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 52879.48it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 224512.62it/s]
+Fetching 22 files:   0%|          | 0/22 [00:00<?, ?it/s]Fetching 22 files: 100%|██████████| 22/22 [00:00<00:00, 186413.51it/s]
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+2026-02-08 01:23:40,478 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 8
+GPU: NVIDIA A100-SXM4-80GB | Peak FLOPS (BF16): 3.12e+14
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+[rank0]:     return _run_code(code, main_globals, None,
+[rank0]:   File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+[rank0]:     exec(code, run_globals)
+[rank0]:   File "/home/ubuntu/nanochat/scripts/base_train.py", line 103, in <module>
+[rank0]:     wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 1581, in init
+[rank0]:     wandb._sentry.reraise(e)
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/analytics/sentry.py", line 162, in reraise
+[rank0]:     raise exc.with_traceback(sys.exc_info()[2])
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 1504, in init
+[rank0]:     wi.maybe_login(init_settings)
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 190, in maybe_login
+[rank0]:     wandb_login._login(
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/sdk/wandb_login.py", line 318, in _login
+[rank0]:     key, key_status = wlogin.prompt_api_key(referrer=referrer)
+[rank0]:   File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/wandb/sdk/wandb_login.py", line 244, in prompt_api_key
+[rank0]:     raise UsageError("api_key not configured (no-tty). call " + directive)
+[rank0]: wandb.errors.errors.UsageError: api_key not configured (no-tty). call wandb.login(key=[your_api_key])
+[rank0]:[W208 01:23:40.942580903 ProcessGroupNCCL.cpp:1524] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0208 01:23:42.020000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993903 closing signal SIGTERM
+W0208 01:23:42.021000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993904 closing signal SIGTERM
+W0208 01:23:42.022000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993905 closing signal SIGTERM
+W0208 01:23:42.022000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993906 closing signal SIGTERM
+W0208 01:23:42.023000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993907 closing signal SIGTERM
+W0208 01:23:42.023000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993908 closing signal SIGTERM
+W0208 01:23:42.023000 993847 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 993909 closing signal SIGTERM
+E0208 01:23:42.854000 993847 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 993902) of binary: /home/ubuntu/nanochat/.venv/bin/python3
+Traceback (most recent call last):
+  File "/home/ubuntu/nanochat/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+  File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+  File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/ubuntu/nanochat/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+scripts.base_train FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-08_01:23:42
+  host      : 0197-dsm2-sma100sx-prxmx70171
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 993902)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
