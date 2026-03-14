@@ -404,8 +404,70 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+
+
+
+# =====================================================================================
+#                                PROFILING SETUP
+# =====================================================================================
+# Set up logging directories based on run name (RUN_ID set after compute_init for sync)
+
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# Small helper for timestamping.
+from zoneinfo import ZoneInfo
+import datetime as dt
+
+def get_timestamp(timezone_str: str = "America/Los_Angeles") -> str:
+    tz = ZoneInfo(timezone_str)
+    now = dt.datetime.now(tz)
+    return now.strftime("%Y-%m-%d_%H%M%S")
+
+# Generate RUN_ID on rank 0 and broadcast to all ranks for consistent trace filenames
+import torch.distributed as dist
+
+# First, generate RUN_ID on rank 0.
+RUN_ID = f"{get_timestamp()} - {args.run}" if master_process else None
+
+# Broadcast RUN_ID from rank 0 to all other ranks
+if ddp:
+    run_id_list = [RUN_ID] if master_process else [None]
+    dist.broadcast_object_list(run_id_list, src=0)
+    RUN_ID = run_id_list[0]
+
+# Create logging directories
+TRACE_LOG_DIR = f"logs/{RUN_ID}/traces"
+os.makedirs(TRACE_LOG_DIR, exist_ok=True)
+
+# Profiler setup
+trace_filename = f"{TRACE_LOG_DIR}/{RUN_ID} - Rank {ddp_rank:02d}.json.gz"
+print0(f"Chrome trace will be saved to: {trace_filename}")
+
+# Set up profiler activities
+activities = [ProfilerActivity.CPU]
+if device_type == "cuda":
+    activities.append(ProfilerActivity.CUDA)
+
+# Create profiler with schedule
+profiler = profile(
+    activities=activities,
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=False,
+    schedule=torch.profiler.schedule(wait=5, warmup=5, active=4, repeat=1),
+)
+
+# Training loop
+profiled_steps = 0
+
+# Start profiler context
+profiler.__enter__()
+   
+for _ in range(14):
+# =============================================================================
+
 # Go!
-while True:
+# while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -536,6 +598,11 @@ while True:
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
+    # =========================================================================
+    # Advance profiler schedule
+    profiler.step()
+    # =========================================================================
+
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
@@ -584,6 +651,33 @@ while True:
         gc.disable() # nuclear intervention here: disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
+
+# ============================================================================
+#                            PROFILING COMPLETE
+# ============================================================================
+
+# Export the chrome trace files (executed on all ranks)
+print(f"Exporting chrome trace to: {trace_filename}")
+profiler.__exit__(None, None, None)  # Stop the profiler
+profiler.export_chrome_trace(trace_filename)
+print(f"Chrome trace saved successfully to: {trace_filename}")
+
+# OPTIONAL, multi-gpu only: Zip up all 8 trace files to make them easier to download.
+import zipfile
+if ddp:
+    dist.barrier()  # Wait for all ranks to finish writing their traces
+if master_process:
+    zip_filename = f"{TRACE_LOG_DIR}/{RUN_ID}.zip"
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for rank in range(ddp_world_size): # TODO - Just zip the folder to simply this.
+            trace_path = f"{TRACE_LOG_DIR}/{RUN_ID} - Rank {rank:02d}.json.gz"
+            if os.path.exists(trace_path):
+                zipf.write(trace_path, f"rank_{rank:02d}.json.gz")
+            else:
+                print(f"Warning: trace file not found: {trace_path}")
+    print(f"Zip file saved successfully to: {zip_filename}")
+
+# ============================================================================
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
