@@ -24,19 +24,18 @@ def _load_flash_attention_3():
     """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
     if not torch.cuda.is_available():
         return None
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are compiled for Hopper (sm90) only
-        # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
-        if major != 9:
-            return None
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
-        return None
+    
+    import os
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    from kernels import get_kernel
 
+    major, _ = torch.cuda.get_device_capability()
+    # FA3 kernels are compiled for Hopper (sm90) only
+    # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
+    if major < 9:  # pre-Hopper (Ampere sm80, Ada sm89)
+        return get_kernel("kernels-community/flash-attn2").flash_attn_interface
+    else:
+        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
