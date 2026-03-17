@@ -19,7 +19,7 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 import torch
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info
+from nanochat.common import get_dist_info, print0
 from nanochat.dataset import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
@@ -164,3 +164,130 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+# =============================================================================
+# 1D packed varlen dataloader
+# =============================================================================
+# Packs documents into a single flat buffer of B*T tokens with cu_seqlens marking
+# document boundaries for flash_attn_varlen_func. Each document gets its own
+# attention context, which is more principled than the BOS-aligned approach where
+# documents within the same row can attend across boundaries.
+#
+# Greedy packing: documents are added sequentially until the buffer is full. Only
+# the last document in each micro-batch gets cropped, giving ~1-3% token waste
+# vs ~35% for BOS-aligned bestfit.
+
+def tokenizing_distributed_data_loader_with_state_varlen(
+    tokenizer, B, T, split,
+    tokenizer_threads=4, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+):
+    """
+    1D packed varlen dataloader for use with flash_attn_varlen_func.
+
+    Yields (inputs, targets, cu_seqlens, state_dict) where:
+    - inputs: 1D long tensor of shape (B*T,)
+    - targets: 1D long tensor of shape (B*T,), shifted by 1
+    - cu_seqlens: int32 tensor of shape (max_num_docs,), cumulative doc lengths
+      padded with total_tokens for unused slots (ghost segments of length 0)
+    - state_dict: {"pq_idx", "rg_idx", "epoch"} for checkpoint resume
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+
+    total_tokens = B * T
+    buffer_capacity = total_tokens + 1  # +1 so the last input position has a target
+
+    # Fixed cu_seqlens size for torch.compile(dynamic=False). Must be large enough for
+    # the maximum number of documents that could fit in one micro-batch. We use the p5
+    # document length (87 tokens) from ClimbMix as divisor, rounded to 85 for safety.
+    # At B=64: 131072 // 85 -> 1536 slots x 4 bytes = 6KB, negligible memory cost.
+    max_num_docs = ((total_tokens // 85) + 127) // 128 * 128
+
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    bos_token = tokenizer.get_bos_token_id()
+    doc_buffer = []
+    pq_idx, rg_idx, epoch = 0, 0, 1
+
+    def refill_buffer():
+        nonlocal pq_idx, rg_idx, epoch
+        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        doc_buffer.extend(token_lists)
+
+    # Pre-allocate all buffers once
+    use_cuda = device == "cuda"
+    pack_buffer = torch.empty(buffer_capacity, dtype=torch.long)        # 1D packing workspace
+    cpu_buffer = torch.empty(2 * total_tokens, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * total_tokens, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:total_tokens]
+    cpu_targets = cpu_buffer[total_tokens:]
+    inputs = gpu_buffer[:total_tokens]
+    targets = gpu_buffer[total_tokens:]
+    cu_seqlens_cpu = torch.empty(max_num_docs, dtype=torch.int32)
+    cu_seqlens_gpu = torch.empty(max_num_docs, dtype=torch.int32, device=device)
+
+    # Packing efficiency counters (integers only — no GC pressure)
+    total_tokens_seen = 0     # tokens available from documents (before any cropping)
+    total_tokens_cropped = 0  # tokens lost to last-doc cropping
+    total_tokens_trunc = 0    # tokens lost to per-doc T truncation
+    total_docs_packed = 0
+    batch_count = 0
+
+    while True:
+        # Greedily pack documents into a single 1D buffer
+        pos = 0
+        doc_count = 0
+        cu_seqlens_cpu[0] = 0
+
+        while pos < buffer_capacity:
+            while len(doc_buffer) == 0:
+                refill_buffer()
+
+            doc = doc_buffer.pop(0)
+            raw_len = len(doc)
+            doc_len = min(raw_len, T)             # truncate to max_seq_len
+            total_tokens_trunc += raw_len - doc_len
+            remaining = buffer_capacity - pos
+            use_len = min(doc_len, remaining)      # crop last doc to fill exactly
+            total_tokens_cropped += doc_len - use_len
+            total_tokens_seen += raw_len
+
+            pack_buffer[pos:pos + use_len] = torch.tensor(doc[:use_len], dtype=torch.long)
+            pos += use_len
+            doc_count += 1
+            assert doc_count < max_num_docs, \
+                f"Too many documents ({doc_count}) in micro-batch for cu_seqlens " \
+                f"size ({max_num_docs}). Need a smaller divisor in max_num_docs."
+            cu_seqlens_cpu[doc_count] = min(pos, total_tokens)
+
+        # Pad remaining cu_seqlens slots (ghost segments of length 0)
+        cu_seqlens_cpu[doc_count + 1:] = total_tokens
+
+        # Split into inputs/targets (standard next-token prediction shift)
+        cpu_inputs.copy_(pack_buffer[:total_tokens])
+        cpu_targets.copy_(pack_buffer[1:total_tokens + 1])
+
+        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+
+        total_docs_packed += doc_count
+        batch_count += 1
+        if batch_count == 1 or batch_count % 1000 == 0:
+            crop_pct = 100 * total_tokens_cropped / total_tokens_seen
+            trunc_pct = 100 * total_tokens_trunc / total_tokens_seen
+            avg_docs = total_docs_packed / batch_count
+            print0(f"[varlen packer] batch {batch_count:,} | "
+                   f"docs/batch: {avg_docs:.1f} | "
+                   f"crop waste: {crop_pct:.2f}% | trunc waste: {trunc_pct:.2f}% | "
+                   f"total waste: {crop_pct + trunc_pct:.2f}%")
+
+        # H2D transfer: single copy for tokens, small copy for cu_seqlens
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        cu_seqlens_gpu.copy_(cu_seqlens_cpu, non_blocking=use_cuda)
+        yield inputs, targets, cu_seqlens_gpu, state_dict
+
+
+def tokenizing_distributed_data_loader_varlen(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, cu_seqlens, state_dict in tokenizing_distributed_data_loader_with_state_varlen(*args, **kwargs):
+        yield inputs, targets, cu_seqlens
