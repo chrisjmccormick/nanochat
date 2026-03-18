@@ -3,19 +3,19 @@ Unified Flash Attention interface with three-tier automatic backend selection:
 
     FA3 (Hopper sm90)  ->  FA2 (Ampere sm80 / Ada sm89)  ->  PyTorch SDPA fallback
 
-Exports `flash_attn` module that matches the FA3 API exactly.
+Exports `flash_attn` module with two functions:
 
 Usage:
     from nanochat.flash_attention import flash_attn
-
-    # Training with batched sequences: q, k, v are (B, T, H, D)
-    y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
 
     # Training with packed variable-length sequences: q, k, v are (total_tokens, H, D)
     y = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)
 
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
+
+All non-cached forward passes go through varlen. (B, T) callers that don't provide
+cu_seqlens get it auto-constructed in GPT.forward.
 
 FA3 and FA2 both support flash_attn_varlen_func with per-document attention isolation.
 The SDPA fallback reshapes to (B, T_seq) and uses is_causal=True -- no doc isolation,
@@ -140,39 +140,14 @@ def _sdpa_varlen_attention(q, k, v, max_seqlen, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """
-    Flash Attention for training (no KV cache).
-
-    Args:
-        q, k, v: Tensors of shape (B, T, H, D)
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
-
-    Returns:
-        Output tensor of shape (B, T, H, D)
-    """
-    if USE_FA:
-        return _fa.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
-
-    # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-    return y.transpose(1, 2)  # back to (B, T, H, D)
-
-
 def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
                            max_seqlen_q, max_seqlen_k,
                            causal=False, window_size=(-1, -1)):
     """
     Flash Attention for packed variable-length sequences (training, no KV cache).
 
-    Like flash_attn_func but for 1D packed inputs where multiple documents are
-    concatenated into one buffer. Each document attends only to itself, with
-    boundaries defined by cu_seqlens.
+    1D packed inputs where multiple documents are concatenated into one buffer.
+    Each document attends only to itself, with boundaries defined by cu_seqlens.
 
     Args:
         q, k, v: Tensors of shape (total_tokens, H, D)
@@ -252,7 +227,6 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 # =============================================================================
 from types import SimpleNamespace
 flash_attn = SimpleNamespace(
-    flash_attn_func=flash_attn_func,
     flash_attn_varlen_func=flash_attn_varlen_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
 )

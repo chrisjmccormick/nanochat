@@ -103,19 +103,7 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if cu_seqlens is not None:
-            # Varlen training: packed 1D sequence with per-document attention isolation
-            # q[0]/k[0]/v[0] squeeze B=1 to get (T, H, D) for flash_attn_varlen_func
-            y = flash_attn.flash_attn_varlen_func(
-                q[0], k[0], v[0],
-                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seq_len, max_seqlen_k=max_seq_len,
-                causal=True, window_size=window_size)
-            y = y.unsqueeze(0)  # restore B=1
-        elif kv_cache is None:
-            # Standard training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
+        if kv_cache is not None:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
@@ -128,6 +116,15 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+        else:
+            # Varlen: packed 1D sequence with per-document attention isolation
+            assert cu_seqlens is not None
+            y = flash_attn.flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seq_len, max_seqlen_k=max_seq_len,
+                causal=True, window_size=window_size)
+            y = y.unsqueeze(0)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -419,12 +416,28 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None, cu_seqlens=None, kv_cache=None, loss_reduction='mean'):
-        # Varlen training: idx is 1D packed tokens, add batch dim for internal consistency
+        B_orig = None  # set when auto-constructing cu_seqlens from (B, T) input
+
         if cu_seqlens is not None:
+            # Explicit varlen: caller packed 1D tokens
             assert idx.ndim == 1
-            idx = idx.unsqueeze(0)  # (T,) -> (1, T)
+            idx = idx.unsqueeze(0)
             if targets is not None:
                 targets = targets.unsqueeze(0)
+            max_seq_len = self.config.sequence_len
+        elif kv_cache is None:
+            # Auto-construct: each row of (B, T) becomes a separate document
+            B_orig, T_orig = idx.size()
+            cu_seqlens = torch.arange(
+                0, (B_orig + 1) * T_orig, T_orig,
+                dtype=torch.int32, device=idx.device
+            )
+            max_seq_len = T_orig
+            idx = idx.reshape(1, -1)
+            if targets is not None:
+                targets = targets.reshape(1, -1)
+        else:
+            max_seq_len = None
 
         B, T = idx.size()
 
@@ -462,7 +475,6 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
-        max_seq_len = self.config.sequence_len if cu_seqlens is not None else None
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
@@ -485,12 +497,13 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if B_orig is not None and loss_reduction == 'none':
+                loss = loss.view(B_orig, T_orig)
             return loss
         else:
-            # inference: just return the logits directly
+            if B_orig is not None:
+                logits = logits.view(B_orig, T_orig, -1)
             return logits
 
     @torch.inference_mode()
@@ -508,6 +521,7 @@ class GPT(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        assert ids.size(0) == 1, "GPT.generate only supports batch size 1"
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
