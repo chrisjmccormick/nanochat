@@ -129,10 +129,11 @@ def _sdpa_varlen_attention(q, k, v, max_seqlen, window_size, enable_gqa):
     within each T_seq chunk), but uses efficient is_causal=True kernels.
     """
     T, H, D = q.shape
+    H_kv = k.shape[1]
     B = T // max_seqlen
     q = q.view(B, max_seqlen, H, D).transpose(1, 2)
-    k = k.view(B, max_seqlen, H, D).transpose(1, 2)
-    v = v.view(B, max_seqlen, H, D).transpose(1, 2)
+    k = k.view(B, max_seqlen, H_kv, D).transpose(1, 2)
+    v = v.view(B, max_seqlen, H_kv, D).transpose(1, 2)
     y = _sdpa_attention(q, k, v, window_size, enable_gqa)
     return y.transpose(1, 2).reshape(T, H, D)
 

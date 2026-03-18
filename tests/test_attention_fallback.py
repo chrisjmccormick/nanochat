@@ -36,6 +36,11 @@ def run_both_impls(fn):
     return out_fa, out_sdpa
 
 
+def make_cu_seqlens(B, T, device):
+    """Create cu_seqlens for B documents each of length T."""
+    return torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=device)
+
+
 def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
     """Assert two tensors are close, with helpful error message."""
     max_diff = (t1 - t2).abs().max().item()
@@ -58,12 +63,15 @@ class TestFA3VsSDPA:
     def test_basic_causal(self):
         """Basic causal attention."""
         B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
         def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+            return flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(T, 0))
 
         y_fa3, y_sdpa = run_both_impls(run)
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "basic_causal")
@@ -72,12 +80,15 @@ class TestFA3VsSDPA:
     def test_full_context(self):
         """Full context (window_size=-1)."""
         B, T, H, D = 2, 128, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
         def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
+            return flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(-1, -1))
 
         y_fa3, y_sdpa = run_both_impls(run)
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "full_context")
@@ -87,12 +98,15 @@ class TestFA3VsSDPA:
         """Sliding window attention."""
         B, T, H, D = 2, 128, 4, 32
         window = 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
         def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0))
+            return flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(window, 0))
 
         y_fa3, y_sdpa = run_both_impls(run)
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "sliding_window")
@@ -104,12 +118,15 @@ class TestFA3VsSDPA:
         n_heads = 8
         n_kv_heads = 2
 
-        q = torch.randn(B, T, n_heads, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, n_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
         def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+            return flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(T, 0))
 
         y_fa3, y_sdpa = run_both_impls(run)
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "gqa")
@@ -118,12 +135,15 @@ class TestFA3VsSDPA:
     def test_larger_model(self):
         """Larger dimensions closer to real model."""
         B, T, H, D = 4, 256, 12, 64
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
         def run():
-            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
+            return flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(-1, -1))
 
         y_fa3, y_sdpa = run_both_impls(run)
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "larger_model")
@@ -215,21 +235,24 @@ class TestFA3VsSDPA:
     def test_backward_gradients_match(self):
         """Verify gradients are similar between FA3 and SDPA."""
         B, T, H, D = 2, 32, 4, 16
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
-        q_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q_data = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k_data = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v_data = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
 
         def run():
             q = q_data.clone().requires_grad_(True)
             k = k_data.clone().requires_grad_(True)
             v = v_data.clone().requires_grad_(True)
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+            y = flash_attn.flash_attn_varlen_func(q, k, v,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(T, 0))
             loss = y.sum()
             loss.backward()
             return y.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
 
-        set_impl('fa3')
+        set_impl('fa')
         y_fa3, q_grad_fa3, k_grad_fa3, v_grad_fa3 = run()
         set_impl('sdpa')
         y_sdpa, q_grad_sdpa, k_grad_sdpa, v_grad_sdpa = run()
@@ -261,13 +284,16 @@ class TestSDPAOnly:
         """Test SDPA forward pass produces valid output."""
         set_impl('sdpa')
         B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+        y = flash_attn.flash_attn_varlen_func(q, k, v,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(T, 0))
 
-        assert y.shape == (B, T, H, D)
+        assert y.shape == (B * T, H, D)
         assert not torch.isnan(y).any(), "Output contains NaN"
         set_impl(None)
 
@@ -275,11 +301,14 @@ class TestSDPAOnly:
         """Test gradients flow through SDPA."""
         set_impl('sdpa')
         B, T, H, D = 2, 32, 4, 16
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
+        q = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
+        k = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
+        v = torch.randn(B * T, H, D, device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
+        cu_seqlens = make_cu_seqlens(B, T, self.DEVICE)
 
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+        y = flash_attn.flash_attn_varlen_func(q, k, v,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=T, max_seqlen_k=T, causal=True, window_size=(T, 0))
         loss = y.sum()
         loss.backward()
 

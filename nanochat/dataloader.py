@@ -1,7 +1,14 @@
 """
 Distributed dataloaders for pretraining.
 
-BOS-aligned bestfit:
+Two loaders:
+
+Varlen (primary, used by nanochat models):
+   - Packs documents into 1D buffer with cu_seqlens for per-document attention isolation
+   - No cropping, no padding: every token is used exactly once
+   - Yields (inputs_1d, targets_1d, cu_seqlens) for flash_attn_varlen_func
+
+BOS-aligned bestfit (used by HF model evaluation):
    - Every row starts with BOS token
    - Documents packed using best-fit algorithm to minimize cropping
    - When no document fits remaining space, crops a document to fill exactly
@@ -199,10 +206,9 @@ def tokenizing_distributed_data_loader_with_state_varlen(
     buffer_capacity = total_tokens + 1  # +1 so the last input position has a target
 
     # Fixed cu_seqlens size for torch.compile(dynamic=False). Must be large enough for
-    # the maximum number of documents that could fit in one micro-batch. We use the p5
-    # document length (87 tokens) from ClimbMix as divisor, rounded to 85 for safety.
-    # At B=64: 131072 // 85 -> 1536 slots x 4 bytes = 6KB, negligible memory cost.
-    max_num_docs = ((total_tokens // 85) + 127) // 128 * 128
+    # the maximum number of documents that could fit in one micro-batch. 
+    max_num_docs = ((total_tokens // 400) + 15) // 16 * 16
+    #max_num_docs = 96 # TODO - Temporary testing value.
 
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos_token = tokenizer.get_bos_token_id()

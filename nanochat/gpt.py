@@ -497,11 +497,14 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             if B_orig is not None and loss_reduction == 'none':
                 loss = loss.view(B_orig, T_orig)
             return loss
         else:
+            # inference: just return the logits directly
             if B_orig is not None:
                 logits = logits.view(B_orig, T_orig, -1)
             return logits
