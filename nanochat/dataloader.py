@@ -207,7 +207,7 @@ def tokenizing_distributed_data_loader_with_state_varlen(
 
     # Fixed cu_seqlens size for torch.compile(dynamic=False). Must be large enough for
     # the maximum number of documents that could fit in one micro-batch. 
-    max_num_docs = ((total_tokens // 400) + 15) // 16 * 16  --> Yields 96 docs at 32K tokens.
+    max_num_docs = ((total_tokens // 400) + 15) // 16 * 16  # --> Yields 96 docs at 32K tokens.
 
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos_token = tokenizer.get_bos_token_id()
