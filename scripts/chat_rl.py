@@ -141,7 +141,7 @@ def get_batch():
         inputs = torch.cat(input_seqs)
         targets = torch.cat(target_seqs)
         lengths = torch.tensor([len(s) for s in input_seqs], dtype=torch.int32, device=device)
-        cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+        cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)]).to(torch.int32)
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()

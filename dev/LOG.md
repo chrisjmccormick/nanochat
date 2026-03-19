@@ -4,6 +4,54 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-03-18: Varlen cu_seqlens sizing — performance impact and dataset profiling
+
+Benchmarked the varlen packing dataloader against the baseline (non-varlen) on a single H100, d24 model with FP8, `--total-batch-size=131072` (simulating per-GPU load from 8xH100 setup). Measured wall time for 200 training steps (steps 50–249) to avoid warmup noise.
+
+### Key finding: cu_seqlens tensor size has a significant performance impact
+
+The `max_num_docs` parameter (which sets the fixed size of the `cu_seqlens` tensor for `torch.compile(dynamic=False)`) directly affects training speed, even though ghost segments (zero-length padding entries) should be free in the FA3 kernel itself. The effect likely comes from how `torch.compile` generates code around the fixed tensor shape.
+
+| cu_seqlens size | 200-step wall time | ms/step | vs baseline |
+|---|---|---|---|
+| baseline (no varlen) | 221.15s | 1105.7 | — |
+| 512 (original) | 228.78s | 1143.9 | +3.5% slower |
+| 128 | 219.38s | 1096.9 | −0.8% faster |
+| 96 | 218.13s | 1090.6 | −1.4% faster |
+
+Going from 512 → 96 turned a 3.5% regression into a 1.4% speedup over baseline. GC was confirmed not a factor (zero collections during the benchmark window).
+
+### Peak memory usage
+
+Negligible impact — varlen adds ~120 MiB with FP8 and ~121 MiB without, both well under 0.3%.
+
+| Config | baseline | varlen (cu_seqlens=96) | delta |
+|---|---|---|---|
+| FP8 | 52,674 MiB | 52,794 MiB | +120 MiB (+0.2%) |
+| BF16 (no FP8) | 60,207 MiB | 60,328 MiB | +121 MiB (+0.2%) |
+
+### Full-dataset doc count profiling
+
+Profiled all 170 training shards (14.4M documents, 241K simulated micro-batches at B=16, T=2048):
+
+- **Max doc count seen: 88** (only 1 batch out of 241K). The distribution is a clean bell curve centered around 59–60 docs/batch.
+- Tail is very thin: 99.9th percentile is ~77 docs, only 6 batches exceeded 85.
+- Recommendation: `max_num_docs=96` provides 9% headroom over the observed max while keeping the tensor small.
+
+### Max sequence length per micro-batch
+
+- **87.6% of batches** contain at least one document hitting the 2048 truncation cap.
+- Only 4.4% of batches have all docs ≤ 1536 tokens, and 0% have all docs ≤ 768.
+- With random (greedy) packing, a two-pathway strategy (compiling separate kernels for short vs long `max_seqlen`) would not help — the "short" path would almost never fire.
+
+### Future idea: length-sorted packing with paired pathways
+
+A smarter dataloader could buffer documents and group by length, creating short-doc batches (all docs < 1024) vs long-doc batches. This could pair shorter `max_seqlen` tiling hints with higher `max_num_docs`, and vice versa. With median doc ~500 tokens, probably 60–70% of documents are under 1024, so a substantial fraction of batches could use the short path.
+
+However, the two tuning dimensions fight each other: short-doc batches pack more documents (32K / ~300 avg ≈ 109 docs), requiring a *larger* `cu_seqlens` — which we showed is the dimension that actually costs performance. Also, FA3 varlen already computes attention at each document's actual length; `max_seqlen` is a tiling hint, not a padding bound, so the marginal gain from a tighter hint is unclear. Additional costs: two compiled graphs (more GPU memory), buffering that breaks streaming, and changed data ordering that could affect training. Not an obvious win without profiling FA3 tiling sensitivity directly.
+
+---
+
 ## 2026-03-04: Remove autocast, explicit dtype management, fp16 GradScaler
 
 Replaced `torch.amp.autocast` throughout the codebase with explicit dtype management via a single `COMPUTE_DTYPE` global. Also added fp16 training support with GradScaler.
