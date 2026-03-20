@@ -416,28 +416,16 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None, cu_seqlens=None, kv_cache=None, loss_reduction='mean'):
-        B_orig = None  # set when auto-constructing cu_seqlens from (B, T) input
-
         if cu_seqlens is not None:
-            # Explicit varlen: caller packed 1D tokens
             assert idx.ndim == 1
             idx = idx.unsqueeze(0)
             if targets is not None:
                 targets = targets.unsqueeze(0)
             max_seq_len = self.config.sequence_len
-        elif kv_cache is None:
-            # Auto-construct: each row of (B, T) becomes a separate document
-            B_orig, T_orig = idx.size()
-            cu_seqlens = torch.arange(
-                0, (B_orig + 1) * T_orig, T_orig,
-                dtype=torch.int32, device=idx.device
-            )
-            max_seq_len = T_orig
-            idx = idx.reshape(1, -1)
-            if targets is not None:
-                targets = targets.reshape(1, -1)
-        else:
+        elif kv_cache is not None:
             max_seq_len = None
+        else:
+            raise ValueError("GPT.forward requires either cu_seqlens or kv_cache")
 
         B, T = idx.size()
 
@@ -500,13 +488,8 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            if B_orig is not None and loss_reduction == 'none':
-                loss = loss.view(B_orig, T_orig)
             return loss
         else:
-            # inference: just return the logits directly
-            if B_orig is not None:
-                logits = logits.view(B_orig, T_orig, -1)
             return logits
 
     @torch.inference_mode()
@@ -523,11 +506,11 @@ class GPT(nn.Module):
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-        assert ids.size(0) == 1, "GPT.generate only supports batch size 1"
+        ids = torch.tensor(tokens, dtype=torch.long, device=device)  # 1D, no batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
+            cu_seqlens = torch.tensor([0, ids.size(0)], dtype=torch.int32, device=device)
+            logits = self.forward(ids, cu_seqlens=cu_seqlens)  # (1, T, vocab_size)
+            logits = logits[:, -1, :]  # (1, vocab_size)
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
@@ -537,6 +520,6 @@ class GPT(nn.Module):
                 next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
                 next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids), dim=1)
+            ids = torch.cat((ids, next_ids.squeeze(0)))  # stay 1D
             token = next_ids.item()
             yield token

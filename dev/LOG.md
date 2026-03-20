@@ -4,6 +4,44 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-03-19: Baseline d12 vs flashattention_varlen — full training and evaluation comparison
+
+Compared baseline d12 model (12 layers, 286M params) against the `flashattention_varlen` implementation across full training and evaluation pipeline (1680 pre-training steps + SFT).
+
+### Implementation changes
+
+The varlen implementation was completed in two phases:
+
+**Phase 1 (varlen_full_cleanup)**: Removed `flash_attn_func` entirely, converting all training paths (base training, SFT, RL) to explicit varlen packing with `cu_seqlens`. Added auto-construct `cu_seqlens` in `GPT.forward` for backward compatibility with `(B, T)` callers. Model now has two attention paths: varlen (all non-cached forward passes) and KV cache (generation).
+
+**Phase 2 (varlen_eval_packing)**: Eliminated padding waste in evaluation by converting CORE eval and chat categorical eval to explicit varlen packing. Added `cu_seqlens` support to `ModelWrapper` (unpacks/repacks for HuggingFace models). Removed auto-construct from `GPT.forward` (now requires explicit `cu_seqlens` or `kv_cache`). Removed bestfit dataloader (~95 lines) as all paths now use varlen loader.
+
+### Results
+
+| Phase | Metric | Baseline | FA-eval (varlen) | Delta |
+|-------|--------|----------|------------------|-------|
+| **Pre-training** | Val BPB | 0.8702 | 0.8740 | baseline -0.4% |
+| | Time | 26.83 min | 26.54 min | varlen +1.1% faster |
+| | Tok/sec | ~543K | ~549K | varlen +1.1% faster |
+| | MFU | 41.6% | 42.2% | varlen +0.6pp |
+| **Base eval** | CORE | 0.1326 | 0.1396 | varlen +0.0070 |
+| **SFT** | ChatCORE | 0.2400 | 0.2613 | varlen +0.0213 |
+| | ChatCORE_cat | 0.1049 | 0.1199 | varlen +0.0150 |
+| | Time | 15.42 min | 15.93 min | baseline +3% faster |
+| **Chat eval** | ARC-Easy | 35.02% | 37.04% | varlen +2.0pp |
+| | ARC-Challenge | 32.42% | 33.19% | varlen +0.8pp |
+| | MMLU | 31.17% | 31.74% | varlen +0.6pp |
+| | HumanEval | 8.54% | 8.33%* | baseline +0.2pp |
+| | SpellingBee | 98.05% | 100%* | varlen +2.0pp |
+
+\* FA-eval used 24-sample inline eval; baseline used full test sets
+
+**Conclusion**: Varlen provides ~1% throughput improvement during pre-training with essentially identical convergence (BPB within 0.4%). Eval scores favor varlen slightly but are within typical run-to-run variance for small models. The changes are neutral-to-positive: small throughput boost without quality degradation.
+
+**Total wall clock**: Baseline 1h37m. GSM8K disabled in baseline chat_eval for faster iteration. Wandb: pre-training `j2js8a1i`, SFT `27pnl7bc`.
+
+---
+
 ## 2026-03-18: Varlen cu_seqlens sizing — performance impact and dataset profiling
 
 Benchmarked the varlen packing dataloader against the baseline (non-varlen) on a single H100, d24 model with FP8, `--total-batch-size=131072` (simulating per-GPU load from 8xH100 setup). Measured wall time for 200 training steps (steps 50–249) to avoid warmup noise.
