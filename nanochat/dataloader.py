@@ -18,7 +18,7 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 import torch
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info, print0
+from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
@@ -126,13 +126,6 @@ def tokenizing_distributed_data_loader_with_state_varlen(
     cu_seqlens_cpu = torch.empty(max_num_docs, dtype=torch.int32)
     cu_seqlens_gpu = torch.empty(max_num_docs, dtype=torch.int32, device=device)
 
-    # Packing efficiency counters (integers only — no GC pressure)
-    total_tokens_seen = 0     # tokens available from documents (before any cropping)
-    total_tokens_cropped = 0  # tokens lost to last-doc cropping
-    total_tokens_trunc = 0    # tokens lost to per-doc T truncation
-    total_docs_packed = 0
-    batch_count = 0
-
     while True:
         # Greedily pack documents into a single 1D buffer
         pos = 0
@@ -144,13 +137,9 @@ def tokenizing_distributed_data_loader_with_state_varlen(
                 refill_buffer()
 
             doc = doc_buffer.pop(0)
-            raw_len = len(doc)
-            doc_len = min(raw_len, T)             # truncate to max_seq_len
-            total_tokens_trunc += raw_len - doc_len
+            doc_len = min(len(doc), T)             # truncate to max_seq_len
             remaining = buffer_capacity - pos
             use_len = min(doc_len, remaining)      # crop last doc to fill exactly
-            total_tokens_cropped += doc_len - use_len
-            total_tokens_seen += raw_len
 
             pack_buffer[pos:pos + use_len] = torch.tensor(doc[:use_len], dtype=torch.long)
             pos += use_len
@@ -168,17 +157,6 @@ def tokenizing_distributed_data_loader_with_state_varlen(
         cpu_targets.copy_(pack_buffer[1:total_tokens + 1])
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
-
-        total_docs_packed += doc_count
-        batch_count += 1
-        if batch_count == 1 or batch_count % 1000 == 0:
-            crop_pct = 100 * total_tokens_cropped / total_tokens_seen
-            trunc_pct = 100 * total_tokens_trunc / total_tokens_seen
-            avg_docs = total_docs_packed / batch_count
-            print0(f"[varlen packer] batch {batch_count:,} | "
-                   f"docs/batch: {avg_docs:.1f} | "
-                   f"crop waste: {crop_pct:.2f}% | trunc waste: {trunc_pct:.2f}% | "
-                   f"total waste: {crop_pct + trunc_pct:.2f}%")
 
         # H2D transfer: single copy for tokens, small copy for cu_seqlens
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
