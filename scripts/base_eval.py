@@ -21,6 +21,7 @@ Examples:
 """
 import os
 import csv
+import math
 import time
 import json
 import yaml
@@ -313,8 +314,10 @@ def main():
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
 
+        avg_num_docs = args.device_batch_size * sequence_len // 400
+        max_num_docs = math.ceil(avg_num_docs / 16) * 16
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            loader = tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, sequence_len, split_name, max_num_docs=max_num_docs, device=device)
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")

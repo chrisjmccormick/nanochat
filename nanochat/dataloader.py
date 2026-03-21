@@ -78,9 +78,17 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
 # document boundaries for flash_attn_varlen_func. Each document gets its own
 # attention context. Greedy packing: documents are added sequentially until the
 # buffer is full. Only the last document in each micro-batch gets cropped.
+#
+# Requires specificying a fixed maximum number of docs supported per batch. 
+# The dataloader will append additional documents to the final segment if needed,
+# resulting in cross-document attention bleeding, but that hasn't been a problem
+# in practice. 
+# It's recommended to keep max_num_docs tight rather than padding it conservatively
+# because an oversized `cu_seqlens` tensor will hurt FlashAttention performance 
+# somewhat.
 
-def tokenizing_distributed_data_loader_with_state_varlen(
-    tokenizer, B, T, split,
+def tokenizing_distributed_data_loader_varlen(
+    tokenizer, B, T, split, max_num_docs,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
 ):
@@ -98,10 +106,6 @@ def tokenizing_distributed_data_loader_with_state_varlen(
 
     total_tokens = B * T
     buffer_capacity = total_tokens + 1  # +1 so the last input position has a target
-
-    # Fixed cu_seqlens size for torch.compile(dynamic=False). Must be large enough for
-    # the maximum number of documents that could fit in one micro-batch. 
-    max_num_docs = ((total_tokens // 400) + 15) // 16 * 16  # --> Yields 96 docs at 32K tokens.
 
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos_token = tokenizer.get_bos_token_id()
@@ -126,6 +130,8 @@ def tokenizing_distributed_data_loader_with_state_varlen(
     cu_seqlens_cpu = torch.empty(max_num_docs, dtype=torch.int32)
     cu_seqlens_gpu = torch.empty(max_num_docs, dtype=torch.int32, device=device)
 
+    warned = False
+    warned_seqlen = False
     while True:
         # Greedily pack documents into a single 1D buffer
         pos = 0
@@ -143,11 +149,19 @@ def tokenizing_distributed_data_loader_with_state_varlen(
 
             pack_buffer[pos:pos + use_len] = torch.tensor(doc[:use_len], dtype=torch.long)
             pos += use_len
-            doc_count += 1
-            assert doc_count < max_num_docs, \
-                f"Too many documents ({doc_count}) in micro-batch for cu_seqlens " \
-                f"size ({max_num_docs}). Need a smaller divisor in max_num_docs."
-            cu_seqlens_cpu[doc_count] = min(pos, total_tokens)
+            if doc_count < max_num_docs - 1:
+                doc_count += 1
+                cu_seqlens_cpu[doc_count] = min(pos, total_tokens)
+            else:
+                if not warned:
+                    print(f"Warning: too many documents for cu_seqlens size ({max_num_docs}), "
+                          f"merging remaining docs (cross-document attention bleeding)")
+                    warned = True
+                merged_len = min(pos, total_tokens) - cu_seqlens_cpu[doc_count].item()
+                if merged_len > T and not warned_seqlen:
+                    print(f"Warning: merged segment length ({merged_len}) exceeds max_seq_len ({T}). "
+                          f"Increase max_num_docs to avoid silent attention truncation.")
+                    warned_seqlen = True
 
         # Pad remaining cu_seqlens slots (ghost segments of length 0)
         cu_seqlens_cpu[doc_count + 1:] = total_tokens
@@ -162,9 +176,3 @@ def tokenizing_distributed_data_loader_with_state_varlen(
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         cu_seqlens_gpu.copy_(cu_seqlens_cpu, non_blocking=use_cuda)
         yield inputs, targets, cu_seqlens_gpu, state_dict
-
-
-def tokenizing_distributed_data_loader_varlen(*args, **kwargs):
-    """Helper that omits state_dict from yields."""
-    for inputs, targets, cu_seqlens, state_dict in tokenizing_distributed_data_loader_with_state_varlen(*args, **kwargs):
-        yield inputs, targets, cu_seqlens
