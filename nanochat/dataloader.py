@@ -163,6 +163,9 @@ def tokenizing_distributed_data_loader_varlen(
                           f"Increase max_num_docs to avoid silent attention truncation.")
                     warned_seqlen = True
 
+        # Ensure the final document boundary always points to the end of the batch
+        cu_seqlens_cpu[doc_count] = total_tokens
+
         # Pad remaining cu_seqlens slots (ghost segments of length 0)
         cu_seqlens_cpu[doc_count + 1:] = total_tokens
 
