@@ -204,8 +204,8 @@ def tokenize_and_pack_sft(dataset, tokenizer, B, T, bos_token, ddp_rank, ddp_wor
         conversations.append((ids, mask))
         cursor += ddp_world_size
         if len(conversations) % 5000 == 0:
-            print(f"\r\033[KTokenizing: {len(conversations):,}/{num_convs:,} ({100*len(conversations)/num_convs:.0f}%)", end='', flush=True)
-    print(f"\r\033[KTokenized {len(conversations):,} conversations", flush=True)
+            print0(f"\r\033[KTokenizing: {len(conversations):,}/{num_convs:,} ({100*len(conversations)/num_convs:.0f}%)", end='', flush=True)
+    print0(f"\r\033[KTokenized {len(conversations):,} conversations", flush=True)
 
     batch_plans = []
     conv_buffer = []
@@ -286,6 +286,10 @@ if args.num_iterations > 0:
     num_iterations = min(args.num_iterations, data_num_iterations)
 else:
     num_iterations = data_num_iterations
+if ddp:
+    num_iter_tensor = torch.tensor([num_iterations], dtype=torch.long, device=device)
+    dist.all_reduce(num_iter_tensor, op=dist.ReduceOp.MIN)
+    num_iterations = num_iter_tensor.item()
 print0(f"Pre-packed {len(train_convs):,} train conversations into {train_micro_batches:,} micro-batches "
        f"=> {num_iterations:,} optimization steps (max {max_num_docs} docs/batch)")
 
