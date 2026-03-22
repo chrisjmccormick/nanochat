@@ -9,6 +9,7 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+import math
 from functools import partial
 import torch
 import torch.distributed as dist
@@ -90,50 +91,88 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
-    # We'll process batches of independent problems at a time because there is no sampling needed
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
-    ceil_div = lambda x, y: -(-x // y)
-    num_batches = ceil_div(num_problems, batch_size)
 
-    # Run the evaluation
+    # We'll process batches of independent problems at a time because there is no sampling needed.
+    # First, pre-tokenize all the prompts so we know their lengths and can pack them efficiently.
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
+    all_prompts = []
+    for i in range(ddp_rank, num_problems, ddp_world_size):
+        conversation = task_object[i]
+        prompt_ids = tokenizer.render_for_completion(conversation)
+        # get the token ids of all the available letters of this problem
+        letters = conversation['letters']
+        letter_ids = []
+        for letter in letters:
+            if letter not in letter_to_id_cache:
+                encoded_letter = tokenizer.encode(letter)
+                assert len(encoded_letter) == 1, "Each letter must be a single token"
+                letter_to_id_cache[letter] = encoded_letter[0]
+            letter_ids.append(letter_to_id_cache[letter])
+        all_prompts.append((prompt_ids, letter_ids, conversation))
+
+    # Pack the pre-tokenized prompts into fixed-size batches (same total token budget every batch).
+    # Unlike the simpler variable-length approach, fixed shapes let us torch.compile the model
+    # so that the first forward traces the graph and all subsequent batches reuse it.
+    T = model.config.sequence_len
+    total_tokens = batch_size * T
+    bos_token = tokenizer.get_bos_token_id()
+
+    batches = []
+    cursor = 0
+    max_doc_count = 0
+    while cursor < len(all_prompts):
+        batch_items = []
+        pos = 0
+        while cursor < len(all_prompts):
+            prompt_len = len(all_prompts[cursor][0])
+            if pos + prompt_len > total_tokens:
+                break
+            answer_pos = pos + prompt_len - 1 # where the last token is (and the predicted answer)
+            batch_items.append((cursor, answer_pos))
+            pos += prompt_len
+            cursor += 1
+        if not batch_items:
+            cursor += 1 # skip prompt too large for buffer
+            continue
+        doc_count = len(batch_items) + (1 if pos < total_tokens else 0)
+        max_doc_count = max(max_doc_count, doc_count)
+        batches.append(batch_items)
+
+    max_num_docs = max(math.ceil((max_doc_count + 1) / 16) * 16, 16)
+
+    # Compile the model (first forward traces the graph; all subsequent batches reuse it)
+    compiled_model = torch.compile(model, dynamic=False)
+
+    # Get the logits for whole batches of conversations in parallel (efficiency win here).
+    # Focus the available answers on just the letters corresponding to choices.
+    # Note that this helps the evaluation a lot because it specifically narrows the focus to
+    # only the available letters. The much harder alternative would be to just generate from
+    # the Assistant and check if it responded with the correct letter (e.g. A, B, C, D), but
+    # evaluations typically make the task easier in this way.
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_batches, ddp_world_size):
-        i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
+    for batch_items in batches:
+        # Prepare the batch: pack prompts into a flat buffer, pad remainder with BOS
+        packed = torch.full((total_tokens,), bos_token, dtype=torch.long, device=device)
+        cu_seqlens = torch.full((max_num_docs,), total_tokens, dtype=torch.int32, device=device)
+        cu_seqlens[0] = 0
 
-        # Prepare the batch of problems and pack into varlen (no padding waste)
-        conversations = [task_object[ii] for ii in range(i0, i1)]
-        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
-        answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
-        packed = torch.cat([torch.tensor(ids, dtype=torch.long, device=device) for ids in prompt_ids])
-        cu_seqlens = torch.zeros(len(prompt_ids) + 1, dtype=torch.int32, device=device)
-        for j, ids in enumerate(prompt_ids):
-            cu_seqlens[j + 1] = cu_seqlens[j] + len(ids)
+        pos = 0
+        for doc_idx, (prompt_idx, _) in enumerate(batch_items):
+            ids = all_prompts[prompt_idx][0]
+            packed[pos:pos + len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            pos += len(ids)
+            cu_seqlens[doc_idx + 1] = pos
 
-        # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
-            logits = model(packed, cu_seqlens=cu_seqlens).squeeze(0)  # (total_T, V)
+            logits = compiled_model(packed, cu_seqlens=cu_seqlens).squeeze(0)  # (total_tokens, V)
 
-        # Focus on the available answer on just the letters corresponding to choices
-        # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
-        # The much harder alternative would be to just generate from the Assistant and check if it responded with the correct
-        # letter (e.g. A, B, C, D), but evaluations typically make the task easier in this way.
-        for idx, conversation in enumerate(conversations):
-            # get the token ids of all the available letters of this problem
-            letters = conversation['letters']
-            letter_ids = []
-            for letter in letters:
-                if not letter in letter_to_id_cache:
-                    encoded_letter = tokenizer.encode(letter)
-                    assert len(encoded_letter) == 1, "Each letter must be a single token"
-                    letter_to_id_cache[letter] = encoded_letter[0]
-                letter_ids.append(letter_to_id_cache[letter])
+        for prompt_idx, answer_pos in batch_items:
+            _, letter_ids, conversation = all_prompts[prompt_idx]
             # focus logits just down to the answer position and the available letters of the answer
-            answer_pos = answer_time_positions[idx]
-            focus_logits = logits[cu_seqlens[idx].item() + answer_pos, letter_ids]
+            focus_logits = logits[answer_pos, letter_ids]
             # get the argmax letter (the predicted answer)
-            argmax_letter_id = focus_logits.argmax(dim=-1).item()
-            predicted_letter = letters[argmax_letter_id]
+            predicted_letter = conversation['letters'][focus_logits.argmax().item()]
             # evaluate the outcome
             outcome = task_object.evaluate(conversation, predicted_letter)
             num_passed += int(outcome)
