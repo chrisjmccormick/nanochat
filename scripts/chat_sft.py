@@ -197,11 +197,15 @@ def tokenize_and_pack_sft(dataset, tokenizer, B, T, bos_token, ddp_rank, ddp_wor
     buffer_capacity = B * T + 1
 
     conversations = []
+    num_convs = (dataset_size - ddp_rank + ddp_world_size - 1) // ddp_world_size
     cursor = ddp_rank
     while cursor < dataset_size:
         ids, mask = tokenizer.render_conversation(dataset[cursor])
         conversations.append((ids, mask))
         cursor += ddp_world_size
+        if len(conversations) % 5000 == 0:
+            print(f"\r\033[KTokenizing: {len(conversations):,}/{num_convs:,} ({100*len(conversations)/num_convs:.0f}%)", end='', flush=True)
+    print(f"\r\033[KTokenized {len(conversations):,} conversations", flush=True)
 
     batch_plans = []
     conv_buffer = []
@@ -246,13 +250,34 @@ def tokenize_and_pack_sft(dataset, tokenizer, B, T, bos_token, ddp_rank, ddp_wor
     return conversations, batch_plans, len(batch_plans), max(max_num_docs, 16)
 
 bos_token = tokenizer.get_bos_token_id()
+t_pack_start = time.time()
 train_convs, train_plans, train_micro_batches, train_max_docs = tokenize_and_pack_sft(
     train_dataset, tokenizer, args.device_batch_size, args.max_seq_len,
     bos_token, ddp_rank, ddp_world_size)
+t_pack_train = time.time()
 val_convs, val_plans, val_micro_batches, val_max_docs = tokenize_and_pack_sft(
     val_dataset, tokenizer, args.device_batch_size, args.max_seq_len,
     bos_token, ddp_rank, ddp_world_size)
+t_pack_val = time.time()
 max_num_docs = max(train_max_docs, val_max_docs)
+print0(f"Pre-tokenize & pack: train {t_pack_train - t_pack_start:.1f}s, val {t_pack_val - t_pack_train:.1f}s, total {t_pack_val - t_pack_start:.1f}s")
+
+# Document length and packing statistics
+import numpy as np
+train_doc_lens = [len(ids) for ids, _ in train_convs]
+train_docs_per_batch = [len(plan) for plan in train_plans]
+train_tokens_per_batch = [sum(len(train_convs[i][0]) for i in plan) for plan in train_plans]
+buffer_capacity = args.device_batch_size * args.max_seq_len + 1
+train_packing_eff = [t / buffer_capacity for t in train_tokens_per_batch]
+dl = np.array(train_doc_lens)
+dpb = np.array(train_docs_per_batch)
+pe = np.array(train_packing_eff)
+print0(f"Train doc lengths: n={len(dl):,} | mean={dl.mean():.0f} median={np.median(dl):.0f} "
+       f"min={dl.min()} max={dl.max()} p5={np.percentile(dl,5):.0f} p95={np.percentile(dl,95):.0f}")
+print0(f"Train docs/batch:  n={len(dpb):,} | mean={dpb.mean():.1f} median={np.median(dpb):.0f} "
+       f"min={dpb.min()} max={dpb.max()} p5={np.percentile(dpb,5):.0f} p95={np.percentile(dpb,95):.0f}")
+print0(f"Train packing eff: mean={pe.mean():.3f} median={np.median(pe):.3f} "
+       f"min={pe.min():.3f} max={pe.max():.3f}")
 
 # num_iterations: exact count of optimization steps. The -1 accounts for the
 # prefetch batch that the training loop requests but never trains on.
