@@ -89,6 +89,7 @@ GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped unde
 UNEMBEDDING_LR = _env_float("UNEMBEDDING_LR", 0.004)
 EMBEDDING_LR   = _env_float("EMBEDDING_LR", 0.2)
 MATRIX_LR      = _env_float("MATRIX_LR", 0.02)
+SCALAR_LR      = _env_float("SCALAR_LR", 0.5)     # resid/x0/smear scalar groups
 WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
@@ -181,7 +182,7 @@ print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
 # Snapshot fp32 masters from the checkpoint weights BEFORE the bf16 cast.
 optimizer = setup_fp32_optimizer(model, unembedding_lr=UNEMBEDDING_LR,
                                  embedding_lr=EMBEDDING_LR, matrix_lr=MATRIX_LR,
-                                 weight_decay=WEIGHT_DECAY)
+                                 weight_decay=WEIGHT_DECAY, scalar_lr=SCALAR_LR)
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * INIT_LR_FRAC
     group["initial_lr"] = group["lr"]
@@ -359,7 +360,8 @@ METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "train_s", "vmm_s", "n_ext", "n_groups_used", "n_docs", "n_loss_tokens",
                "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
-               "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
+               "grad_norm", "lrm", "wnorm", "smear_lambda", "backout_lambda",
+               "x0_norm", "resid_norm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
 passk_path = HERE / f"passk_{TAG}.csv"
 mf = open(metrics_path, "w", newline="") if master else None
@@ -461,6 +463,10 @@ try:
             loss_token_mean=round(tstats["loss_token_mean"], 6),
             grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
             wnorm=round(wnorm, 2),
+            smear_lambda=round(float(model.smear_lambda.float()), 5),
+            backout_lambda=round(float(model.backout_lambda.float()), 5),
+            x0_norm=round(float(model.x0_lambdas.float().norm()), 5),
+            resid_norm=round(float(model.resid_lambdas.float().norm()), 5),
             mem_gb=round((lambda f_t: (f_t[1] - f_t[0]) / 2 ** 30)(torch.cuda.mem_get_info()), 1),
             round_s=round(time.perf_counter() - r_t0, 1))
         curve.append(row)
