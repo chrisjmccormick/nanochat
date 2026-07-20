@@ -48,7 +48,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.fast_engine import (
     FastEngine, cast_model_bf16, setup_fp32_optimizer, group_advantages,
     build_reinforce_packs, reinforce_forward_loss)
-from tasks.gsm8k import GSM8K
+from tasks.gsm8k import GSM8K, extract_answer
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -359,15 +359,25 @@ def run_eval(rnd: int) -> dict:
         for k in range(1, EVAL_K + 1):
             passk[k - 1] += float(any(outcomes[:k]))
     n_rec = torch.tensor(len(by_idx), dtype=torch.long, device=device)
+    # rollout-level eval diagnostics: truncation rate (hit the token budget) and
+    # correct-formatting rate (emitted an extractable `#### n`, right or wrong) —
+    # so a flat pass@k can be attributed to format/truncation vs actual wrongness.
+    n_roll = torch.tensor(float(len(rows)), device=device)
+    n_trunc = torch.tensor(float(sum(r["terminal"] == "truncated" for r in rows)), device=device)
+    n_fmt = torch.tensor(float(sum(extract_answer(r["completion_text"]) is not None for r in rows)), device=device)
     if ddp:
-        dist.all_reduce(n_rec, op=dist.ReduceOp.SUM)
-        dist.all_reduce(passk, op=dist.ReduceOp.SUM)
+        for _t in (n_rec, passk, n_roll, n_trunc, n_fmt):
+            dist.all_reduce(_t, op=dist.ReduceOp.SUM)
     passk = (passk / n_rec.item()).tolist()
+    trunc_rate = (n_trunc / n_roll).item()
+    fmt_rate = (n_fmt / n_roll).item()
     print0(f"  [eval r{rnd}] " + ", ".join(f"pass@{k+1}: {v:.4f}" for k, v in enumerate(passk))
+           + f" | fmt {100*fmt_rate:.1f}% | trunc {100*trunc_rate:.1f}%"
            + f" | {gstats['gen_tok']:,} tok in {gstats['gen_s']:.1f}s "
            f"({gstats['gen_tok']/gstats['gen_s']:,.0f} tok/s)", flush=True)
     return {f"pass@{k+1}": round(v, 4) for k, v in enumerate(passk)} | {
         "round": rnd, "n": int(n_rec.item()),
+        "fmt_rate": round(fmt_rate, 4), "trunc_rate": round(trunc_rate, 4),
         "gen_s": round(gstats["gen_s"], 1), "gen_tok": gstats["gen_tok"]}
 
 
