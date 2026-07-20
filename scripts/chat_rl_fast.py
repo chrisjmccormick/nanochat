@@ -117,6 +117,9 @@ SAVE_OPT      = _env_flag("SAVE_OPT", 0)          # fp32 optimizer state is resu
 SAVE_ROLLOUTS = _env_flag("SAVE_ROLLOUTS", 0)
 OUT_TAG       = os.environ.get("OUT_TAG", "d24-fastrl")
 SOURCE        = os.environ.get("SOURCE", "sft")
+# FIXED_PROBLEMS: csv of train indices — every round trains on exactly these
+# problems (single/multi-problem overfit smoke, like the speedrun's sp1).
+FIXED_PROBLEMS = [int(x) for x in os.environ.get("FIXED_PROBLEMS", "").split(",") if x] or None
 MODEL_TAG     = os.environ.get("MODEL_TAG") or None
 MODEL_STEP    = int(os.environ["MODEL_STEP"]) if os.environ.get("MODEL_STEP") else None
 PUSH          = _env_flag("PUSH", 0)
@@ -393,7 +396,10 @@ try:
                 pf.flush()
 
         # -- generation ------------------------------------------------------
-        idxs = [shard[(rnd * ppr_rank + j) % len(shard)] for j in range(ppr_rank)]
+        if FIXED_PROBLEMS is not None:
+            idxs = FIXED_PROBLEMS
+        else:
+            idxs = [shard[(rnd * ppr_rank + j) % len(shard)] for j in range(ppr_rank)]
         specs = [(i, train_prompts[i], K_DRAWS, MAX_TOKENS) for i in idxs]
         rows, gstats = engine.run_round(engine.make_nodes(specs), rnd)
         vmm_unmap_s = engine.pool.lend()
