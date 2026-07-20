@@ -475,10 +475,10 @@ try:
             loss_token_mean=round(tstats["loss_token_mean"], 6),
             grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
             wnorm=round(wnorm, 2),
-            smear_lambda=round(float(model.smear_lambda.float()), 5),
-            backout_lambda=round(float(model.backout_lambda.float()), 5),
-            x0_norm=round(float(model.x0_lambdas.float().norm()), 5),
-            resid_norm=round(float(model.resid_lambdas.float().norm()), 5),
+            smear_lambda=round(float(model.smear_lambda.detach().float()), 5),
+            backout_lambda=round(float(model.backout_lambda.detach().float()), 5),
+            x0_norm=round(float(model.x0_lambdas.detach().float().norm()), 5),
+            resid_norm=round(float(model.resid_lambdas.detach().float().norm()), 5),
             mem_gb=round((lambda f_t: (f_t[1] - f_t[0]) / 2 ** 30)(torch.cuda.mem_get_info()), 1),
             round_s=round(time.perf_counter() - r_t0, 1))
         curve.append(row)
