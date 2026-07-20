@@ -34,6 +34,15 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+# fast-rl branch: route the flash_attention shim to the Dao FA2 kernels when
+# available (proper varlen doc isolation on Ampere; stock falls back to SDPA
+# which has none). No-op if flash-attn / cuda bindings are absent.
+try:
+    from nanochat.fast_engine import install_dao_flash_attention
+    install_dao_flash_attention()
+except Exception:
+    pass
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
@@ -68,6 +77,9 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--gsm8k-tools", type=int, default=1, help="1=stock tool-call rendering, 0=plain text (strip << >> calculator annotations; for no-tool RL)")
+parser.add_argument("--smoltalk-rows", type=int, default=-1, help="cap SmolTalk train rows (-1 = all 460K)")
+parser.add_argument("--spelling", type=int, default=1, help="include SimpleSpelling/SpellingBee tasks (280K rows)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -164,21 +176,29 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+gsm8k_tools = bool(args.gsm8k_tools)
+smoltalk_kwargs = {"stop": args.smoltalk_rows} if args.smoltalk_rows >= 0 else {}
 train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
+    SmolTalk(split="train", **smoltalk_kwargs), # up to 460K rows of general conversations
     *[MMLU(subset="auxiliary_train", split="train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
-    *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    *[GSM8K(subset="main", split="train", tools=gsm8k_tools) for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 ]
+if os.path.exists(identity_conversations_filepath):
+    train_tasks += [CustomJSON(filepath=identity_conversations_filepath)] * 2 # 2 epochs of 1000 synthetic identity rows
+else:
+    print0(f"NOTE: {identity_conversations_filepath} not found, skipping identity conversations")
+if args.spelling:
+    train_tasks += [
+        SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+        SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    ]
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs} "
+       f"tools={gsm8k_tools}, smoltalk_rows={args.smoltalk_rows}, spelling={bool(args.spelling)})")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
+    GSM8K(subset="main", split="test", stop=420, tools=gsm8k_tools), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 14K + 1.32K ~= 39K rows
 
 # Pre-tokenize and pre-pack all conversations into batch plans.
