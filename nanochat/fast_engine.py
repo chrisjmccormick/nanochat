@@ -20,11 +20,13 @@ Decode carries two pieces of cross-step state per row: the paged KV cache and
 seeds the latter from each context's last position; sibling rows inherit the
 node's seed.
 
-Uses the Dao flash-attn package directly (FA2 on A100) for the paged decode +
-varlen prefill; `install_dao_flash_attention()` also routes nanochat's
-`flash_attention` shim to the same kernels so the reference Engine / training
-forward run FA2 instead of the SDPA fallback (the SDPA varlen fallback has no
-document isolation and would be WRONG for packed RL training).
+Uses FA2 (on A100) for the paged decode + varlen prefill — sourced from the Dao
+flash-attn pip package if installed, else from the community `kernels` hub
+(kernels-community/flash-attn2), so nanochat's uv env works without a wheel build.
+`install_dao_flash_attention()` also routes nanochat's `flash_attention` shim to
+the same kernels so the reference Engine / training forward run FA2 instead of the
+SDPA fallback (the SDPA varlen fallback has no document isolation and would be
+WRONG for packed RL training).
 """
 
 import math
@@ -36,8 +38,20 @@ import torch
 import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_varlen_func
-from flash_attn.flash_attn_interface import flash_attn_with_kvcache as _fa_kvcache_raw
+# FA2 primitives (varlen + paged kvcache with block_table). Prefer the Dao pip
+# package if installed (keeps existing envs byte-for-byte unchanged); otherwise
+# pull the SAME FA2 kernels from the community `kernels` hub — no wheel build, so
+# nanochat's own uv env (which ships `kernels`, not flash-attn) works as-is.
+try:
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.flash_attn_interface import flash_attn_with_kvcache as _fa_kvcache_raw
+    _FA2_SOURCE = "flash_attn (dao pip wheel)"
+except Exception:
+    from kernels import get_kernel
+    _fa2i = get_kernel("kernels-community/flash-attn2").flash_attn_interface
+    flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
+    _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
+    _FA2_SOURCE = "kernels-community/flash-attn2"
 
 from nanochat.gpt import norm, apply_rotary_emb
 
@@ -71,6 +85,7 @@ def install_dao_flash_attention():
 
     _nfa.flash_attn.flash_attn_varlen_func = _varlen
     _nfa.flash_attn.flash_attn_with_kvcache = _kvcache
+    print(f"  fast_engine FA2 source: {_FA2_SOURCE}", flush=True)
 
 
 # -----------------------------------------------------------------------------
