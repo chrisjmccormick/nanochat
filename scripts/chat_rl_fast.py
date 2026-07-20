@@ -90,6 +90,10 @@ UNEMBEDDING_LR = _env_float("UNEMBEDDING_LR", 0.004)
 EMBEDDING_LR   = _env_float("EMBEDDING_LR", 0.2)
 MATRIX_LR      = _env_float("MATRIX_LR", 0.02)
 SCALAR_LR      = _env_float("SCALAR_LR", 0.5)     # resid/x0/smear scalar groups
+# FREEZE_SCALARS=1: zero the LR on ALL per-layer scalar groups (resid_lambdas,
+# x0_lambdas, smear_gate/smear_lambda/backout_lambda). Their pretraining
+# trajectories are smooth and deliberate — RL should not touch them (Chris).
+FREEZE_SCALARS = _env_flag("FREEZE_SCALARS", 0)
 WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
@@ -183,6 +187,14 @@ print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
 optimizer = setup_fp32_optimizer(model, unembedding_lr=UNEMBEDDING_LR,
                                  embedding_lr=EMBEDDING_LR, matrix_lr=MATRIX_LR,
                                  weight_decay=WEIGHT_DECAY, scalar_lr=SCALAR_LR)
+if FREEZE_SCALARS:
+    _scalar_ids = {id(model.resid_lambdas), id(model.x0_lambdas),
+                   id(model.smear_gate.weight), id(model.smear_lambda),
+                   id(model.backout_lambda)}
+    for group in optimizer.param_groups:
+        if any(id(p) in _scalar_ids for p in group["params"]):
+            group["lr"] = 0.0
+    print0("FREEZE_SCALARS: resid/x0/smear/backout groups at lr 0")
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * INIT_LR_FRAC
     group["initial_lr"] = group["lr"]
