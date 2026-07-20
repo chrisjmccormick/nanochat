@@ -130,6 +130,11 @@ SOURCE        = os.environ.get("SOURCE", "sft")
 # FIXED_PROBLEMS: csv of train indices — every round trains on exactly these
 # problems (single/multi-problem overfit smoke, like the speedrun's sp1).
 FIXED_PROBLEMS = [int(x) for x in os.environ.get("FIXED_PROBLEMS", "").split(",") if x] or None
+# POOL_PROBLEMS: csv of train indices to RESTRICT the on-policy round sampler to
+# (unlike FIXED, still draws PPR problems/round from this pool, rotating). Use to
+# RL only on a difficulty-selected subset (e.g. the 0<rate<1 signal band) while
+# keeping the normal 32-problem mini-batch structure.
+POOL_PROBLEMS = [int(x) for x in os.environ.get("POOL_PROBLEMS", "").split(",") if x] or None
 MODEL_TAG     = os.environ.get("MODEL_TAG") or None
 MODEL_STEP    = int(os.environ["MODEL_STEP"]) if os.environ.get("MODEL_STEP") else None
 PUSH          = _env_flag("PUSH", 0)
@@ -171,8 +176,9 @@ assert max_prompt <= PREFILL_T, f"longest prompt {max_prompt} > PREFILL_T={PREFI
 if PASS1:
     assert max_prompt + PASS1 <= PREFILL_T, "prompt+PASS1 exceeds PREFILL_T"
 
-shard = list(range(rank, len(train_task), world_size))
-num_rounds = (len(train_task) // PPR) * EPOCHS
+pool = POOL_PROBLEMS if POOL_PROBLEMS is not None else list(range(len(train_task)))
+shard = pool[rank::world_size]
+num_rounds = (len(pool) // PPR) * EPOCHS
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
