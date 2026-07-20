@@ -70,6 +70,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of 
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--save-every", type=int, default=-1, help="also save a (model+meta only) checkpoint every N steps, to capture the training trajectory for later per-checkpoint eval + pick (-1 = only at end)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
@@ -342,6 +343,7 @@ def get_muon_momentum(it):
 # Training loop
 x, y, cu_seqlens = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = float("nan")  # defined even if a periodic save lands before an eval
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -402,15 +404,19 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
+    # save the checkpoint at the end AND periodically (--save-every) to capture the
+    # training trajectory for later per-checkpoint eval + pick. Intermediate saves
+    # are model+meta only (optimizer skipped) to keep disk sane; the final save
+    # includes the optimizer shard (all ranks participate).
+    periodic_save = args.save_every > 0 and step > 0 and step % args.save_every == 0
+    if last_step or periodic_save:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(),
-            optimizer.state_dict(),
+            optimizer.state_dict() if last_step else None,
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
