@@ -78,6 +78,11 @@ TOP_P        = _env_float("TOP_P", 0.95)
 TOP_K        = _env_int("TOP_K", 512)
 # Trainer
 ADV_STD      = _env_flag("ADV_STD", 1)            # 0 -> stock (r - mean)
+# TRAIN_TERMINAL=1 (speedrun): the emitted <|assistant_end|> is a trained token.
+# 0 (stock chat_rl): exclude it from the loss — with negative advantages on
+# failing problems, training the terminal actively suppresses termination and
+# produces a truncation/rambling spiral (observed in run ep1).
+TRAIN_TERMINAL = _env_flag("TRAIN_TERMINAL", 1)
 TRAIN_BRANCH_TEMP  = _env_float("TRAIN_BRANCH_TEMP", 1.0)
 TRAIN_BRANCH_TOP_P = _env_float("TRAIN_BRANCH_TOP_P", 0.95)
 GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped under DDP
@@ -257,7 +262,13 @@ def train_step(groups: list[dict]) -> dict:
             if (g["truncated"][k] and g["rewards"][k] == 0) or not comp:
                 n_excluded += 1
                 continue
-            docs.append((g["prompt_ids"], list(comp), float(adv[k])))
+            comp = list(comp)
+            if not TRAIN_TERMINAL and comp[-1] in (ASSISTANT_END, BOS):
+                comp = comp[:-1]
+                if not comp:
+                    n_excluded += 1
+                    continue
+            docs.append((g["prompt_ids"], comp, float(adv[k])))
     total_tokens = total_branch = total_comp = 0
     total_loss = 0.0
     n_packs = 0
