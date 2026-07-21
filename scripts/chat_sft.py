@@ -81,6 +81,8 @@ parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epoch
 parser.add_argument("--gsm8k-tools", type=int, default=1, help="1=stock tool-call rendering, 0=plain text (strip << >> calculator annotations; for no-tool RL)")
 parser.add_argument("--smoltalk-rows", type=int, default=-1, help="cap SmolTalk train rows (-1 = all 460K)")
 parser.add_argument("--spelling", type=int, default=1, help="include SimpleSpelling/SpellingBee tasks (280K rows)")
+parser.add_argument("--distill-jsonl", type=str, default="", help="path to a JSONL of distilled conversations (one JSON list-of-messages per line) to add to the training mixture via CustomJSON (empty = none)")
+parser.add_argument("--distill-epochs", type=int, default=1, help="number of epochs of --distill-jsonl in the training mixture")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -184,6 +186,10 @@ train_tasks = [
     *[MMLU(subset="auxiliary_train", split="train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train", tools=gsm8k_tools) for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 ]
+if args.distill_jsonl:
+    assert os.path.exists(args.distill_jsonl), f"--distill-jsonl not found: {args.distill_jsonl}"
+    train_tasks += [CustomJSON(filepath=args.distill_jsonl) for _ in range(args.distill_epochs)] # distilled traces
+    print0(f"Added distill mixture: {args.distill_jsonl} x{args.distill_epochs} epochs")
 if os.path.exists(identity_conversations_filepath):
     train_tasks += [CustomJSON(filepath=identity_conversations_filepath)] * 2 # 2 epochs of 1000 synthetic identity rows
 else:
