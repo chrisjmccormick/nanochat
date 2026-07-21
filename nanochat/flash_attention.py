@@ -48,7 +48,12 @@ def _load_flash_attention():
         # FA2: Ampere (sm80), Ada (sm89), and Hopper fallback
         if major >= 8:
             try:
-                return get_kernel('kernels-community/flash-attn2').flash_attn_interface, 'fa2'
+                _k = get_kernel('kernels-community/flash-attn2')
+                # Kernel revisions differ: newer builds expose the fns at the module
+                # top level, older ones under `.flash_attn_interface`. Prefer whichever
+                # actually carries flash_attn_varlen_func.
+                _fa2 = _k if hasattr(_k, 'flash_attn_varlen_func') else _k.flash_attn_interface
+                return _fa2, 'fa2'
             except Exception:
                 pass
     except Exception:

@@ -48,7 +48,12 @@ try:
     _FA2_SOURCE = "flash_attn (dao pip wheel)"
 except Exception:
     from kernels import get_kernel
-    _fa2i = get_kernel("kernels-community/flash-attn2").flash_attn_interface
+    _fa2 = get_kernel("kernels-community/flash-attn2")
+    # Kernel revisions differ: newer builds expose the fns at the module top level,
+    # older ones nested them under `.flash_attn_interface`. Prefer top-level (which
+    # the current kernels-community/flash-attn2 provides) and fall back to the
+    # submodule so both layouts work.
+    _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_interface
     flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
     _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
     _FA2_SOURCE = "kernels-community/flash-attn2"
