@@ -741,6 +741,8 @@ class FastEngine:
         self.gate_ids = frozenset(
             ids[-1] for s in self.stop_strings for ids in [tokenizer.encode(s)] if ids)
 
+        self.kv_pool_gb = kv_pool_gb
+        self.sampler_cfg = (temperature, top_p, top_k)
         self.pool = KVPool(model.config, int(kv_pool_gb * 2 ** 30), device_index)
         self.max_blocks = nblocks(max_prompt_len + 1 + max_tokens + macro_n) + 1
         # Admission ceiling: worst-case per-row private reserve at the pass-1 budget.
@@ -769,6 +771,17 @@ class FastEngine:
     @torch.no_grad()
     def capture(self, warm_context: list[int]) -> None:
         """Capture decode buckets + the prefill graph; warm one prefill replay."""
+        temp, top_p, top_k = self.sampler_cfg
+        print(f"  engine config: kv_pool {self.kv_pool_gb:g} GB "
+              f"({self.pool.num_blocks} blocks x {PAGE} tok) | max_seqs {self.max_seqs} | "
+              f"buckets {self.buckets} | macro_n {self.macro_n} | "
+              f"prefill T={self.prefill_t} x{self.prefill_seqs} seqs | "
+              f"pantry {self.pantry_cap} blocks | starve_jobs {self.starve_jobs} | "
+              f"max_tokens {self.max_tokens}"
+              + (f" (pass1 {self.pass1})" if self.pass1 else "")
+              + f" | temp {temp:g} top_p {top_p:g} top_k {top_k} | "
+              f"stop_detect {int(self.stop_detect)} | ceiling_rows {self.ceiling_rows}",
+              flush=True)
         print("  capture+compile decode buckets:", flush=True)
         self.gd.capture_all()
         self.pfg = PrefillGraph(self.model, self.pool, self.prefill_t, self.prefill_seqs,
@@ -1057,8 +1070,11 @@ class FastEngine:
                 adopt()
             if rolls_done - last_roll_print >= print_every:
                 el = time.perf_counter() - t0
+                # all Python-side counters — no GPU sync, no throughput cost
                 print(f"    [r{rnd}] roll {rolls_done:4d}/{n_target} | tok {tok_total:>10,} | "
-                      f"rows {len(running):3d} | {el:5.1f}s", flush=True)
+                      f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {len(running):3d} | "
+                      f"pantry {pantry_blocks:3d}b/{len(pantry):2d}j | "
+                      f"free {len(pool.free):4d} | {el:6.1f}s", flush=True)
                 last_roll_print = rolls_done
 
         gen_s = time.perf_counter() - t0
