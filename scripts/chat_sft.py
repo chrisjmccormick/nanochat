@@ -83,6 +83,7 @@ parser.add_argument("--smoltalk-rows", type=int, default=-1, help="cap SmolTalk 
 parser.add_argument("--spelling", type=int, default=1, help="include SimpleSpelling/SpellingBee tasks (280K rows)")
 parser.add_argument("--distill-jsonl", type=str, default="", help="path to a JSONL of distilled conversations (one JSON list-of-messages per line) to add to the training mixture via CustomJSON (empty = none)")
 parser.add_argument("--distill-epochs", type=int, default=1, help="number of epochs of --distill-jsonl in the training mixture")
+parser.add_argument("--val-jsonl", type=str, default="", help="path to a JSONL of conversations (CustomJSON format, same as --distill-jsonl) to use AS the validation set, replacing the stock SmolTalk/MMLU/GSM8K test mixture. Build it per-experiment (e.g. held-out teacher traces on the eval-domain test split) so val bpb tracks the thing being trained instead of drift away from general chat (empty = stock mixture)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -202,11 +203,16 @@ if args.spelling:
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs} "
        f"tools={gsm8k_tools}, smoltalk_rows={args.smoltalk_rows}, spelling={bool(args.spelling)})")
-val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420, tools=gsm8k_tools), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 14K + 1.32K ~= 39K rows
+if args.val_jsonl:
+    assert os.path.exists(args.val_jsonl), f"--val-jsonl not found: {args.val_jsonl}"
+    val_dataset = TaskMixture([CustomJSON(filepath=args.val_jsonl)])
+    print0(f"Validation set: {args.val_jsonl} ({len(val_dataset):,} rows, replaces stock mixture)")
+else:
+    val_dataset = TaskMixture([
+        SmolTalk(split="test"), # 24K rows in test set
+        MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
+        GSM8K(subset="main", split="test", stop=420, tools=gsm8k_tools), # 1.32K rows in test set, use only 420 to match the train ratios
+    ]) # total: 24K + 14K + 1.32K ~= 39K rows
 
 # Pre-tokenize and pre-pack all conversations into batch plans.
 # This runs the same best-fit packing algorithm offline at startup, so we know
