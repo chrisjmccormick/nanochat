@@ -291,6 +291,7 @@ def train_step(groups: list[dict]) -> dict:
     total_tokens = total_branch = total_comp = 0
     total_loss = 0.0
     n_packs = 0
+    pstats = None
     if docs:
         packs, pstats = build_reinforce_packs(
             docs, buckets=list(TRAIN_BUCKETS), max_num_docs=MAX_NUM_DOCS,
@@ -333,6 +334,7 @@ def train_step(groups: list[dict]) -> dict:
     torch.cuda.synchronize()
     return dict(n_groups_used=n_groups_used, n_groups_total=len(groups),
                 n_docs=len(docs), n_excluded=n_excluded, n_packs=n_packs,
+                pstats=pstats,
                 n_loss_tokens=total_tokens, n_comp_tokens=total_comp,
                 branch_frac=(total_branch / total_comp) if total_comp else 0.0,
                 loss_token_mean=(total_loss / total_tokens) if total_tokens else 0.0,
@@ -505,10 +507,20 @@ try:
                 import pandas as pd
                 pd.DataFrame(rows).assign(reward=rewards).to_parquet(
                     RUN_DIR / f"rollouts_round_{rnd:04d}.parquet", index=False)
+        # padding-waste telemetry (all host-side ints — no GPU sync):
+        # prefill packing = real packed tokens / (replays x PREFILL_T); train pad%
+        # = pad tail / sealed pack capacity. Keys for tuning PREFILL_SEQS and
+        # TRAIN_BUCKETS/MAX_NUM_DOCS respectively.
+        pf_pack = (100.0 * gstats["prefill_tok"] / (gstats["replays"] * PREFILL_T)
+                   if gstats.get("replays") else 0.0)
+        tr_pad = (100.0 * tstats["pstats"]["pad_tokens"] / max(1, tstats["pstats"]["cap_tokens"])
+                  if tstats.get("pstats") else 0.0)
         print0(f"  [round {rnd:3d}] solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
-               f"gen {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s) | "
+               f"gen {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s, "
+               f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% packed) | "
                f"train {train_s:4.1f}s vmm {vmm_map_s + vmm_unmap_s:.1f}s "
-               f"({tstats['n_loss_tokens']} br-tok, gnorm {tstats['grad_norm']:.3f})"
+               f"({tstats['n_loss_tokens']} br-tok, {tstats.get('n_packs', 0)} packs "
+               f"pad {tr_pad:.0f}%, gnorm {tstats['grad_norm']:.3f})"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
         if SAVE_EVERY and rnd > 0 and rnd % SAVE_EVERY == 0:

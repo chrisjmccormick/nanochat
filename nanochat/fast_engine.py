@@ -1544,7 +1544,8 @@ def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
     so no packed segment may exceed it)."""
     buckets = sorted(buckets)
     cap = buckets[-1]
-    stats = {"n_docs": len(docs), "n_packs": 0, "pad_tokens": 0, "comp_targets": 0}
+    stats = {"n_docs": len(docs), "n_packs": 0, "pad_tokens": 0, "comp_targets": 0,
+             "cap_tokens": 0}  # sum of sealed bucket sizes -> pad% = pad/cap
     if not docs:
         return [], stats
     for p_ids, c_ids, _ in docs:
@@ -1567,6 +1568,7 @@ def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
     out: list[ReinforcePack] = []
     for b in bins:
         T_pack = next(x for x in buckets if x >= b["used"])
+        stats["cap_tokens"] += T_pack
         ids = torch.full((T_pack,), pad_id, dtype=torch.long)
         targets = torch.full((T_pack,), pad_id, dtype=torch.long)
         comp = torch.zeros(T_pack, dtype=torch.float32)
