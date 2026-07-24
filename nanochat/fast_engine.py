@@ -20,6 +20,7 @@ Decode carries two pieces of cross-step state per row: the paged KV cache and
 seeds the latter from each context's last position; sibling rows inherit the
 node's seed.
 
+TODO - This comment says too much. We're using kernels-community/flash-attn2, period.
 Uses FA2 (on A100) for the paged decode + varlen prefill — sourced from the Dao
 flash-attn pip package if installed, else from the community `kernels` hub
 (kernels-community/flash-attn2), so nanochat's uv env works without a wheel build.
@@ -691,7 +692,7 @@ def default_buckets(ceiling_rows: int, max_seqs: int, step: int = 16) -> tuple:
     return tuple(sorted(coarse | {top}))
 
 
-class FastEngine:
+class PantryRefillEngine:
     """Paged prefix-shared CUDA-graph engine over a live nanochat GPT.
 
     Life cycle: __init__ builds the pool + graphs (untimed setup; call with the
@@ -1135,495 +1136,446 @@ class FastEngine:
         return out
 
 
-# -----------------------------------------------------------------------------
-# §9. bf16 weights + 32-bit-state optimizer (fp32 master, in-place bf16 writeback)
-# -----------------------------------------------------------------------------
-def cast_model_bf16(model) -> None:
-    """Cast all parameters to bf16 in place (Parameter objects keep identity, so
-    optimizer/param-group references and later graph captures stay valid).
-    Rotary cos/sin buffers are already COMPUTE_DTYPE (bf16 on CUDA)."""
-    assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    model.to(torch.bfloat16)
+# TODO - Implement...
+class PrefillAllEngine:
+    """Prefill all the context at once, then decode.
 
+    Life cycle: __init__ builds the pool + graphs (untimed setup; call with the
+    KV pool memory available), then per round:
+        pool.reclaim() -> run_round(nodes) -> pool.lend()
+    `make_nodes` builds the admission units from (meta, prompt_ids, k, allow)
+    specs. Rows never retain pool pages across rounds (leak-asserted).
+    """
 
-from nanochat.optim import adamw_step_fused, muon_step_fused
+    def __init__(self, model, tokenizer, *,
+                 kv_pool_gb: float,
+                 max_seqs: int,
+                 max_tokens: int,
+                 max_prompt_len: int,
+                 macro_n: int = 8,
+                 buckets: tuple | None = None,
+                 prefill_t: int = 2048,
+                 prefill_seqs: int = 12,
+                 pantry_blocks: int = 96,
+                 starve_jobs: int = 12,
+                 pass1: int = 0,
+                 temperature: float = 0.6,
+                 top_p: float = 0.95,
+                 top_k: int = 512,
+                 stop_detect: bool = True,
+                 stop_strings: tuple = ("\nQuestion:", " Question:", "\nProblem:"),
+                 window_tokens: int = 6,
+                 compile_decode: bool = True,
+                 compile_prefill: bool = True,
+                 prefill_fullgraph: bool = True,
+                 extra_compile_slots: int = 8,
+                 print_every: int | None = None,
+                 device_index: int = 0):
+        assert pass1 == 0 or pass1 < max_tokens, "PASS1 must be < MAX_TOKENS (or 0 to disable)"
+        self.model, self.tok = model, tokenizer
+        self.max_tokens, self.pass1 = max_tokens, pass1
+        self.pass1_eff = pass1 or max_tokens
+        self.macro_n, self.prefill_t, self.prefill_seqs = macro_n, prefill_t, prefill_seqs
+        self.pantry_cap, self.starve_jobs = pantry_blocks, starve_jobs
+        self.stop_detect, self.stop_strings, self.window_tokens = stop_detect, tuple(stop_strings), window_tokens
+        self.print_every = print_every
 
+        # Terminal set for the nanochat chat format: assistant_end ends the turn;
+        # a sampled bos would start a fresh document — both retire the row.
+        self.terminal_ids = frozenset({tokenizer.encode_special("<|assistant_end|>"),
+                                       tokenizer.get_bos_token_id()})
+        self.gate_ids = frozenset(
+            ids[-1] for s in self.stop_strings for ids in [tokenizer.encode(s)] if ids)
 
-class _Fp32StateMixin:
-    """Shared helpers: fp32 master snapshots + dtype-preserving state load."""
+        self.kv_pool_gb = kv_pool_gb
+        self.sampler_cfg = (temperature, top_p, top_k)
+        self.pool = KVPool(model.config, int(kv_pool_gb * 2 ** 30), device_index)
+        self.max_blocks = nblocks(max_prompt_len + 1 + max_tokens + macro_n) + 1
+        # Admission ceiling: worst-case per-row private reserve at the pass-1 budget.
+        min_priv = nblocks(2 + self.pass1_eff + macro_n)  # smallest plausible context
+        self.ceiling_rows = max(1, (len(self.pool.free) - pantry_blocks) // min_priv)
+        if buckets is None:
+            buckets = default_buckets(min(self.ceiling_rows, max_seqs), max_seqs)
+        assert max(buckets) <= max_seqs
+        self.buckets = tuple(sorted(buckets))
+        self.max_seqs = max_seqs
 
-    def _snapshot_masters(self):
-        """Eagerly snapshot fp32 masters for every param slice this rank owns.
-        Called at construction, BEFORE the model is cast to bf16, so masters
-        keep the checkpoint's full precision."""
-        raise NotImplementedError
+        n_slots = max_seqs + 4 * pantry_blocks + 64
+        self.store = SmearStore(n_slots, model.config.n_embd, "cuda")
+        with torch.no_grad():
+            self.gd = GraphDecoder(model, self.pool, self.store, self.max_blocks,
+                                   max_seqs, macro_n, self.buckets, temperature,
+                                   top_p, top_k, compile_body=compile_decode,
+                                   extra_compile_slots=extra_compile_slots)
+        self.pfg = None
+        self._compile_prefill = compile_prefill
+        self._prefill_fullgraph = prefill_fullgraph
+        # v1.1 lesson (speedrun): overlapped side-stream refills deadlock
+        # mid-decode in a fused gen+train process; refills stay serialized.
+        self.prefill_stream = torch.cuda.current_stream()
 
-    def state_dict(self):
-        # Keyed by (group_idx, param_idx) — stable across processes (unlike id()).
-        param_states = {}
-        for gi, group in enumerate(self.param_groups):
-            for pi, p in enumerate(group["params"]):
-                st = self.state.get(p)
-                if st:
-                    param_states[f"{gi}.{pi}"] = {
-                        k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                        for k, v in st.items()}
-        return {"param_states": param_states}
+    @torch.no_grad()
+    def capture(self, warm_context: list[int]) -> None:
+        """Capture decode buckets + the prefill graph; warm one prefill replay."""
+        temp, top_p, top_k = self.sampler_cfg
+        print(f"  engine config: kv_pool {self.kv_pool_gb:g} GB "
+              f"({self.pool.num_blocks} blocks x {PAGE} tok) | max_seqs {self.max_seqs} | "
+              f"buckets {self.buckets} | macro_n {self.macro_n} | "
+              f"prefill T={self.prefill_t} x{self.prefill_seqs} seqs | "
+              f"pantry {self.pantry_cap} blocks | starve_jobs {self.starve_jobs} | "
+              f"max_tokens {self.max_tokens}"
+              + (f" (pass1 {self.pass1})" if self.pass1 else "")
+              + f" | temp {temp:g} top_p {top_p:g} top_k {top_k} | "
+              f"stop_detect {int(self.stop_detect)} | ceiling_rows {self.ceiling_rows}",
+              flush=True)
+        print("  capture+compile decode buckets:", flush=True)
+        self.gd.capture_all()
+        self.pfg = PrefillGraph(self.model, self.pool, self.prefill_t, self.prefill_seqs,
+                                compile_body=self._compile_prefill,
+                                fullgraph=self._prefill_fullgraph)
+        t = time.perf_counter()
+        self.pfg.capture()
+        print(f"    prefill graph (T={self.prefill_t}, "
+              f"{'compiled' if self._compile_prefill else 'capture-only'}): "
+              f"{time.perf_counter() - t:5.1f}s", flush=True)
+        warm = Node(list(warm_context), [])
+        self.pfg.run([warm])
+        self.pool.release(warm.blocks)
+        warm.blocks = []
+        self.pfg.replays = self.pfg.real_tok = 0
+        torch.cuda.synchronize()
 
-    def load_state_dict(self, state_dict):
-        """Dtype-preserving load (modded-nanogpt convention): each loaded tensor
-        is cast to the dtype/device of the EXISTING state entry, so fp32
-        momentum/master never silently degrade to the param dtype."""
-        for gi, group in enumerate(self.param_groups):
-            for pi, p in enumerate(group["params"]):
-                saved = state_dict["param_states"].get(f"{gi}.{pi}")
-                if saved is None:
+    def set_sampling(self, temperature: float | None = None, top_p: float | None = None) -> None:
+        self.gd.set_sampling(temperature, top_p)
+
+    def make_nodes(self, specs: list[tuple]) -> list["Node"]:
+        """specs: (meta, prompt_ids, k, allow). Context = prompt[:-1]; forced
+        first decode input = prompt[-1]; K natural draws at the given budget."""
+        nodes = []
+        for meta, prompt_ids, k, allow in specs:
+            assert len(prompt_ids) >= 2, "prompt too short for the split-last-token trick"
+            assert allow <= self.max_tokens, "allow exceeds engine MAX_TOKENS (block table width)"
+            p1 = self.pass1_eff if self.pass1 else allow
+            jobs = [dict(meta=meta, prompt_ids=list(prompt_ids), forced=prompt_ids[-1],
+                         allow=min(p1, allow), budget=allow,
+                         final=(self.pass1 == 0 or allow <= self.pass1_eff))
+                    for _ in range(k)]
+            nodes.append(Node(list(prompt_ids[:-1]), jobs))
+        return nodes
+
+    # -- the round driver ------------------------------------------------------
+    @torch.no_grad()
+    def run_round(self, nodes_all: list["Node"], rnd: int = 0,
+                  on_retire=None) -> tuple[list[dict], dict]:
+        """One round of generation through the persistent engine. Returns
+        (rows, stats). Each row: dict(meta, completion_token_ids, completion_text,
+        terminal, stop_reason, finish_reason). `on_retire(row)` fires as rows
+        finish (e.g. inline grading)."""
+        pfg, gd, pool, store = self.pfg, self.gd, self.pool, self.store
+        MACRO_N = self.macro_n
+        pfg.replays = pfg.real_tok = 0
+        pantry: deque[tuple[Seq, torch.cuda.Event]] = deque()
+        pantry_blocks = 0
+        node_q = deque(nodes_all)
+        running: list[Seq] = []
+        rows: list[dict] = []
+        rolls_done = tok_total = 0
+        stop_fires = refills = adopt_stalls = bnd_copies = n_ext = 0
+        prefill_s = adopt_s = 0.0
+        n_target = sum(len(n.cand_jobs) for n in nodes_all)
+        print_every = self.print_every or max(1, n_target // 8)
+
+        def reserved_owned() -> int:
+            return sum(s.need - len(s.blocks) for s in running)
+
+        def plan_refill() -> list[Node]:
+            take: list[Node] = []
+            tok_n = cost_sum = 0
+            blocks_left = min(self.pantry_cap - pantry_blocks,
+                              len(pool.free) - reserved_owned())
+            full = False
+            for nd in node_q:
+                L = nd.plen
+                if tok_n + L > self.prefill_t:
+                    full = True
+                    break
+                if cost_sum + nd.new_pages() > blocks_left or len(take) + 1 > self.prefill_seqs:
+                    break
+                take.append(nd)
+                cost_sum += nd.new_pages()
+                tok_n += L
+            # Continuation nodes trickle in — batch until the chunk is token-full
+            # or the pantry is actually hungry (liveness preserved via STARVE).
+            if take and (full or len(pantry) <= self.starve_jobs):
+                return take
+            if not take and not running and not pantry and node_q:
+                nd = node_q[0]
+                assert nd.new_pages() <= len(pool.free), \
+                    f"first node needs {nd.new_pages()} pages, only {len(pool.free)} free"
+                return [nd]
+            return []
+
+        def mint_rows(nd: Node) -> list[Seq]:
+            nonlocal pantry_blocks, bnd_copies
+            seqs = []
+            full_pages = nd.blocks[:nd.n_full]
+            src_bnd = nd.blocks[nd.n_full] if nd.partial else None
+            for j, job in enumerate(nd.cand_jobs):
+                s = Seq(job, nd, MACRO_N)
+                pool.addref(full_pages)
+                s.blocks = list(full_pages)
+                s.n_shared = nd.n_full
+                if nd.partial:
+                    if j == 0:
+                        s.blocks.append(src_bnd)
+                    else:
+                        dst = pool.alloc(1)[0]
+                        pool.k[:, dst].copy_(pool.k[:, src_bnd])
+                        pool.v[:, dst].copy_(pool.v[:, src_bnd])
+                        s.blocks.append(dst)
+                        s.priv_pantry = 1
+                        bnd_copies += 1
+                s.seq_len = nd.plen
+                s.slot = store.alloc()
+                seqs.append(s)
+            # Seed every sibling's smear state with the node's last-context
+            # pre-smear embedding (computed by the prefill graph).
+            slots_t = torch.tensor([s.slot for s in seqs], dtype=torch.long, device="cuda")
+            store.data[slots_t] = nd.seed_emb.unsqueeze(0).expand(len(seqs), -1)
+            pool.release(full_pages)
+            nd.pantry_pages = nd.new_pages()
+            pantry_blocks += nd.pantry_pages
+            return seqs
+
+        def refill_varlen() -> None:
+            nonlocal refills, prefill_s
+            take = plan_refill()
+            if not take:
+                return
+            _t = time.perf_counter()
+            for _ in take:
+                node_q.popleft()
+            refills += 1
+            with torch.cuda.stream(self.prefill_stream):
+                pfg.run(take)
+                minted = [s for nd in take for s in mint_rows(nd)]
+            ev = torch.cuda.Event()
+            ev.record(self.prefill_stream)
+            for s in minted:
+                pantry.append((s, ev))
+            prefill_s += time.perf_counter() - _t
+
+        def adopt() -> None:
+            nonlocal pantry_blocks, adopt_s, adopt_stalls
+            _t = time.perf_counter()
+            reserved = reserved_owned()
+            row_cap = min(self.max_seqs, max(self.buckets))
+            while pantry and len(running) + 1 <= row_cap:
+                s, ev = pantry[0]
+                if not ev.query():
+                    adopt_stalls += 1
+                    break
+                if len(pool.free) < reserved + (s.need - len(s.blocks)):
+                    break
+                reserved += s.need - len(s.blocks)
+                pantry_blocks -= s.priv_pantry
+                s.node.rows_left -= 1
+                if s.node.rows_left == 0:
+                    pantry_blocks -= nblocks(s.node.plen)
+                pantry.popleft()
+                s.next_tok = s.forced
+                running.append(s)
+            adopt_s += time.perf_counter() - _t
+
+        def suspend(s: Seq) -> None:
+            """Two-pass: pass-1 budget reached with budget remaining — free the
+            row's pages and re-queue as a K=1 continuation node. Context =
+            prompt ⊕ gen[:-1]; forced first decode input = gen[-1]."""
+            nonlocal n_ext
+            s.done = True
+            pool.release(s.blocks)
+            s.blocks = []
+            store.release(s.slot)
+            j = s.job
+            gen_prefix = list(j.get("gen_prefix", [])) + list(s.gen)
+            cont = dict(meta=j["meta"], prompt_ids=j["prompt_ids"],
+                        gen_prefix=gen_prefix, forced=gen_prefix[-1],
+                        allow=j["budget"] - len(gen_prefix), budget=j["budget"],
+                        final=True)
+            node_q.append(Node(list(j["prompt_ids"]) + gen_prefix[:-1], [cont]))
+            n_ext += 1
+
+        def retire(s: Seq, eos: bool, stop: str | None = None) -> None:
+            nonlocal rolls_done
+            s.done = True
+            pool.release(s.blocks)
+            s.blocks = []
+            store.release(s.slot)
+            j = s.job
+            full_gen = list(j.get("gen_prefix", [])) + list(s.gen)   # pass-1 ⊕ pass-2
+            body = full_gen[:-1] if eos else full_gen  # trailing terminal excluded from text
+            full_text = self.tok.decode(body)
+            if stop is not None:
+                cut = len(full_text)
+                for ss in self.stop_strings:
+                    i = full_text.find(ss)
+                    if i != -1:
+                        cut = min(cut, i)
+                full_text = full_text[:cut]
+                finish_reason, stop_reason, terminal = "stop", stop, "stop_string"
+            elif eos:
+                finish_reason, stop_reason, terminal = "stop", None, "emitted_eos"
+            else:
+                finish_reason, stop_reason, terminal = "length", None, "truncated"
+            row = dict(meta=j["meta"], round=rnd, completion_token_ids=full_gen,
+                       completion_text=full_text, finish_reason=finish_reason,
+                       stop_reason=stop_reason, terminal=terminal)
+            rows.append(row)
+            if on_retire is not None:
+                on_retire(row)
+            rolls_done += 1
+
+        def _stop_hit(s: Seq) -> str | None:
+            ids = s.gen[-self.window_tokens:]
+            if len(ids) < self.window_tokens:  # pad from the pre-gen stream
+                pre = list(s.job["prompt_ids"]) + list(s.job.get("gen_prefix", []))
+                ids = pre[len(ids) - self.window_tokens:] + ids
+            tail = self.tok.decode(ids)
+            hits = [ss for ss in self.stop_strings if ss in tail]
+            if not hits:
+                return None
+            return max(hits, key=lambda ss: tail.rfind(ss))
+
+        def apply_window(batch: list[Seq], toks: list[list[int]]) -> bool:
+            nonlocal tok_total, stop_fires
+            any_done = False
+            for s, row in zip(batch, toks):
+                if (self.terminal_ids.isdisjoint(row)
+                        and (not self.stop_detect or self.gate_ids.isdisjoint(row))
+                        and len(s.gen) + MACRO_N < s.allow):
+                    s.gen.extend(row)
+                    tok_total += MACRO_N
+                    s.seq_len += MACRO_N
+                    s.next_tok = row[-1]
                     continue
-                st = self.state[p]
-                for k, v in saved.items():
-                    if isinstance(v, torch.Tensor) and k in st and isinstance(st[k], torch.Tensor):
-                        st[k] = v.to(dtype=st[k].dtype, device=st[k].device)
-                    else:
-                        st[k] = v
+                for t in row:
+                    s.gen.append(t)
+                    tok_total += 1
+                    if t in self.terminal_ids:
+                        retire(s, True)
+                        any_done = True
+                        break
+                    if len(s.gen) >= s.allow:
+                        # pass-1 budget with budget remaining -> extend; else truncated.
+                        if s.job["final"]:
+                            retire(s, False)
+                        else:
+                            suspend(s)
+                        any_done = True
+                        break
+                    if self.stop_detect and t in self.gate_ids:
+                        hit = _stop_hit(s)
+                        if hit is not None:
+                            stop_fires += 1
+                            retire(s, False, stop=hit)
+                            any_done = True
+                            break
+                if not s.done:
+                    s.seq_len += MACRO_N
+                    s.next_tok = row[-1]
+            return any_done
 
+        t0 = time.perf_counter()
+        last_roll_print = 0
+        while node_q or pantry or running:
+            if not running:
+                if node_q:
+                    refill_varlen()
+                if pantry:
+                    adopt()
+                assert running or pantry or node_q, "nothing running and nothing to admit"
+                if not running:
+                    continue
+            batch = running
+            inputs, cache_lens, block_rows, slots = [], [], [], []
+            for s in batch:
+                grow = (s.seq_len + MACRO_N + PAGE - 1) // PAGE - len(s.blocks)
+                if grow > 0:
+                    s.blocks.extend(pool.alloc(grow))
+                inputs.append(s.next_tok)
+                cache_lens.append(s.seq_len)
+                block_rows.append(s.blocks)
+                slots.append(s.slot)
+            gd.begin_window(inputs, cache_lens, block_rows, slots)
+            if node_q:
+                refill_varlen()
+            toks = gd.collect_window()
+            if apply_window(batch, toks):
+                running = [s for s in running if not s.done]
+            if pantry:
+                adopt()
+            if rolls_done - last_roll_print >= print_every:
+                el = time.perf_counter() - t0
+                # all Python-side counters — no GPU sync, no throughput cost
+                print(f"    [r{rnd}] roll {rolls_done:4d}/{n_target} | tok {tok_total:>10,} | "
+                      f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {len(running):3d} | "
+                      f"pantry {pantry_blocks:3d}b/{len(pantry):2d}j | "
+                      f"free {len(pool.free):4d} | {el:6.1f}s", flush=True)
+                last_roll_print = rolls_done
 
-class Fp32MuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
-    """MuonAdamW (nanochat/optim.py) with fp32 optimizer state and fp32 master
-    weights; bf16 params are updated by IN-PLACE copy from the masters, so
-    captured CUDA graphs keep reading valid pointers. Single-GPU version.
+        gen_s = time.perf_counter() - t0
+        assert pantry_blocks == 0 and not pantry, "pantry not drained"
+        leaked = self.pool.num_blocks - 1 - len(self.pool.free) - 2  # null + gd/pfg scratch
+        assert leaked == 0, f"{leaked} KV blocks leaked"
+        assert len(store.free) == len(store.data), "smear slots leaked"
+        return rows, dict(
+            gen_s=gen_s, gen_tok=tok_total, refills=refills, replays=pfg.replays,
+            prefill_tok=pfg.real_tok, bnd_copies=bnd_copies, stop_fires=stop_fires,
+            adopt_stalls=adopt_stalls, prefill_s=prefill_s, adopt_s=adopt_s,
+            n_extended=n_ext)
 
-    Construct while the model still holds the checkpoint's fp32 weights (only
-    the embeddings are natively bf16); cast the model to bf16 AFTER."""
-
-    def __init__(self, param_groups: list[dict]):
-        super().__init__(param_groups, defaults={})
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._snapshot_masters()
-
-    def _snapshot_masters(self):
-        for group in self.param_groups:
-            if group["kind"] == "adamw":
-                for p in group["params"]:
-                    st = self.state[p]
-                    st["step"] = 0
-                    st["master"] = p.detach().float().clone()
-                    st["exp_avg"] = torch.zeros_like(st["master"])
-                    st["exp_avg_sq"] = torch.zeros_like(st["master"])
-            elif group["kind"] == "muon":
-                params = group["params"]
-                p = params[0]
-                st = self.state[p]
-                shape = p.shape
-                st["master_stack"] = torch.stack([q.detach().float() for q in params])
-                st["momentum_buffer"] = torch.zeros_like(st["master_stack"])
-                state_shape = ((len(params), shape[-2], 1) if shape[-2] >= shape[-1]
-                               else (len(params), 1, shape[-1]))
-                st["second_momentum_buffer"] = torch.zeros(
-                    state_shape, dtype=torch.float32, device=p.device)
-
-    def _step_adamw(self, group: dict) -> None:
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-            state = self.state[p]
-            state["step"] += 1
-            self._adamw_step_t.fill_(state["step"])
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t.fill_(group["eps"])
-            self._adamw_wd_t.fill_(group["weight_decay"])
-            adamw_step_fused(
-                state["master"], p.grad.float(), state["exp_avg"], state["exp_avg_sq"],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-            )
-            p.copy_(state["master"])   # bf16 writeback, same storage
-
-    def _step_muon(self, group: dict) -> None:
-        params = group["params"]
-        if not params or params[0].grad is None:
-            return
-        state = self.state[params[0]]
-        shape = params[0].shape
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params]).float()
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(
-            stacked_grads, state["master_stack"],
-            state["momentum_buffer"], state["second_momentum_buffer"],
-            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-            self._muon_beta2_t, group["ns_steps"], red_dim,
-        )
-        for p, m in zip(params, state["master_stack"].unbind(0)):
-            p.copy_(m)                 # bf16 writeback, same storage
-
+    # -- eager debug path (parity gate) ---------------------------------------
     @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group["kind"] == "adamw":
-                self._step_adamw(group)
-            elif group["kind"] == "muon":
-                self._step_muon(group)
-            else:
-                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
-
-
-class Fp32DistMuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
-    """DistMuonAdamW (ZeRO-sharded) with fp32 state + fp32 sharded masters and
-    in-place bf16 writeback. Comm runs in the param dtype (bf16 after cast).
-    Same 3-phase async structure as nanochat/optim.py DistMuonAdamW."""
-
-    def __init__(self, param_groups: list[dict]):
-        import torch.distributed as dist
-        super().__init__(param_groups, defaults={})
-        self._dist = dist
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._snapshot_masters()
-
-    def _snapshot_masters(self):
-        dist = self._dist
-        rank, world = dist.get_rank(), dist.get_world_size()
-        for group in self.param_groups:
-            if group["kind"] == "adamw":
-                for p in group["params"]:
-                    st = self.state[p]
-                    st["step"] = 0
-                    if p.numel() < 1024:
-                        p_slice = p
-                    else:
-                        assert p.shape[0] % world == 0
-                        rs = p.shape[0] // world
-                        p_slice = p[rank * rs:(rank + 1) * rs]
-                    st["master"] = p_slice.detach().float().clone()
-                    st["exp_avg"] = torch.zeros_like(st["master"])
-                    st["exp_avg_sq"] = torch.zeros_like(st["master"])
-            elif group["kind"] == "muon":
-                params = group["params"]
-                p = params[0]
-                st = self.state[p]
-                shape = p.shape
-                chunk = (len(params) + world - 1) // world
-                start = rank * chunk
-                owned = [params[start + i] for i in range(min(chunk, max(0, len(params) - start)))]
-                st["master_stack"] = (torch.stack([q.detach().float() for q in owned])
-                                      if owned else torch.zeros(0, *shape, dtype=torch.float32, device=p.device))
-                st["momentum_buffer"] = torch.zeros(chunk, *shape, dtype=torch.float32, device=p.device)
-                state_shape = ((chunk, shape[-2], 1) if shape[-2] >= shape[-1]
-                               else (chunk, 1, shape[-1]))
-                st["second_momentum_buffer"] = torch.zeros(
-                    state_shape, dtype=torch.float32, device=p.device)
-
-    def _reduce_adamw(self, group, world_size):
-        dist = self._dist
-        param_infos = {}
-        for p in group["params"]:
-            grad = p.grad
-            if p.numel() < 1024:
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
-            else:
-                assert grad.shape[0] % world_size == 0
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG,
-                                                    async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
-        return dict(param_infos=param_infos)
-
-    def _reduce_muon(self, group, world_size):
-        dist = self._dist
-        params = group["params"]
-        chunk_size = (len(params) + world_size - 1) // world_size
-        padded = chunk_size * world_size
-        p = params[0]
-        shape, device, dtype = p.shape, p.device, p.dtype
-        grad_stack = torch.stack([q.grad for q in params])
-        stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
-        if len(params) < padded:
-            stacked_grads[len(params):].zero_()
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG,
-                                            async_op=True).get_future()
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads,
-                    chunk_size=chunk_size)
-
-    def _compute_adamw(self, group, info, gather_list, rank, world_size):
-        dist = self._dist
-        for p in group["params"]:
-            pinfo = info["param_infos"][p]
-            pinfo["future"].wait()
-            state = self.state[p]
-            if pinfo["is_small"]:
-                p_slice = p
-            else:
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
-            state["step"] += 1
-            self._adamw_step_t.fill_(state["step"])
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t.fill_(group["eps"])
-            self._adamw_wd_t.fill_(group["weight_decay"])
-            adamw_step_fused(
-                state["master"], pinfo["grad_slice"].float(),
-                state["exp_avg"], state["exp_avg_sq"],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-            )
-            p_slice.copy_(state["master"])
-            if not pinfo["is_small"]:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                gather_list.append(dict(future=future, params=None))
-
-    def _compute_muon(self, group, info, gather_list, rank):
-        dist = self._dist
-        info["future"].wait()
-        params = group["params"]
-        chunk_size = info["chunk_size"]
-        p = params[0]
-        shape, device = p.shape, p.device
-        start_idx = rank * chunk_size
-        num_owned = min(chunk_size, max(0, len(params) - start_idx))
-        state = self.state[p]
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        updated = torch.empty(chunk_size, *shape, dtype=p.dtype, device=device)
-        if num_owned > 0:
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                info["grad_chunk"][:num_owned].float(), state["master_stack"],
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                self._muon_beta2_t, group["ns_steps"], red_dim,
-            )
-            updated[:num_owned].copy_(state["master_stack"])   # fp32 -> bf16
-        if num_owned < chunk_size:
-            updated[num_owned:].zero_()
-        stacked_params = info["stacked_grads"]                  # reuse buffer
-        future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
-        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
-
-    def _finish_gathers(self, gather_list):
-        for info in gather_list:
-            info["future"].wait()
-            if info["params"] is not None:
-                torch._foreach_copy_(info["params"],
-                                     list(info["stacked_params"][:len(info["params"])].unbind(0)))
-
-    @torch.no_grad()
-    def step(self):
-        dist = self._dist
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-        reduce_infos = []
-        for group in self.param_groups:
-            if group["kind"] == "adamw":
-                reduce_infos.append(self._reduce_adamw(group, world_size))
-            elif group["kind"] == "muon":
-                reduce_infos.append(self._reduce_muon(group, world_size))
-            else:
-                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
-        gather_list = []
-        for group, info in zip(self.param_groups, reduce_infos):
-            if group["kind"] == "adamw":
-                self._compute_adamw(group, info, gather_list, rank, world_size)
-            else:
-                self._compute_muon(group, info, gather_list, rank)
-        self._finish_gathers(gather_list)
-
-
-def setup_fp32_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                         weight_decay=0.0, scalar_lr=0.5):
-    """nanochat GPT.setup_optimizer's exact param-group split, but constructing
-    the fp32-master variant. Call while the model still holds fp32 weights;
-    cast to bf16 afterwards."""
-    from nanochat.common import get_dist_info, print0
-    model_dim = model.config.n_embd
-    ddp, rank, local_rank, world_size = get_dist_info()
-
-    matrix_params = list(model.transformer.h.parameters())
-    value_embeds_params = list(model.value_embeds.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
-    resid_params = [model.resid_lambdas]
-    x0_params = [model.x0_lambdas]
-    smear_params = [model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
-    assert len(list(model.parameters())) == (len(matrix_params) + len(embedding_params)
-                                             + len(lm_head_params) + len(value_embeds_params)
-                                             + len(resid_params) + len(x0_params) + len(smear_params))
-
-    dmodel_lr_scale = (model_dim / 768) ** -0.5
-    print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
-    param_groups = [
-        dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-        dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-        dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-        dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-        dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
-    ]
-    for shape in sorted({p.shape for p in matrix_params}):
-        group_params = [p for p in matrix_params if p.shape == shape]
-        param_groups.append(dict(
-            kind='muon', params=group_params, lr=matrix_lr,
-            momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-        ))
-    Factory = Fp32DistMuonAdamW if ddp else Fp32MuonAdamW
-    optimizer = Factory(param_groups)
-    for group in optimizer.param_groups:
-        group["initial_lr"] = group["lr"]
-    return optimizer
-
-
-# -----------------------------------------------------------------------------
-# §10. Trainer — group advantage + branch-masked REINFORCE over compiled
-#      fixed-shape packs (speedrun §3; forward = nanochat's own GPT.forward)
-# -----------------------------------------------------------------------------
-ADV_EPS = 1e-6
-
-
-def group_advantages(rewards: np.ndarray, resolved: np.ndarray | None = None,
-                     use_std: bool = True) -> np.ndarray | None:
-    """(r - mean)/std over one problem's RESOLVED rewards; None for a std=0 group
-    (all-correct / all-incorrect — no signal, skip). use_std=False gives stock
-    nanochat's plain (r - mean) advantage (still skipping zero-signal groups)."""
-    r = np.asarray(rewards, dtype=np.float64)
-    res = (np.ones(len(r), dtype=bool) if resolved is None
-           else np.asarray(resolved, dtype=bool))
-    rr = r[res]
-    if rr.size < 2:
-        return None
-    std = rr.std()
-    if std < ADV_EPS:
-        return None
-    adv = np.zeros(len(r), dtype=np.float64)
-    adv[res] = (rr - rr.mean()) / std if use_std else (rr - rr.mean())
-    return adv
-
-
-class ReinforcePack:
-    __slots__ = ("input_ids", "cu_seqlens", "targets", "comp_mask",
-                 "adv_tok", "n_seqs", "n_comp_targets")
-
-    def __init__(self, **kw):
-        for k, v in kw.items():
-            setattr(self, k, v)
-
-
-def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
-                          device="cuda"):
-    """FFD bin-pack ``docs`` = (prompt_ids, completion_ids, advantage) into
-    fixed-shape packs; each bin sealed at the smallest bucket >= its fill. The
-    pad tail is emitted as benign varying-ids segments of <= max_doc_len each
-    (FA-varlen NaN doctrine; nanochat's forward passes max_seqlen=sequence_len,
-    so no packed segment may exceed it)."""
-    buckets = sorted(buckets)
-    cap = buckets[-1]
-    stats = {"n_docs": len(docs), "n_packs": 0, "pad_tokens": 0, "comp_targets": 0,
-             "cap_tokens": 0}  # sum of sealed bucket sizes -> pad% = pad/cap
-    if not docs:
-        return [], stats
-    for p_ids, c_ids, _ in docs:
-        L = len(p_ids) + len(c_ids)
-        assert L <= cap, f"doc {L} tok > max bucket {cap} — raise TRAIN_BUCKETS"
-        assert L <= max_doc_len, f"doc {L} tok > max_seqlen {max_doc_len}"
-
-    order = sorted(range(len(docs)),
-                   key=lambda i: len(docs[i][0]) + len(docs[i][1]), reverse=True)
-    bins: list[dict] = []
-    for di in order:
-        L = len(docs[di][0]) + len(docs[di][1])
-        for b in bins:
-            if b["used"] + L <= cap and len(b["items"]) < max_num_docs:
-                b["used"] += L; b["items"].append(di); break
-        else:
-            bins.append({"used": L, "items": [di]})
-
-    max_pad_segs = -(-cap // max_doc_len) + 1
-    out: list[ReinforcePack] = []
-    for b in bins:
-        T_pack = next(x for x in buckets if x >= b["used"])
-        stats["cap_tokens"] += T_pack
-        ids = torch.full((T_pack,), pad_id, dtype=torch.long)
-        targets = torch.full((T_pack,), pad_id, dtype=torch.long)
-        comp = torch.zeros(T_pack, dtype=torch.float32)
-        adv = torch.zeros(T_pack, dtype=torch.float32)
-        cu = torch.zeros(max_num_docs + max_pad_segs + 2, dtype=torch.int32)
-        off = 0
-        n_comp_in_pack = 0
-        si = 0
-        for si, di in enumerate(b["items"]):
-            p_ids, c_ids, a = docs[di]
-            doc = list(p_ids) + list(c_ids)
-            L = len(doc)
-            p_len, c_len = len(p_ids), len(c_ids)
-            ids[off:off + L] = torch.tensor(doc, dtype=torch.long)
-            if L > 1:
-                targets[off:off + L - 1] = torch.tensor(doc[1:], dtype=torch.long)
-            if c_len > 0:
-                lo = off + p_len - 1
-                comp[lo:lo + c_len] = 1.0
-                adv[lo:lo + c_len] = float(a)
-                n_comp_in_pack += c_len
-            cu[si + 1] = off + L
-            off += L
-        seg_i = len(b["items"]) + 1
-        if off < T_pack:                      # benign pad segments (varying ids)
-            ids[off:] = torch.arange(T_pack - off) % 4096 + 1
-            while off < T_pack:
-                off2 = min(off + max_doc_len, T_pack)
-                cu[seg_i] = off2
-                seg_i += 1
-                off = off2
-        cu[seg_i:] = T_pack
-        stats["pad_tokens"] += int(T_pack - (cu[len(b["items"])].item()))
-        stats["comp_targets"] += n_comp_in_pack
-        out.append(ReinforcePack(
-            input_ids=ids.to(device), cu_seqlens=cu.to(device),
-            targets=targets.to(device), comp_mask=comp.to(device), adv_tok=adv.to(device),
-            n_seqs=len(b["items"]), n_comp_targets=n_comp_in_pack))
-    stats["n_packs"] = len(out)
-    return out, stats
-
-
-def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv_tok,
-                           branch_temperature: float, branch_top_p: float):
-    """Compile target (fullgraph, static shapes): nanochat packed forward ->
-    Σ -A·logπ over kept BRANCH tokens (the policy's own T=1.0 nucleus>1
-    positions). Returns (loss_sum, n_loss_tokens, n_branch, n_comp); only
-    loss_sum carries grad."""
-    logits = model(input_ids, targets=None, cu_seqlens=cu_seqlens)  # (1, T, V) fp32 softcapped
-    logits = logits[0]
-    logp = -F.cross_entropy(logits, targets, reduction="none")
-    z = logits / branch_temperature
-    log_pmax = z.amax(-1) - z.logsumexp(-1)
-    branch = log_pmax <= math.log(branch_top_p)
-    comp = comp_mask.bool()
-    tok_mask = comp & branch
-    loss_sum = (-(adv_tok * logp) * tok_mask).sum()
-    return loss_sum, tok_mask.sum(), tok_mask.sum(), comp.sum()
+    def debug_greedy(self, prompt_ids: list[int], max_new_tokens: int,
+                     stop_at_terminal: bool = True) -> list[int]:
+        """Greedy generation through the SAME paged forward path, eagerly (no
+        graphs, no sampler): prefill prompt[:-1] via prefill_body semantics,
+        then argmax-decode starting from the forced prompt[-1]. Used by the
+        Phase-2 parity gate against the reference engine."""
+        model = self.model
+        dev = "cuda"
+        ctx = prompt_ids[:-1]
+        Lp = len(ctx)
+        blocks = self.pool.alloc(nblocks(Lp + 1 + max_new_tokens + 1))
+        cfg = model.config
+        n_kv, hd = cfg.n_kv_head, cfg.n_embd // cfg.n_head
+        k_flat = self.pool.k.view(cfg.n_layer, -1, n_kv, hd)
+        v_flat = self.pool.v.view(cfg.n_layer, -1, n_kv, hd)
+        ids = torch.tensor(ctx, dtype=torch.long, device=dev)
+        pos = torch.arange(Lp, dtype=torch.long, device=dev)
+        slot = torch.tensor([blocks[p // PAGE] * PAGE + p % PAGE for p in range(Lp)],
+                            dtype=torch.long, device=dev)
+        notstart = torch.ones(Lp, 1, dtype=torch.bfloat16, device=dev)
+        notstart[0] = 0
+        cu = torch.tensor([0, Lp], dtype=torch.int32, device=dev)
+        gather = torch.tensor([Lp - 1], dtype=torch.long, device=dev)
+        seed = prefill_body(model, ids, pos, cu, slot, notstart, gather,
+                            k_flat, v_flat, Lp)
+        prev_emb = seed.clone()                       # (1, C)
+        block_row = blocks + [0] * (self.max_blocks - len(blocks))
+        block_table = torch.tensor([block_row], dtype=torch.int32, device=dev)
+        cache_seqlens = torch.tensor([Lp], dtype=torch.int32, device=dev)
+        input_ids = torch.tensor([[prompt_ids[-1]]], dtype=torch.long, device=dev)
+        out = []
+        for _ in range(max_new_tokens):
+            logits, x_pre = decode_body(model, input_ids, cache_seqlens, block_table,
+                                        self.pool.k, self.pool.v, prev_emb)
+            prev_emb.copy_(x_pre)
+            cache_seqlens += 1
+            nxt = int(torch.argmax(logits, dim=-1).item())
+            out.append(nxt)
+            if stop_at_terminal and nxt in self.terminal_ids:
+                break
+            input_ids[0, 0] = nxt
+        self.pool.release(blocks)
+        return out

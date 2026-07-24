@@ -531,3 +531,315 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+
+# -----------------------------------------------------------------------------
+# bf16 weights + 32-bit-state optimizer (fp32 master, in-place bf16 writeback)
+# -----------------------------------------------------------------------------
+
+class _Fp32StateMixin:
+    """Shared helpers: fp32 master snapshots + dtype-preserving state load."""
+
+    def _snapshot_masters(self):
+        """Eagerly snapshot fp32 masters for every param slice this rank owns.
+        Called at construction, BEFORE the model is cast to bf16, so masters
+        keep the checkpoint's full precision."""
+        raise NotImplementedError
+
+    def state_dict(self):
+        # Keyed by (group_idx, param_idx) — stable across processes (unlike id()).
+        param_states = {}
+        for gi, group in enumerate(self.param_groups):
+            for pi, p in enumerate(group["params"]):
+                st = self.state.get(p)
+                if st:
+                    param_states[f"{gi}.{pi}"] = {
+                        k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                        for k, v in st.items()}
+        return {"param_states": param_states}
+
+    def load_state_dict(self, state_dict):
+        """Dtype-preserving load (modded-nanogpt convention): each loaded tensor
+        is cast to the dtype/device of the EXISTING state entry, so fp32
+        momentum/master never silently degrade to the param dtype."""
+        for gi, group in enumerate(self.param_groups):
+            for pi, p in enumerate(group["params"]):
+                saved = state_dict["param_states"].get(f"{gi}.{pi}")
+                if saved is None:
+                    continue
+                st = self.state[p]
+                for k, v in saved.items():
+                    if isinstance(v, torch.Tensor) and k in st and isinstance(st[k], torch.Tensor):
+                        st[k] = v.to(dtype=st[k].dtype, device=st[k].device)
+                    else:
+                        st[k] = v
+
+
+class Fp32MuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
+    """MuonAdamW (nanochat/optim.py) with fp32 optimizer state and fp32 master
+    weights; bf16 params are updated by IN-PLACE copy from the masters, so
+    captured CUDA graphs keep reading valid pointers. Single-GPU version.
+
+    Construct while the model still holds the checkpoint's fp32 weights (only
+    the embeddings are natively bf16); cast the model to bf16 AFTER."""
+
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._snapshot_masters()
+
+    def _snapshot_masters(self):
+        for group in self.param_groups:
+            if group["kind"] == "adamw":
+                for p in group["params"]:
+                    st = self.state[p]
+                    st["step"] = 0
+                    st["master"] = p.detach().float().clone()
+                    st["exp_avg"] = torch.zeros_like(st["master"])
+                    st["exp_avg_sq"] = torch.zeros_like(st["master"])
+            elif group["kind"] == "muon":
+                params = group["params"]
+                p = params[0]
+                st = self.state[p]
+                shape = p.shape
+                st["master_stack"] = torch.stack([q.detach().float() for q in params])
+                st["momentum_buffer"] = torch.zeros_like(st["master_stack"])
+                state_shape = ((len(params), shape[-2], 1) if shape[-2] >= shape[-1]
+                               else (len(params), 1, shape[-1]))
+                st["second_momentum_buffer"] = torch.zeros(
+                    state_shape, dtype=torch.float32, device=p.device)
+
+    def _step_adamw(self, group: dict) -> None:
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            state["step"] += 1
+            self._adamw_step_t.fill_(state["step"])
+            self._adamw_lr_t.fill_(group["lr"])
+            self._adamw_beta1_t.fill_(group["betas"][0])
+            self._adamw_beta2_t.fill_(group["betas"][1])
+            self._adamw_eps_t.fill_(group["eps"])
+            self._adamw_wd_t.fill_(group["weight_decay"])
+            adamw_step_fused(
+                state["master"], p.grad.float(), state["exp_avg"], state["exp_avg_sq"],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+            p.copy_(state["master"])   # bf16 writeback, same storage
+
+    def _step_muon(self, group: dict) -> None:
+        params = group["params"]
+        if not params or params[0].grad is None:
+            return
+        state = self.state[params[0]]
+        shape = params[0].shape
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        stacked_grads = torch.stack([p.grad for p in params]).float()
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        muon_step_fused(
+            stacked_grads, state["master_stack"],
+            state["momentum_buffer"], state["second_momentum_buffer"],
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+            self._muon_beta2_t, group["ns_steps"], red_dim,
+        )
+        for p, m in zip(params, state["master_stack"].unbind(0)):
+            p.copy_(m)                 # bf16 writeback, same storage
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group["kind"] == "adamw":
+                self._step_adamw(group)
+            elif group["kind"] == "muon":
+                self._step_muon(group)
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
+
+class Fp32DistMuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
+    """DistMuonAdamW (ZeRO-sharded) with fp32 state + fp32 sharded masters and
+    in-place bf16 writeback. Comm runs in the param dtype (bf16 after cast).
+    Same 3-phase async structure as nanochat/optim.py DistMuonAdamW."""
+
+    def __init__(self, param_groups: list[dict]):
+        import torch.distributed as dist
+        super().__init__(param_groups, defaults={})
+        self._dist = dist
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._snapshot_masters()
+
+    def _snapshot_masters(self):
+        dist = self._dist
+        rank, world = dist.get_rank(), dist.get_world_size()
+        for group in self.param_groups:
+            if group["kind"] == "adamw":
+                for p in group["params"]:
+                    st = self.state[p]
+                    st["step"] = 0
+                    if p.numel() < 1024:
+                        p_slice = p
+                    else:
+                        assert p.shape[0] % world == 0
+                        rs = p.shape[0] // world
+                        p_slice = p[rank * rs:(rank + 1) * rs]
+                    st["master"] = p_slice.detach().float().clone()
+                    st["exp_avg"] = torch.zeros_like(st["master"])
+                    st["exp_avg_sq"] = torch.zeros_like(st["master"])
+            elif group["kind"] == "muon":
+                params = group["params"]
+                p = params[0]
+                st = self.state[p]
+                shape = p.shape
+                chunk = (len(params) + world - 1) // world
+                start = rank * chunk
+                owned = [params[start + i] for i in range(min(chunk, max(0, len(params) - start)))]
+                st["master_stack"] = (torch.stack([q.detach().float() for q in owned])
+                                      if owned else torch.zeros(0, *shape, dtype=torch.float32, device=p.device))
+                st["momentum_buffer"] = torch.zeros(chunk, *shape, dtype=torch.float32, device=p.device)
+                state_shape = ((chunk, shape[-2], 1) if shape[-2] >= shape[-1]
+                               else (chunk, 1, shape[-1]))
+                st["second_momentum_buffer"] = torch.zeros(
+                    state_shape, dtype=torch.float32, device=p.device)
+
+    def _reduce_adamw(self, group, world_size):
+        dist = self._dist
+        param_infos = {}
+        for p in group["params"]:
+            grad = p.grad
+            if p.numel() < 1024:
+                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
+            else:
+                assert grad.shape[0] % world_size == 0
+                rank_size = grad.shape[0] // world_size
+                grad_slice = torch.empty_like(grad[:rank_size])
+                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG,
+                                                    async_op=True).get_future()
+                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
+        return dict(param_infos=param_infos)
+
+    def _reduce_muon(self, group, world_size):
+        dist = self._dist
+        params = group["params"]
+        chunk_size = (len(params) + world_size - 1) // world_size
+        padded = chunk_size * world_size
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+        grad_stack = torch.stack([q.grad for q in params])
+        stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
+        stacked_grads[:len(params)].copy_(grad_stack)
+        if len(params) < padded:
+            stacked_grads[len(params):].zero_()
+        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG,
+                                            async_op=True).get_future()
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads,
+                    chunk_size=chunk_size)
+
+    def _compute_adamw(self, group, info, gather_list, rank, world_size):
+        dist = self._dist
+        for p in group["params"]:
+            pinfo = info["param_infos"][p]
+            pinfo["future"].wait()
+            state = self.state[p]
+            if pinfo["is_small"]:
+                p_slice = p
+            else:
+                rank_size = p.shape[0] // world_size
+                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+            state["step"] += 1
+            self._adamw_step_t.fill_(state["step"])
+            self._adamw_lr_t.fill_(group["lr"])
+            self._adamw_beta1_t.fill_(group["betas"][0])
+            self._adamw_beta2_t.fill_(group["betas"][1])
+            self._adamw_eps_t.fill_(group["eps"])
+            self._adamw_wd_t.fill_(group["weight_decay"])
+            adamw_step_fused(
+                state["master"], pinfo["grad_slice"].float(),
+                state["exp_avg"], state["exp_avg_sq"],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+            p_slice.copy_(state["master"])
+            if not pinfo["is_small"]:
+                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                gather_list.append(dict(future=future, params=None))
+
+    def _compute_muon(self, group, info, gather_list, rank):
+        dist = self._dist
+        info["future"].wait()
+        params = group["params"]
+        chunk_size = info["chunk_size"]
+        p = params[0]
+        shape, device = p.shape, p.device
+        start_idx = rank * chunk_size
+        num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        state = self.state[p]
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        updated = torch.empty(chunk_size, *shape, dtype=p.dtype, device=device)
+        if num_owned > 0:
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(group["beta2"])
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+            self._muon_wd_t.fill_(group["weight_decay"])
+            muon_step_fused(
+                info["grad_chunk"][:num_owned].float(), state["master_stack"],
+                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                self._muon_beta2_t, group["ns_steps"], red_dim,
+            )
+            updated[:num_owned].copy_(state["master_stack"])   # fp32 -> bf16
+        if num_owned < chunk_size:
+            updated[num_owned:].zero_()
+        stacked_params = info["stacked_grads"]                  # reuse buffer
+        future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
+        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
+    def _finish_gathers(self, gather_list):
+        for info in gather_list:
+            info["future"].wait()
+            if info["params"] is not None:
+                torch._foreach_copy_(info["params"],
+                                     list(info["stacked_params"][:len(info["params"])].unbind(0)))
+
+    @torch.no_grad()
+    def step(self):
+        dist = self._dist
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        reduce_infos = []
+        for group in self.param_groups:
+            if group["kind"] == "adamw":
+                reduce_infos.append(self._reduce_adamw(group, world_size))
+            elif group["kind"] == "muon":
+                reduce_infos.append(self._reduce_muon(group, world_size))
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+        gather_list = []
+        for group, info in zip(self.param_groups, reduce_infos):
+            if group["kind"] == "adamw":
+                self._compute_adamw(group, info, gather_list, rank, world_size)
+            else:
+                self._compute_muon(group, info, gather_list, rank)
+        self._finish_gathers(gather_list)

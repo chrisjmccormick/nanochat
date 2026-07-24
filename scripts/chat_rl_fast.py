@@ -31,6 +31,7 @@ Config via env (speedrun runner convention), see §0 below.
 # -----------------------------------------------------------------------------
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -39,15 +40,17 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from nanochat.fast_engine import install_dao_flash_attention
 install_dao_flash_attention()  # before anything touches nanochat.flash_attention
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
+from nanochat.dataloader import build_reinforce_packs
 from nanochat.checkpoint_manager import save_checkpoint, load_model
-from nanochat.fast_engine import (
-    FastEngine, cast_model_bf16, setup_fp32_optimizer, group_advantages,
-    build_reinforce_packs, reinforce_forward_loss)
+from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer 
+from nanochat.fast_engine import PantryRefillEngine
+
 from tasks.gsm8k import GSM8K, extract_answer
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
@@ -208,7 +211,7 @@ for group in optimizer.param_groups:
 cast_model_bf16(model)
 model.eval()
 
-engine = FastEngine(
+engine = PantryRefillEngine(
     model, tokenizer,
     kv_pool_gb=KV_POOL_GB, max_seqs=MAX_SEQS, max_tokens=max(MAX_TOKENS, EVAL_MAX_TOKENS),
     max_prompt_len=max_prompt, macro_n=MACRO_N, buckets=BUCKETS,
@@ -232,6 +235,49 @@ engine.capture(warm_context=train_prompts[shard[0]][:-1])
 _lent_gb = (engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30
 print0(f"  [vmm] pool physical lent back ({_lent_gb:.1f} GB, {engine.pool.lend():.2f}s) "
        f"for train warmup", flush=True)
+
+# -----------------------------------------------------------------------------
+# §3. Trainer — group advantage + branch-masked REINFORCE over compiled
+#      fixed-shape packs (speedrun §3; forward = nanochat's own GPT.forward)
+# -----------------------------------------------------------------------------
+ADV_EPS = 1e-6
+
+def group_advantages(rewards: np.ndarray, resolved: np.ndarray | None = None,
+                     use_std: bool = True) -> np.ndarray | None:
+    """(r - mean)/std over one problem's RESOLVED rewards; None for a std=0 group
+    (all-correct / all-incorrect — no signal, skip). use_std=False gives stock
+    nanochat's plain (r - mean) advantage (still skipping zero-signal groups)."""
+    r = np.asarray(rewards, dtype=np.float64)
+    res = (np.ones(len(r), dtype=bool) if resolved is None
+           else np.asarray(resolved, dtype=bool))
+    rr = r[res]
+    if rr.size < 2:
+        return None
+    std = rr.std()
+    if std < ADV_EPS:
+        return None
+    adv = np.zeros(len(r), dtype=np.float64)
+    adv[res] = (rr - rr.mean()) / std if use_std else (rr - rr.mean())
+    return adv
+
+
+def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv_tok,
+                           branch_temperature: float, branch_top_p: float):
+    """Compile target (fullgraph, static shapes): nanochat packed forward ->
+    Σ -A·logπ over kept BRANCH tokens (the policy's own T=1.0 nucleus>1
+    positions). Returns (loss_sum, n_loss_tokens, n_branch, n_comp); only
+    loss_sum carries grad."""
+    logits = model(input_ids, targets=None, cu_seqlens=cu_seqlens)  # (1, T, V) fp32 softcapped
+    logits = logits[0]
+    logp = -F.cross_entropy(logits, targets, reduction="none")
+    z = logits / branch_temperature
+    log_pmax = z.amax(-1) - z.logsumexp(-1)
+    branch = log_pmax <= math.log(branch_top_p)
+    comp = comp_mask.bool()
+    tok_mask = comp & branch
+    loss_sum = (-(adv_tok * logp) * tok_mask).sum()
+    return loss_sum, tok_mask.sum(), tok_mask.sum(), comp.sum()
+
 
 # TRAIN warmup: compile fwd+bwd per bucket on a dummy pack (weights untouched).
 TRAIN_FN = (torch.compile(reinforce_forward_loss, fullgraph=True, dynamic=False)
@@ -257,8 +303,9 @@ warm_s = time.perf_counter() - t
 print0(f"  capture+compile+warmup {warm_s:.0f}s | peak mem "
        f"{torch.cuda.max_memory_reserved() / 2 ** 30:.1f} GB", flush=True)
 
+
 # -----------------------------------------------------------------------------
-# §3. Grading + trainer step
+# §4. Grading + trainer step
 # -----------------------------------------------------------------------------
 def grade_rows(rows) -> list[float]:
     """GSM8K regex reward, inline (microseconds per row — no fork pool needed)."""
@@ -342,7 +389,7 @@ def train_step(groups: list[dict]) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# §4. Eval — pass@k on the test split through the fast engine
+# §5. Eval — pass@k on the test split through the fast engine
 # -----------------------------------------------------------------------------
 def run_eval(rnd: int) -> dict:
     engine.set_sampling(temperature=EVAL_TEMP, top_p=TOP_P)
@@ -384,7 +431,7 @@ def run_eval(rnd: int) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# §5. Rounds
+# §6. Rounds
 # -----------------------------------------------------------------------------
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
@@ -538,7 +585,7 @@ finally:
         save_ckpt(len(curve))
 
     # ------------------------------------------------------------------
-    # §6. Results — summary + save (+ optional HF push)
+    # §7. Results — summary + save (+ optional HF push)
     # ------------------------------------------------------------------
     checklist = {
         "decode_body_compiled": bool(COMPILE),

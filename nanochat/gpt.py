@@ -524,3 +524,57 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids.squeeze(0)))  # stay 1D
             token = next_ids.item()
             yield token
+
+# -----------------------------------------------------------------------------
+# Helpers for the fp32 master + bf16 live variant of the optimizers
+# -----------------------------------------------------------------------------
+
+from nanochat.optim import Fp32DistMuonAdamW, Fp32MuonAdamW
+
+def cast_model_bf16(model) -> None:
+    """Cast all parameters to bf16 in place (Parameter objects keep identity, so
+    optimizer/param-group references and later graph captures stay valid).
+    Rotary cos/sin buffers are already COMPUTE_DTYPE (bf16 on CUDA)."""
+    assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    model.to(torch.bfloat16)
+
+def setup_fp32_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
+                         weight_decay=0.0, scalar_lr=0.5):
+    """nanochat GPT.setup_optimizer's exact param-group split, but constructing
+    the fp32-master variant. Call while the model still holds fp32 weights;
+    cast to bf16 afterwards."""
+    model_dim = model.config.n_embd
+    ddp, rank, local_rank, world_size = get_dist_info()
+
+    matrix_params = list(model.transformer.h.parameters())
+    value_embeds_params = list(model.value_embeds.parameters())
+    embedding_params = list(model.transformer.wte.parameters())
+    lm_head_params = list(model.lm_head.parameters())
+    resid_params = [model.resid_lambdas]
+    x0_params = [model.x0_lambdas]
+    smear_params = [model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
+    assert len(list(model.parameters())) == (len(matrix_params) + len(embedding_params)
+                                             + len(lm_head_params) + len(value_embeds_params)
+                                             + len(resid_params) + len(x0_params) + len(smear_params))
+
+    dmodel_lr_scale = (model_dim / 768) ** -0.5
+    print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+    param_groups = [
+        dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+        dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+        dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+        dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+        dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+        dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+    ]
+    for shape in sorted({p.shape for p in matrix_params}):
+        group_params = [p for p in matrix_params if p.shape == shape]
+        param_groups.append(dict(
+            kind='muon', params=group_params, lr=matrix_lr,
+            momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+        ))
+    Factory = Fp32DistMuonAdamW if ddp else Fp32MuonAdamW
+    optimizer = Factory(param_groups)
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+    return optimizer

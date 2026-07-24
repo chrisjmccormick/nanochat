@@ -252,3 +252,91 @@ def sft_data_loader_varlen(
 
         if not cycle:
             break
+
+# =============================================================================
+# Reinforce pack dataloader
+# =============================================================================
+
+class ReinforcePack:
+    __slots__ = ("input_ids", "cu_seqlens", "targets", "comp_mask",
+                 "adv_tok", "n_seqs", "n_comp_targets")
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
+                          device="cuda"):
+    """FFD bin-pack ``docs`` = (prompt_ids, completion_ids, advantage) into
+    fixed-shape packs; each bin sealed at the smallest bucket >= its fill. The
+    pad tail is emitted as benign varying-ids segments of <= max_doc_len each
+    (FA-varlen NaN doctrine; nanochat's forward passes max_seqlen=sequence_len,
+    so no packed segment may exceed it)."""
+    buckets = sorted(buckets)
+    cap = buckets[-1]
+    stats = {"n_docs": len(docs), "n_packs": 0, "pad_tokens": 0, "comp_targets": 0,
+             "cap_tokens": 0}  # sum of sealed bucket sizes -> pad% = pad/cap
+    if not docs:
+        return [], stats
+    for p_ids, c_ids, _ in docs:
+        L = len(p_ids) + len(c_ids)
+        assert L <= cap, f"doc {L} tok > max bucket {cap} — raise TRAIN_BUCKETS"
+        assert L <= max_doc_len, f"doc {L} tok > max_seqlen {max_doc_len}"
+
+    order = sorted(range(len(docs)),
+                   key=lambda i: len(docs[i][0]) + len(docs[i][1]), reverse=True)
+    bins: list[dict] = []
+    for di in order:
+        L = len(docs[di][0]) + len(docs[di][1])
+        for b in bins:
+            if b["used"] + L <= cap and len(b["items"]) < max_num_docs:
+                b["used"] += L; b["items"].append(di); break
+        else:
+            bins.append({"used": L, "items": [di]})
+
+    max_pad_segs = -(-cap // max_doc_len) + 1
+    out: list[ReinforcePack] = []
+    for b in bins:
+        T_pack = next(x for x in buckets if x >= b["used"])
+        stats["cap_tokens"] += T_pack
+        ids = torch.full((T_pack,), pad_id, dtype=torch.long)
+        targets = torch.full((T_pack,), pad_id, dtype=torch.long)
+        comp = torch.zeros(T_pack, dtype=torch.float32)
+        adv = torch.zeros(T_pack, dtype=torch.float32)
+        cu = torch.zeros(max_num_docs + max_pad_segs + 2, dtype=torch.int32)
+        off = 0
+        n_comp_in_pack = 0
+        si = 0
+        for si, di in enumerate(b["items"]):
+            p_ids, c_ids, a = docs[di]
+            doc = list(p_ids) + list(c_ids)
+            L = len(doc)
+            p_len, c_len = len(p_ids), len(c_ids)
+            ids[off:off + L] = torch.tensor(doc, dtype=torch.long)
+            if L > 1:
+                targets[off:off + L - 1] = torch.tensor(doc[1:], dtype=torch.long)
+            if c_len > 0:
+                lo = off + p_len - 1
+                comp[lo:lo + c_len] = 1.0
+                adv[lo:lo + c_len] = float(a)
+                n_comp_in_pack += c_len
+            cu[si + 1] = off + L
+            off += L
+        seg_i = len(b["items"]) + 1
+        if off < T_pack:                      # benign pad segments (varying ids)
+            ids[off:] = torch.arange(T_pack - off) % 4096 + 1
+            while off < T_pack:
+                off2 = min(off + max_doc_len, T_pack)
+                cu[seg_i] = off2
+                seg_i += 1
+                off = off2
+        cu[seg_i:] = T_pack
+        stats["pad_tokens"] += int(T_pack - (cu[len(b["items"])].item()))
+        stats["comp_targets"] += n_comp_in_pack
+        out.append(ReinforcePack(
+            input_ids=ids.to(device), cu_seqlens=cu.to(device),
+            targets=targets.to(device), comp_mask=comp.to(device), adv_tok=adv.to(device),
+            n_seqs=len(b["items"]), n_comp_targets=n_comp_in_pack))
+    stats["n_packs"] = len(out)
+    return out, stats
