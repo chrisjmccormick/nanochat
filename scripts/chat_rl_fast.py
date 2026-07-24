@@ -372,6 +372,8 @@ def train_step(groups: list[dict]) -> dict:
             pad_id=PAD_ID, max_doc_len=SEQ_CAP)
         n_packs = pstats["n_packs"]
         _t_build = time.perf_counter() - _t0
+        _pk_verbose = os.environ.get("TRAIN_TIMING_VERBOSE") == "1"
+        _pk_t = time.perf_counter()
         for pk in packs:
             loss_sum, n_tok, n_branch, n_comp = TRAIN_FN(
                 model, pk.input_ids, pk.cu_seqlens, pk.targets, pk.comp_mask,
@@ -384,6 +386,10 @@ def train_step(groups: list[dict]) -> dict:
                 total_loss += float(loss_sum.detach())
                 total_tokens += nt
             del loss_sum
+            if _pk_verbose:
+                _now = time.perf_counter()
+                print0(f"      pack {n_packs}b{pk.input_ids.numel()}: {_now - _pk_t:.3f}s", flush=True)
+                _pk_t = _now
         _t_fwd = time.perf_counter() - _t0 - _t_build
     # DAPO token-level mean across ALL ranks' loss tokens
     tok_t = torch.tensor(float(total_tokens), device=device)
