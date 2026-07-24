@@ -340,3 +340,44 @@ def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
             n_seqs=len(b["items"]), n_comp_targets=n_comp_in_pack))
     stats["n_packs"] = len(out)
     return out, stats
+
+
+# =============================================================================
+# Balanced round assembly (static-prefill RL)
+# =============================================================================
+
+def assemble_balanced_rounds(items, ppr, *, epochs=1):
+    """Partition problem indices into rounds of exactly ``ppr`` each, balancing
+    the per-round context-token sum so no round is pathologically long — a long
+    round would force an oversized static-prefill graph, since PrefillAllEngine
+    prefills the whole round in one replay (Sigma context <= PREFILL_T).
+
+    ``items``: list of ``(problem_index, context_len)``, where ``context_len`` is
+    the prefill length the problem contributes — the engine prefills
+    ``prompt[:-1]``, so ``len(prompt) - 1``.
+
+    Balancing is stratified: sort by ``context_len``, cut the sorted list into
+    ``ppr`` contiguous strata, and give every round one problem from each
+    stratum. Each round then spans the full length range, so per-round sums
+    cluster tightly around the mean (max round ~= mean, not ~= ppr * longest).
+    Deterministic; each problem appears once per epoch; the trailing ``< ppr``
+    remainder is dropped (varlen doctrine: no short final batch).
+
+    Returns ``(rounds, stats)`` — ``rounds`` is a list of length
+    ``(len(items) // ppr) * epochs`` of ``ppr``-length index lists; ``stats`` has
+    the ``min`` / ``mean`` / ``max`` per-round context-token sums. Report those so
+    the caller can set PREFILL_T explicitly — this function never sizes it and
+    the engine never auto-sizes."""
+    r = len(items) // ppr                         # rounds per epoch (drop remainder)
+    if r == 0:
+        return [], {"min": 0, "mean": 0.0, "max": 0}
+    order = sorted(items[:r * ppr], key=lambda t: t[1])
+    epoch_rounds = [[] for _ in range(r)]
+    for j, (pid, _clen) in enumerate(order):
+        _stratum, within = divmod(j, r)           # one problem per stratum -> balanced
+        epoch_rounds[within].append(pid)
+    clen = dict(items)
+    sums = [sum(clen[pid] for pid in rd) for rd in epoch_rounds]
+    stats = {"min": min(sums), "mean": sum(sums) / len(sums), "max": max(sums)}
+    rounds = [list(rd) for _ in range(epochs) for rd in epoch_rounds]
+    return rounds, stats

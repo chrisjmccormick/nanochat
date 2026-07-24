@@ -1138,7 +1138,16 @@ class PantryRefillEngine:
 
 # TODO - Implement...
 class PrefillAllEngine:
-    """Prefill all the context at once, then decode.
+    """Prefill every context once, then decode the whole round to completion.
+
+    The RL-train regime is the degenerate case the streaming pantry was never
+    for: a fixed handful of contexts (PPR problems x K rows) that, at the train
+    budget, fit the pool all at once. So there is no pantry, no mid-round refill,
+    and no adoption — one prefill replay mints and admits all rows, then the
+    round decodes them down. Both invariants (one replay, whole round resident)
+    are asserted, NOT recovered from: a trip means the config left the tuned path
+    and we want to know. Eval's full-pool round is far too many rows to admit
+    this way — use PantryRefillEngine for that.
 
     Life cycle: __init__ builds the pool + graphs (untimed setup; call with the
     KV pool memory available), then per round:
@@ -1156,8 +1165,6 @@ class PrefillAllEngine:
                  buckets: tuple | None = None,
                  prefill_t: int = 2048,
                  prefill_seqs: int = 12,
-                 pantry_blocks: int = 96,
-                 starve_jobs: int = 12,
                  pass1: int = 0,
                  temperature: float = 0.6,
                  top_p: float = 0.95,
@@ -1171,12 +1178,12 @@ class PrefillAllEngine:
                  extra_compile_slots: int = 8,
                  print_every: int | None = None,
                  device_index: int = 0):
-        assert pass1 == 0 or pass1 < max_tokens, "PASS1 must be < MAX_TOKENS (or 0 to disable)"
+        assert pass1 == 0, "PrefillAllEngine is single-pass; PASS1 re-queues mid-round " \
+                           "(use PantryRefillEngine for two-pass)"
         self.model, self.tok = model, tokenizer
         self.max_tokens, self.pass1 = max_tokens, pass1
-        self.pass1_eff = pass1 or max_tokens
+        self.pass1_eff = max_tokens
         self.macro_n, self.prefill_t, self.prefill_seqs = macro_n, prefill_t, prefill_seqs
-        self.pantry_cap, self.starve_jobs = pantry_blocks, starve_jobs
         self.stop_detect, self.stop_strings, self.window_tokens = stop_detect, tuple(stop_strings), window_tokens
         self.print_every = print_every
 
@@ -1191,16 +1198,17 @@ class PrefillAllEngine:
         self.sampler_cfg = (temperature, top_p, top_k)
         self.pool = KVPool(model.config, int(kv_pool_gb * 2 ** 30), device_index)
         self.max_blocks = nblocks(max_prompt_len + 1 + max_tokens + macro_n) + 1
-        # Admission ceiling: worst-case per-row private reserve at the pass-1 budget.
-        min_priv = nblocks(2 + self.pass1_eff + macro_n)  # smallest plausible context
-        self.ceiling_rows = max(1, (len(self.pool.free) - pantry_blocks) // min_priv)
+        # Admission ceiling: whole pool over the worst-case per-row reserve (no
+        # pantry reserve is held back — the round owns the pool).
+        min_priv = nblocks(2 + max_tokens + macro_n)  # smallest plausible context
+        self.ceiling_rows = max(1, len(self.pool.free) // min_priv)
         if buckets is None:
             buckets = default_buckets(min(self.ceiling_rows, max_seqs), max_seqs)
         assert max(buckets) <= max_seqs
         self.buckets = tuple(sorted(buckets))
         self.max_seqs = max_seqs
 
-        n_slots = max_seqs + 4 * pantry_blocks + 64
+        n_slots = max_seqs + 64  # one smear slot per resident row + headroom
         self.store = SmearStore(n_slots, model.config.n_embd, "cuda")
         with torch.no_grad():
             self.gd = GraphDecoder(model, self.pool, self.store, self.max_blocks,
@@ -1211,7 +1219,7 @@ class PrefillAllEngine:
         self._compile_prefill = compile_prefill
         self._prefill_fullgraph = prefill_fullgraph
         # v1.1 lesson (speedrun): overlapped side-stream refills deadlock
-        # mid-decode in a fused gen+train process; refills stay serialized.
+        # mid-decode in a fused gen+train process; prefill stays on the decode stream.
         self.prefill_stream = torch.cuda.current_stream()
 
     @torch.no_grad()
@@ -1222,10 +1230,8 @@ class PrefillAllEngine:
               f"({self.pool.num_blocks} blocks x {PAGE} tok) | max_seqs {self.max_seqs} | "
               f"buckets {self.buckets} | macro_n {self.macro_n} | "
               f"prefill T={self.prefill_t} x{self.prefill_seqs} seqs | "
-              f"pantry {self.pantry_cap} blocks | starve_jobs {self.starve_jobs} | "
-              f"max_tokens {self.max_tokens}"
-              + (f" (pass1 {self.pass1})" if self.pass1 else "")
-              + f" | temp {temp:g} top_p {top_p:g} top_k {top_k} | "
+              f"max_tokens {self.max_tokens} | "
+              f"temp {temp:g} top_p {top_p:g} top_k {top_k} | "
               f"stop_detect {int(self.stop_detect)} | ceiling_rows {self.ceiling_rows}",
               flush=True)
         print("  capture+compile decode buckets:", flush=True)
@@ -1255,10 +1261,8 @@ class PrefillAllEngine:
         for meta, prompt_ids, k, allow in specs:
             assert len(prompt_ids) >= 2, "prompt too short for the split-last-token trick"
             assert allow <= self.max_tokens, "allow exceeds engine MAX_TOKENS (block table width)"
-            p1 = self.pass1_eff if self.pass1 else allow
             jobs = [dict(meta=meta, prompt_ids=list(prompt_ids), forced=prompt_ids[-1],
-                         allow=min(p1, allow), budget=allow,
-                         final=(self.pass1 == 0 or allow <= self.pass1_eff))
+                         allow=allow, budget=allow, final=True)
                     for _ in range(k)]
             nodes.append(Node(list(prompt_ids[:-1]), jobs))
         return nodes
@@ -1267,56 +1271,36 @@ class PrefillAllEngine:
     @torch.no_grad()
     def run_round(self, nodes_all: list["Node"], rnd: int = 0,
                   on_retire=None) -> tuple[list[dict], dict]:
-        """One round of generation through the persistent engine. Returns
-        (rows, stats). Each row: dict(meta, completion_token_ids, completion_text,
-        terminal, stop_reason, finish_reason). `on_retire(row)` fires as rows
-        finish (e.g. inline grading)."""
+        """One round, static-prefill: prefill every context in a SINGLE replay,
+        mint + admit all rows, then decode to completion — no refill, no pantry.
+        Returns (rows, stats); each row: dict(meta, completion_token_ids,
+        completion_text, terminal, stop_reason, finish_reason). `on_retire(row)`
+        fires as rows finish (e.g. inline grading)."""
         pfg, gd, pool, store = self.pfg, self.gd, self.pool, self.store
         MACRO_N = self.macro_n
         pfg.replays = pfg.real_tok = 0
-        pantry: deque[tuple[Seq, torch.cuda.Event]] = deque()
-        pantry_blocks = 0
-        node_q = deque(nodes_all)
-        running: list[Seq] = []
         rows: list[dict] = []
         rolls_done = tok_total = 0
-        stop_fires = refills = adopt_stalls = bnd_copies = n_ext = 0
-        prefill_s = adopt_s = 0.0
+        stop_fires = bnd_copies = 0
         n_target = sum(len(n.cand_jobs) for n in nodes_all)
         print_every = self.print_every or max(1, n_target // 8)
 
-        def reserved_owned() -> int:
-            return sum(s.need - len(s.blocks) for s in running)
-
-        def plan_refill() -> list[Node]:
-            take: list[Node] = []
-            tok_n = cost_sum = 0
-            blocks_left = min(self.pantry_cap - pantry_blocks,
-                              len(pool.free) - reserved_owned())
-            full = False
-            for nd in node_q:
-                L = nd.plen
-                if tok_n + L > self.prefill_t:
-                    full = True
-                    break
-                if cost_sum + nd.new_pages() > blocks_left or len(take) + 1 > self.prefill_seqs:
-                    break
-                take.append(nd)
-                cost_sum += nd.new_pages()
-                tok_n += L
-            # Continuation nodes trickle in — batch until the chunk is token-full
-            # or the pantry is actually hungry (liveness preserved via STARVE).
-            if take and (full or len(pantry) <= self.starve_jobs):
-                return take
-            if not take and not running and not pantry and node_q:
-                nd = node_q[0]
-                assert nd.new_pages() <= len(pool.free), \
-                    f"first node needs {nd.new_pages()} pages, only {len(pool.free)} free"
-                return [nd]
-            return []
+        # -- preconditions: one prefill replay, whole round resident (no fallback)
+        row_cap = min(self.max_seqs, max(self.buckets))
+        assert n_target <= row_cap, \
+            f"{n_target} rows > row_cap {row_cap} (raise MAX_SEQS / top bucket)"
+        assert len(nodes_all) <= pfg.prefill_seqs, \
+            f"{len(nodes_all)} contexts > PREFILL_SEQS={pfg.prefill_seqs}"
+        ctx_tok = sum(nd.plen for nd in nodes_all)
+        assert ctx_tok <= pfg.prefill_t, \
+            f"round context {ctx_tok} tok > PREFILL_T={pfg.prefill_t} " \
+            f"(assemble balanced rounds, or raise PREFILL_T)"
 
         def mint_rows(nd: Node) -> list[Seq]:
-            nonlocal pantry_blocks, bnd_copies
+            """K sibling rows per node: full context pages are shared (addref);
+            a partial last page is aliased by row 0 and copy-on-written for the
+            rest. Each row is admitted straight to `running` (no pantry)."""
+            nonlocal bnd_copies
             seqs = []
             full_pages = nd.blocks[:nd.n_full]
             src_bnd = nd.blocks[nd.n_full] if nd.partial else None
@@ -1333,77 +1317,17 @@ class PrefillAllEngine:
                         pool.k[:, dst].copy_(pool.k[:, src_bnd])
                         pool.v[:, dst].copy_(pool.v[:, src_bnd])
                         s.blocks.append(dst)
-                        s.priv_pantry = 1
                         bnd_copies += 1
                 s.seq_len = nd.plen
                 s.slot = store.alloc()
+                s.next_tok = s.forced
                 seqs.append(s)
             # Seed every sibling's smear state with the node's last-context
             # pre-smear embedding (computed by the prefill graph).
             slots_t = torch.tensor([s.slot for s in seqs], dtype=torch.long, device="cuda")
             store.data[slots_t] = nd.seed_emb.unsqueeze(0).expand(len(seqs), -1)
-            pool.release(full_pages)
-            nd.pantry_pages = nd.new_pages()
-            pantry_blocks += nd.pantry_pages
+            pool.release(full_pages)  # node's own ref drops; K row refs remain
             return seqs
-
-        def refill_varlen() -> None:
-            nonlocal refills, prefill_s
-            take = plan_refill()
-            if not take:
-                return
-            _t = time.perf_counter()
-            for _ in take:
-                node_q.popleft()
-            refills += 1
-            with torch.cuda.stream(self.prefill_stream):
-                pfg.run(take)
-                minted = [s for nd in take for s in mint_rows(nd)]
-            ev = torch.cuda.Event()
-            ev.record(self.prefill_stream)
-            for s in minted:
-                pantry.append((s, ev))
-            prefill_s += time.perf_counter() - _t
-
-        def adopt() -> None:
-            nonlocal pantry_blocks, adopt_s, adopt_stalls
-            _t = time.perf_counter()
-            reserved = reserved_owned()
-            row_cap = min(self.max_seqs, max(self.buckets))
-            while pantry and len(running) + 1 <= row_cap:
-                s, ev = pantry[0]
-                if not ev.query():
-                    adopt_stalls += 1
-                    break
-                if len(pool.free) < reserved + (s.need - len(s.blocks)):
-                    break
-                reserved += s.need - len(s.blocks)
-                pantry_blocks -= s.priv_pantry
-                s.node.rows_left -= 1
-                if s.node.rows_left == 0:
-                    pantry_blocks -= nblocks(s.node.plen)
-                pantry.popleft()
-                s.next_tok = s.forced
-                running.append(s)
-            adopt_s += time.perf_counter() - _t
-
-        def suspend(s: Seq) -> None:
-            """Two-pass: pass-1 budget reached with budget remaining — free the
-            row's pages and re-queue as a K=1 continuation node. Context =
-            prompt ⊕ gen[:-1]; forced first decode input = gen[-1]."""
-            nonlocal n_ext
-            s.done = True
-            pool.release(s.blocks)
-            s.blocks = []
-            store.release(s.slot)
-            j = s.job
-            gen_prefix = list(j.get("gen_prefix", [])) + list(s.gen)
-            cont = dict(meta=j["meta"], prompt_ids=j["prompt_ids"],
-                        gen_prefix=gen_prefix, forced=gen_prefix[-1],
-                        allow=j["budget"] - len(gen_prefix), budget=j["budget"],
-                        final=True)
-            node_q.append(Node(list(j["prompt_ids"]) + gen_prefix[:-1], [cont]))
-            n_ext += 1
 
         def retire(s: Seq, eos: bool, stop: str | None = None) -> None:
             nonlocal rolls_done
@@ -1412,7 +1336,7 @@ class PrefillAllEngine:
             s.blocks = []
             store.release(s.slot)
             j = s.job
-            full_gen = list(j.get("gen_prefix", [])) + list(s.gen)   # pass-1 ⊕ pass-2
+            full_gen = list(s.gen)
             body = full_gen[:-1] if eos else full_gen  # trailing terminal excluded from text
             full_text = self.tok.decode(body)
             if stop is not None:
@@ -1438,7 +1362,7 @@ class PrefillAllEngine:
         def _stop_hit(s: Seq) -> str | None:
             ids = s.gen[-self.window_tokens:]
             if len(ids) < self.window_tokens:  # pad from the pre-gen stream
-                pre = list(s.job["prompt_ids"]) + list(s.job.get("gen_prefix", []))
+                pre = list(s.job["prompt_ids"])
                 ids = pre[len(ids) - self.window_tokens:] + ids
             tail = self.tok.decode(ids)
             hits = [ss for ss in self.stop_strings if ss in tail]
@@ -1465,12 +1389,8 @@ class PrefillAllEngine:
                         retire(s, True)
                         any_done = True
                         break
-                    if len(s.gen) >= s.allow:
-                        # pass-1 budget with budget remaining -> extend; else truncated.
-                        if s.job["final"]:
-                            retire(s, False)
-                        else:
-                            suspend(s)
+                    if len(s.gen) >= s.allow:  # single-pass: budget reached = truncated
+                        retire(s, False)
                         any_done = True
                         break
                     if self.stop_detect and t in self.gate_ids:
@@ -1486,53 +1406,67 @@ class PrefillAllEngine:
             return any_done
 
         t0 = time.perf_counter()
+        # -- prefill EVERY context in one replay, mint + admit ALL rows ---------
+        pfg.run(nodes_all)
+        running: list[Seq] = [s for nd in nodes_all for s in mint_rows(nd)]
+        assert pfg.replays == 1, \
+            f"round used {pfg.replays} prefill replays, not 1 — raise PREFILL_T/PREFILL_SEQS"
+        # Every context is resident; private decode pages grow lazily below. The
+        # round is NOT guaranteed to fit at worst case (sum(s.need) can exceed the
+        # pool when PPR*K rows each reserve their full budget) — it fits because
+        # most rows complete well short of the budget and free their pages first.
+        # We admit all rows and report the headroom; the decode-loop guard fails
+        # LOUD if a round ever actually exhausts the pool (no fallback — that means
+        # the config is too large for the pool).
+        wc_reserve = sum(s.need for s in running)
+        if rnd == 0:
+            over = wc_reserve > self.pool.num_blocks
+            print(f"    [r{rnd}] admitted {len(running)} rows in one wave | worst-case "
+                  f"reserve {wc_reserve} vs pool {self.pool.num_blocks} blocks "
+                  f"({'OVER-COMMIT, relies on early completion' if over else 'fits worst-case'})",
+                  flush=True)
+        min_free = len(pool.free)
+
         last_roll_print = 0
-        while node_q or pantry or running:
-            if not running:
-                if node_q:
-                    refill_varlen()
-                if pantry:
-                    adopt()
-                assert running or pantry or node_q, "nothing running and nothing to admit"
-                if not running:
-                    continue
+        while running:
             batch = running
             inputs, cache_lens, block_rows, slots = [], [], [], []
             for s in batch:
                 grow = (s.seq_len + MACRO_N + PAGE - 1) // PAGE - len(s.blocks)
                 if grow > 0:
+                    if grow > len(pool.free):
+                        raise RuntimeError(
+                            f"KV pool exhausted mid-round r{rnd}: need {grow} pages, "
+                            f"{len(pool.free)} free, {len(batch)} rows live — round too "
+                            f"large for the pool (lower MAX_TOKENS / PPR / K, or raise "
+                            f"KV_POOL_GB)")
                     s.blocks.extend(pool.alloc(grow))
                 inputs.append(s.next_tok)
                 cache_lens.append(s.seq_len)
                 block_rows.append(s.blocks)
                 slots.append(s.slot)
+            min_free = min(min_free, len(pool.free))
             gd.begin_window(inputs, cache_lens, block_rows, slots)
-            if node_q:
-                refill_varlen()
             toks = gd.collect_window()
             if apply_window(batch, toks):
                 running = [s for s in running if not s.done]
-            if pantry:
-                adopt()
             if rolls_done - last_roll_print >= print_every:
                 el = time.perf_counter() - t0
                 # all Python-side counters — no GPU sync, no throughput cost
                 print(f"    [r{rnd}] roll {rolls_done:4d}/{n_target} | tok {tok_total:>10,} | "
                       f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {len(running):3d} | "
-                      f"pantry {pantry_blocks:3d}b/{len(pantry):2d}j | "
                       f"free {len(pool.free):4d} | {el:6.1f}s", flush=True)
                 last_roll_print = rolls_done
 
         gen_s = time.perf_counter() - t0
-        assert pantry_blocks == 0 and not pantry, "pantry not drained"
         leaked = self.pool.num_blocks - 1 - len(self.pool.free) - 2  # null + gd/pfg scratch
         assert leaked == 0, f"{leaked} KV blocks leaked"
         assert len(store.free) == len(store.data), "smear slots leaked"
         return rows, dict(
-            gen_s=gen_s, gen_tok=tok_total, refills=refills, replays=pfg.replays,
+            gen_s=gen_s, gen_tok=tok_total, refills=1, replays=pfg.replays,
             prefill_tok=pfg.real_tok, bnd_copies=bnd_copies, stop_fires=stop_fires,
-            adopt_stalls=adopt_stalls, prefill_s=prefill_s, adopt_s=adopt_s,
-            n_extended=n_ext)
+            adopt_stalls=0, prefill_s=0.0, adopt_s=0.0, n_extended=0,
+            peak_blocks=self.pool.num_blocks - 1 - min_free)
 
     # -- eager debug path (parity gate) ---------------------------------------
     @torch.no_grad()

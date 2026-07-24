@@ -46,10 +46,10 @@ from nanochat.fast_engine import install_dao_flash_attention
 install_dao_flash_attention()  # before anything touches nanochat.flash_attention
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
-from nanochat.dataloader import build_reinforce_packs
+from nanochat.dataloader import build_reinforce_packs, assemble_balanced_rounds
 from nanochat.checkpoint_manager import save_checkpoint, load_model
-from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer 
-from nanochat.fast_engine import PantryRefillEngine
+from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
+from nanochat.fast_engine import PrefillAllEngine
 
 from tasks.gsm8k import GSM8K, extract_answer
 
@@ -143,6 +143,14 @@ MODEL_STEP    = int(os.environ["MODEL_STEP"]) if os.environ.get("MODEL_STEP") el
 PUSH          = _env_flag("PUSH", 0)
 MODEL_REPO    = os.environ.get("MODEL_REPO", "ChrisMcCormick/nanochat-varlen-d24-2026-03-22")
 
+# PrefillAllEngine is train-only: an eval round (EVAL_EXAMPLES x EVAL_K against the
+# full test split) is far more concurrent rows than the pool can admit in one wave.
+# Run eval offline (eval_trajectory.py) or via scripts.chat_rl_pantry.
+assert EVAL_EVERY == 0, (
+    "chat_rl_fast uses the static PrefillAllEngine (train-only) — its single-wave "
+    "round can't admit an eval round; set EVAL_EVERY=0 (use scripts.chat_rl_pantry "
+    "for eval-bearing runs)")
+
 HERE = Path.cwd()
 
 # -----------------------------------------------------------------------------
@@ -181,7 +189,24 @@ if PASS1:
 
 pool = POOL_PROBLEMS if POOL_PROBLEMS is not None else list(range(len(train_task)))
 shard = pool[rank::world_size]
-num_rounds = (len(pool) // PPR) * EPOCHS
+if FIXED_PROBLEMS is not None:
+    round_schedule = None                         # same fixed problems every round
+    num_rounds = (len(pool) // PPR) * EPOCHS
+else:
+    # Balanced round assembly (dataloader): each round's contexts must fit ONE
+    # static-prefill replay (Sigma context <= PREFILL_T). Stratified partition
+    # keeps per-round context sums near the mean so a modest, EXPLICIT PREFILL_T
+    # suffices — the engine never auto-sizes. Report the spread + assert the fit.
+    round_schedule, _sched = assemble_balanced_rounds(
+        [(i, len(train_prompts[i]) - 1) for i in shard], ppr_rank, epochs=EPOCHS)
+    num_rounds = len(round_schedule)
+    print0(f"[{TAG}] balanced rounds: per-round context tokens "
+           f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']} "
+           f"| PREFILL_T={PREFILL_T} ({100 * _sched['max'] / PREFILL_T:.0f}% packed at the "
+           f"max round)", flush=True)
+    assert _sched["max"] <= PREFILL_T, (
+        f"balanced round max context {_sched['max']} tok > PREFILL_T={PREFILL_T} — "
+        f"raise PREFILL_T explicitly (the engine does not auto-size)")
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
@@ -211,13 +236,13 @@ for group in optimizer.param_groups:
 cast_model_bf16(model)
 model.eval()
 
-engine = PantryRefillEngine(
+engine = PrefillAllEngine(
     model, tokenizer,
     kv_pool_gb=KV_POOL_GB, max_seqs=MAX_SEQS, max_tokens=max(MAX_TOKENS, EVAL_MAX_TOKENS),
     max_prompt_len=max_prompt, macro_n=MACRO_N, buckets=BUCKETS,
-    prefill_t=PREFILL_T, prefill_seqs=PREFILL_SEQS, pantry_blocks=PANTRY_BLOCKS,
-    starve_jobs=STARVE_JOBS, pass1=PASS1, temperature=TEMPERATURE, top_p=TOP_P,
-    top_k=TOP_K, stop_detect=STOP_DETECT, stop_strings=tuple(STOP),
+    prefill_t=PREFILL_T, prefill_seqs=PREFILL_SEQS, pass1=PASS1,
+    temperature=TEMPERATURE, top_p=TOP_P, top_k=TOP_K,
+    stop_detect=STOP_DETECT, stop_strings=tuple(STOP),
     compile_decode=COMPILE, compile_prefill=PREFILL_COMPILE,
     prefill_fullgraph=PREFILL_FULLGRAPH,
     extra_compile_slots=len(TRAIN_BUCKETS) + 8,
@@ -437,8 +462,7 @@ METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "train_s", "vmm_s", "n_ext", "n_groups_used", "n_docs", "n_loss_tokens",
                "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
-               "grad_norm", "lrm", "wnorm", "smear_lambda", "backout_lambda",
-               "x0_norm", "resid_norm", "mem_gb", "round_s"]
+               "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
 passk_path = HERE / f"passk_{TAG}.csv"
 mf = open(metrics_path, "w", newline="") if master else None
@@ -486,10 +510,7 @@ try:
                 pf.flush()
 
         # -- generation ------------------------------------------------------
-        if FIXED_PROBLEMS is not None:
-            idxs = FIXED_PROBLEMS
-        else:
-            idxs = [shard[(rnd * ppr_rank + j) % len(shard)] for j in range(ppr_rank)]
+        idxs = FIXED_PROBLEMS if FIXED_PROBLEMS is not None else round_schedule[rnd]
         specs = [(i, train_prompts[i], K_DRAWS, MAX_TOKENS) for i in idxs]
         rows, gstats = engine.run_round(engine.make_nodes(specs), rnd)
         vmm_unmap_s = engine.pool.lend()
@@ -540,10 +561,6 @@ try:
             loss_token_mean=round(tstats["loss_token_mean"], 6),
             grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
             wnorm=round(wnorm, 2),
-            smear_lambda=round(float(model.smear_lambda.detach().float()), 5),
-            backout_lambda=round(float(model.backout_lambda.detach().float()), 5),
-            x0_norm=round(float(model.x0_lambdas.detach().float().norm()), 5),
-            resid_norm=round(float(model.resid_lambdas.detach().float().norm()), 5),
             mem_gb=round((lambda f_t: (f_t[1] - f_t[0]) / 2 ** 30)(torch.cuda.mem_get_info()), 1),
             round_s=round(time.perf_counter() - r_t0, 1))
         curve.append(row)
