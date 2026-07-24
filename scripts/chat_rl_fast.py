@@ -341,6 +341,7 @@ def train_step(groups: list[dict]) -> dict:
     """One branch-masked REINFORCE optimizer step over the round's problem
     groups. Same advantages/exclusions/DAPO token-mean as the speedrun; no
     'unresolved' verdicts (regex reward always resolves)."""
+    _t0 = time.perf_counter()
     docs = []
     n_groups_used = n_excluded = 0
     for g in groups:
@@ -364,11 +365,13 @@ def train_step(groups: list[dict]) -> dict:
     total_loss = 0.0
     n_packs = 0
     pstats = None
+    _t_build = _t_fwd = 0.0
     if docs:
         packs, pstats = build_reinforce_packs(
             docs, buckets=list(TRAIN_BUCKETS), max_num_docs=MAX_NUM_DOCS,
             pad_id=PAD_ID, max_doc_len=SEQ_CAP)
         n_packs = pstats["n_packs"]
+        _t_build = time.perf_counter() - _t0
         for pk in packs:
             loss_sum, n_tok, n_branch, n_comp = TRAIN_FN(
                 model, pk.input_ids, pk.cu_seqlens, pk.targets, pk.comp_mask,
@@ -381,6 +384,7 @@ def train_step(groups: list[dict]) -> dict:
                 total_loss += float(loss_sum.detach())
                 total_tokens += nt
             del loss_sum
+        _t_fwd = time.perf_counter() - _t0 - _t_build
     # DAPO token-level mean across ALL ranks' loss tokens
     tok_t = torch.tensor(float(total_tokens), device=device)
     if ddp:
@@ -404,7 +408,11 @@ def train_step(groups: list[dict]) -> dict:
         stepped = True
     model.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
-    return dict(n_groups_used=n_groups_used, n_groups_total=len(groups),
+    # approximate wall split (host clocks; the per-pack .item() syncs make t_fwd
+    # honest, and the trailing sync charges the drain + optimizer to t_opt)
+    _t_opt = time.perf_counter() - _t0 - _t_build - _t_fwd
+    return dict(t_build=_t_build, t_fwd=_t_fwd, t_opt=_t_opt,
+                n_groups_used=n_groups_used, n_groups_total=len(groups),
                 n_docs=len(docs), n_excluded=n_excluded, n_packs=n_packs,
                 pstats=pstats,
                 n_loss_tokens=total_tokens, n_comp_tokens=total_comp,
@@ -589,7 +597,8 @@ try:
                f"{tstats['n_loss_tokens']:,} br-tok | "
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
                f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
-               f"vmm {vmm_map_s + vmm_unmap_s:.1f}s"
+               f"vmm {vmm_map_s + vmm_unmap_s:.1f}s | "
+               f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
         if SAVE_EVERY and rnd > 0 and rnd % SAVE_EVERY == 0:
