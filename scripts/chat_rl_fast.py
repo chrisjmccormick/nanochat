@@ -460,7 +460,7 @@ def run_eval(rnd: int) -> dict:
 # -----------------------------------------------------------------------------
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
-               "train_s", "vmm_s", "n_ext", "n_groups_used", "n_docs", "n_loss_tokens",
+               "peak_blocks", "train_s", "vmm_s", "n_ext", "n_groups_used", "n_docs", "n_loss_tokens",
                "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
                "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
@@ -552,6 +552,7 @@ try:
             gen_s=round(gstats["gen_s"], 1), gen_tok=gstats["gen_tok"],
             gen_tok_per_s=round(gstats["gen_tok"] / gstats["gen_s"], 1),
             rolls_per_min=round(len(rows) / gstats["gen_s"] * 60, 1),
+            peak_blocks=gstats.get("peak_blocks", 0),
             train_s=round(train_s, 1), vmm_s=round(vmm_map_s + vmm_unmap_s, 2),
             n_ext=gstats["n_extended"],
             n_groups_used=tstats["n_groups_used"], n_docs=tstats["n_docs"],
@@ -579,12 +580,16 @@ try:
                    if gstats.get("replays") else 0.0)
         tr_pad = (100.0 * tstats["pstats"]["pad_tokens"] / max(1, tstats["pstats"]["cap_tokens"])
                   if tstats.get("pstats") else 0.0)
-        print0(f"  [round {rnd:3d}] solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
-               f"gen {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s, "
-               f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% packed) | "
-               f"train {train_s:4.1f}s vmm {vmm_map_s + vmm_unmap_s:.1f}s "
-               f"({tstats['n_loss_tokens']} br-tok, {tstats.get('n_packs', 0)} packs "
-               f"pad {tr_pad:.0f}%, gnorm {tstats['grad_norm']:.3f})"
+        print0(f"  [round {rnd:3d}] gen   {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s) | "
+               f"solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
+               f"eos {row['n_eos']:3d} stop {gstats['stop_fires']:2d} trunc {row['n_truncated']:2d} | "
+               f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% | "
+               f"kv peak {gstats.get('peak_blocks', 0)}/{engine.pool.num_blocks}", flush=True)
+        print0(f"              train {train_s:5.1f}s ({row['train_tok_per_s']:>7,.0f} tok/s) | "
+               f"{tstats['n_loss_tokens']:,} br-tok | "
+               f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
+               f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
+               f"vmm {vmm_map_s + vmm_unmap_s:.1f}s"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
         if SAVE_EVERY and rnd > 0 and rnd % SAVE_EVERY == 0:
