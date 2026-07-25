@@ -15,6 +15,7 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import numpy as np
 import torch
 import pyarrow.parquet as pq
 
@@ -266,29 +267,50 @@ class ReinforcePack:
             setattr(self, k, v)
 
 
+_STAGE_BUFS: dict[str, torch.Tensor] = {}
+
+
+def _stage(name, n, dtype, pin):
+    """Grow-only staging buffer (pinned when pin), returned as an n-length
+    view. Capacity rounds up to the next 64k elements so round-to-round size
+    jitter never reallocates."""
+    buf = _STAGE_BUFS.get(name)
+    if buf is None or buf.numel() < n or buf.is_pinned() != pin:
+        cap_n = -(-n // 65536) * 65536
+        buf = torch.empty(cap_n, dtype=dtype, pin_memory=pin)
+        _STAGE_BUFS[name] = buf
+    return buf[:n]
+
+
 def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
                           device="cuda"):
     """FFD bin-pack ``docs`` = (prompt_ids, completion_ids, advantage) into
     fixed-shape packs; each bin sealed at the smallest bucket >= its fill. The
     pad tail is emitted as benign varying-ids segments of <= max_doc_len each
     (FA-varlen NaN doctrine; nanochat's forward passes max_seqlen=sequence_len,
-    so no packed segment may exceed it)."""
+    so no packed segment may exceed it).
+
+    Assembly is numpy over ONE pinned host buffer per field for all packs, then
+    one async H2D copy per field; the returned packs are contiguous views into
+    the device buffers (identical shape/stride/dtype to standalone tensors, so
+    compiled-consumer guards are unaffected). The naive per-doc torch build
+    cost ~30 ms/round in tiny host ops + 5 pageable copies per pack."""
     buckets = sorted(buckets)
     cap = buckets[-1]
     stats = {"n_docs": len(docs), "n_packs": 0, "pad_tokens": 0, "comp_targets": 0,
              "cap_tokens": 0}  # sum of sealed bucket sizes -> pad% = pad/cap
     if not docs:
         return [], stats
-    for p_ids, c_ids, _ in docs:
-        L = len(p_ids) + len(c_ids)
-        assert L <= cap, f"doc {L} tok > max bucket {cap} — raise TRAIN_BUCKETS"
-        assert L <= max_doc_len, f"doc {L} tok > max_seqlen {max_doc_len}"
+    lens = [(len(p), len(c)) for p, c, _ in docs]
+    L_max = max(p + c for p, c in lens)
+    assert L_max <= cap, f"doc {L_max} tok > max bucket {cap} — raise TRAIN_BUCKETS"
+    assert L_max <= max_doc_len, f"doc {L_max} tok > max_seqlen {max_doc_len}"
 
-    order = sorted(range(len(docs)),
-                   key=lambda i: len(docs[i][0]) + len(docs[i][1]), reverse=True)
+    order = sorted(range(len(docs)), key=lambda i: lens[i][0] + lens[i][1],
+                   reverse=True)
     bins: list[dict] = []
     for di in order:
-        L = len(docs[di][0]) + len(docs[di][1])
+        L = lens[di][0] + lens[di][1]
         for b in bins:
             if b["used"] + L <= cap and len(b["items"]) < max_num_docs:
                 b["used"] += L; b["items"].append(di); break
@@ -296,48 +318,100 @@ def build_reinforce_packs(docs, *, buckets, max_num_docs, pad_id, max_doc_len,
             bins.append({"used": L, "items": [di]})
 
     max_pad_segs = -(-cap // max_doc_len) + 1
-    out: list[ReinforcePack] = []
-    for b in bins:
-        T_pack = next(x for x in buckets if x >= b["used"])
+    W = max_num_docs + max_pad_segs + 2
+    T_packs = [next(x for x in buckets if x >= b["used"]) for b in bins]
+    bases = np.concatenate([[0], np.cumsum(T_packs)])
+    total_T = int(bases[-1])
+
+    # Persistent pinned staging, grown on demand and numpy-filled: a fresh
+    # torch.full/zeros costs ~7 ms per ~1 MB host tensor (vs 0.03 ms for a
+    # numpy fill of a reused buffer), and pinning is what lets the H2D copies
+    # go async. Reuse is safe because the caller consumes each round's packs
+    # under the same stream and syncs before the next build (train_step ends
+    # with torch.cuda.synchronize()).
+    pin = device != "cpu" and torch.cuda.is_available()
+    ids_h = _stage("ids", total_T, torch.long, pin)
+    tgt_h = _stage("tgt", total_T, torch.long, pin)
+    comp_h = _stage("comp", total_T, torch.float32, pin)
+    adv_h = _stage("adv", total_T, torch.float32, pin)
+    cu_h = _stage("cu", len(bins) * W, torch.int32, pin).view(len(bins), W)
+    ids_np, tgt_np = ids_h.numpy(), tgt_h.numpy()
+    cu_np = cu_h.numpy()
+    comp_h.numpy()[:] = 0.0
+    adv_h.numpy()[:] = 0.0
+    cu_np[:, 0] = 0
+    # ids needs no pre-fill (docs + arange pad tail cover every position);
+    # targets' pad tails are filled per pack below.
+
+    # Ragged completion-region index build (comp/adv fancy-write), global
+    # across packs: starts/lengths/advantages collected per doc below.
+    c_starts, c_lens, c_advs = [], [], []
+
+    n_comp_packs = []
+    for p, (b, T_pack) in enumerate(zip(bins, T_packs)):
+        B, used, items = int(bases[p]), b["used"], b["items"]
         stats["cap_tokens"] += T_pack
-        ids = torch.full((T_pack,), pad_id, dtype=torch.long)
-        targets = torch.full((T_pack,), pad_id, dtype=torch.long)
-        comp = torch.zeros(T_pack, dtype=torch.float32)
-        adv = torch.zeros(T_pack, dtype=torch.float32)
-        cu = torch.zeros(max_num_docs + max_pad_segs + 2, dtype=torch.int32)
-        off = 0
+        flat: list[int] = []
         n_comp_in_pack = 0
-        si = 0
-        for si, di in enumerate(b["items"]):
+        doc_Ls = np.empty(len(items), dtype=np.int64)
+        for si, di in enumerate(items):
             p_ids, c_ids, a = docs[di]
-            doc = list(p_ids) + list(c_ids)
-            L = len(doc)
-            p_len, c_len = len(p_ids), len(c_ids)
-            ids[off:off + L] = torch.tensor(doc, dtype=torch.long)
-            if L > 1:
-                targets[off:off + L - 1] = torch.tensor(doc[1:], dtype=torch.long)
+            flat.extend(p_ids)
+            flat.extend(c_ids)
+            p_len, c_len = lens[di]
+            doc_Ls[si] = p_len + c_len
             if c_len > 0:
-                lo = off + p_len - 1
-                comp[lo:lo + c_len] = 1.0
-                adv[lo:lo + c_len] = float(a)
+                c_starts.append(B + len(flat) - c_len - 1)   # B + off + p_len - 1
+                c_lens.append(c_len)
+                c_advs.append(float(a))
                 n_comp_in_pack += c_len
-            cu[si + 1] = off + L
-            off += L
-        seg_i = len(b["items"]) + 1
-        if off < T_pack:                      # benign pad segments (varying ids)
-            ids[off:] = torch.arange(T_pack - off) % 4096 + 1
-            while off < T_pack:
-                off2 = min(off + max_doc_len, T_pack)
-                cu[seg_i] = off2
-                seg_i += 1
-                off = off2
-        cu[seg_i:] = T_pack
-        stats["pad_tokens"] += int(T_pack - (cu[len(b["items"])].item()))
-        stats["comp_targets"] += n_comp_in_pack
-        out.append(ReinforcePack(
-            input_ids=ids.to(device), cu_seqlens=cu.to(device),
-            targets=targets.to(device), comp_mask=comp.to(device), adv_tok=adv.to(device),
-            n_seqs=len(b["items"]), n_comp_targets=n_comp_in_pack))
+        ends = np.cumsum(doc_Ls)                    # pack-local doc end offsets
+        ids_np[B:B + used] = flat                   # ONE conversion per pack
+        # targets = next token: a global shift is correct inside each doc; the
+        # boundary position (last token of each doc) then resets to pad, which
+        # also erases the cross-doc leak the shift wrote there.
+        tgt_np[B:B + used - 1] = ids_np[B + 1:B + used]
+        tgt_np[B + ends - 1] = pad_id
+        cu_np[p, 1:len(items) + 1] = ends
+        if used < T_pack:                           # benign pad segments
+            ids_np[B + used:B + T_pack] = np.arange(T_pack - used) % 4096 + 1
+            tgt_np[B + used:B + T_pack] = pad_id    # staging reuse: clear stale tail
+            n_segs = -(-(T_pack - used) // max_doc_len)
+            seg_ends = np.minimum(used + max_doc_len * np.arange(1, n_segs + 1),
+                                  T_pack)
+            cu_np[p, len(items) + 1:len(items) + 1 + n_segs] = seg_ends
+            cu_np[p, len(items) + 1 + n_segs:] = T_pack
+        else:
+            cu_np[p, len(items) + 1:] = T_pack
+        stats["pad_tokens"] += T_pack - used
+        n_comp_packs.append(n_comp_in_pack)
+
+    if c_starts:
+        cl = np.asarray(c_lens)
+        idx = (np.repeat(np.asarray(c_starts), cl) + np.arange(cl.sum())
+               - np.repeat(np.cumsum(cl) - cl, cl))
+        comp_h.numpy()[idx] = 1.0
+        adv_h.numpy()[idx] = np.repeat(np.asarray(c_advs, dtype=np.float32), cl)
+        stats["comp_targets"] = int(cl.sum())
+
+    # One async DMA per field for the whole round (same-stream ordering makes
+    # the views safe to consume immediately). copy=True because .to("cpu") on
+    # a CPU tensor would otherwise return the staging buffer itself, aliasing
+    # the next call's writes into these packs.
+    ids_d = ids_h.to(device, non_blocking=True, copy=True)
+    tgt_d = tgt_h.to(device, non_blocking=True, copy=True)
+    comp_d = comp_h.to(device, non_blocking=True, copy=True)
+    adv_d = adv_h.to(device, non_blocking=True, copy=True)
+    cu_d = cu_h.to(device, non_blocking=True, copy=True)
+
+    out = [ReinforcePack(
+        input_ids=ids_d[int(bases[p]):int(bases[p]) + T_packs[p]],
+        cu_seqlens=cu_d[p],
+        targets=tgt_d[int(bases[p]):int(bases[p]) + T_packs[p]],
+        comp_mask=comp_d[int(bases[p]):int(bases[p]) + T_packs[p]],
+        adv_tok=adv_d[int(bases[p]):int(bases[p]) + T_packs[p]],
+        n_seqs=len(b["items"]), n_comp_targets=n_comp_packs[p])
+        for p, b in enumerate(bins)]
     stats["n_packs"] = len(out)
     return out, stats
 
