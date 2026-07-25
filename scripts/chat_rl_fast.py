@@ -705,7 +705,12 @@ try:
                 comp = r["completion_token_ids"]
                 trunc = r["terminal"] == "truncated"
                 if CLIP_ANSWER and rw == 1.0:
-                    clipped = clip_post_answer(comp, r["completion_text"])
+                    # A stop-string retire cuts completion_text BEFORE the
+                    # marker but comp keeps the ids through it — decide on the
+                    # ids' own decode so the marker lead-in gets clipped too.
+                    text = (tokenizer.decode(comp) if r["terminal"] == "stop_string"
+                            else r["completion_text"])
+                    clipped = clip_post_answer(comp, text)
                     if clipped is not comp:      # surgery happened: now ends in EOS
                         comp, trunc = clipped, False
                         n_clipped += 1
