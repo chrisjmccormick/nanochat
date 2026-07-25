@@ -620,6 +620,7 @@ def run_eval(rnd: int) -> dict:
 # §6. Rounds
 # -----------------------------------------------------------------------------
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
+               "n_clipped",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
                "n_groups_dead", "n_docs", "n_loss_tokens",
