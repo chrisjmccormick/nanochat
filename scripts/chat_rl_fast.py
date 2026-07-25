@@ -619,6 +619,25 @@ def run_eval(rnd: int) -> dict:
 # -----------------------------------------------------------------------------
 # §6. Rounds
 # -----------------------------------------------------------------------------
+# Device-memory telemetry is SAMPLED, not per-round: cudaMemGetInfo measured
+# ~125 ms a call against this process (trace_prof4) — ~1.4% of a 9 s round, for a
+# number that barely moves, since the KV pool is VMM-mapped once and never
+# unmapped and the torch allocator reaches steady state within a few rounds. It
+# can NOT be swapped for the free torch.cuda.max_memory_reserved(): that sees
+# only the caching allocator, and the 28 GB pool lives outside it. So sample
+# every MEM_EVERY rounds and carry the last reading (0 = only round 0).
+MEM_EVERY = _env_int("MEM_EVERY", 50)
+_mem_last = 0.0
+
+
+def _device_mem_gb(rnd: int) -> float:
+    global _mem_last
+    if rnd == 0 or (MEM_EVERY and rnd % MEM_EVERY == 0):
+        free, total = torch.cuda.mem_get_info()
+        _mem_last = round((total - free) / 2 ** 30, 1)
+    return _mem_last
+
+
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_clipped",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
@@ -764,7 +783,7 @@ try:
             loss_token_mean=round(tstats["loss_token_mean"], 6),
             grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
             wnorm=round(wnorm, 2),
-            mem_gb=round((lambda f_t: (f_t[1] - f_t[0]) / 2 ** 30)(torch.cuda.mem_get_info()), 1),
+            mem_gb=_device_mem_gb(rnd),
             round_s=round(time.perf_counter() - r_t0, 1))
         curve.append(row)
         if master:
