@@ -864,37 +864,50 @@ class PrefillAllEngine:
             f"round context {ctx_tok} tok > PREFILL_T={pfg.prefill_t} " \
             f"(assemble balanced rounds, or raise PREFILL_T)"
 
-        def mint_rows(nd: Node) -> list[Seq]:
-            """K sibling rows per node: full context pages are shared (addref);
-            a partial last page is aliased by row 0 and copy-on-written for the
-            rest. Every row is admitted straight to `running` in one wave."""
+        def mint_all(nodes: list[Node]) -> list[Seq]:
+            """Mint every node's K sibling rows: full context pages are shared
+            (addref); a partial last page is aliased by row 0 and copy-on-written
+            for the rest. GPU work is BATCHED: the K-1 boundary-page clones of a
+            node share one source page, so they go as ONE broadcast scatter per
+            node (RHS is a zero-copy view) over just the OCCUPIED prefix rows —
+            the stale tail is always decode-written before any read. The naive
+            per-sibling strided copy_ pair was ~8k tiny kernels / ~100 ms a
+            round, and moved the full page. Smear seeds land in one index_put."""
             nonlocal bnd_copies
             seqs = []
-            full_pages = nd.blocks[:nd.n_full]
-            src_bnd = nd.blocks[nd.n_full] if nd.partial else None
-            for j, job in enumerate(nd.cand_jobs):
-                s = Seq(job, nd, MACRO_N)
-                pool.addref(full_pages)
-                s.blocks = list(full_pages)
-                s.n_shared = nd.n_full
-                if nd.partial:
-                    if j == 0:
-                        s.blocks.append(src_bnd)
-                    else:
-                        dst = pool.alloc(1)[0]
-                        pool.k[:, dst].copy_(pool.k[:, src_bnd])
-                        pool.v[:, dst].copy_(pool.v[:, src_bnd])
-                        s.blocks.append(dst)
-                        bnd_copies += 1
-                s.seq_len = nd.plen
-                s.slot = store.alloc()
-                s.next_tok = s.forced
-                seqs.append(s)
-            # Seed every sibling's smear state with the node's last-context
-            # pre-smear embedding (computed by the prefill graph).
+            for nd in nodes:
+                full_pages = nd.blocks[:nd.n_full]
+                src_bnd = nd.blocks[nd.n_full] if nd.partial else None
+                dsts = []
+                for j, job in enumerate(nd.cand_jobs):
+                    s = Seq(job, nd, MACRO_N)
+                    pool.addref(full_pages)
+                    s.blocks = list(full_pages)
+                    s.n_shared = nd.n_full
+                    if nd.partial:
+                        if j == 0:
+                            s.blocks.append(src_bnd)
+                        else:
+                            dst = pool.alloc(1)[0]
+                            dsts.append(dst)
+                            s.blocks.append(dst)
+                            bnd_copies += 1
+                    s.seq_len = nd.plen
+                    s.slot = store.alloc()
+                    s.next_tok = s.forced
+                    seqs.append(s)
+                if dsts:
+                    used = nd.plen - nd.n_full * PAGE   # occupied boundary rows
+                    dst_t = torch.tensor(dsts, dtype=torch.long, device="cuda")
+                    pool.k[:, dst_t, :used] = pool.k[:, src_bnd, :used].unsqueeze(1)
+                    pool.v[:, dst_t, :used] = pool.v[:, src_bnd, :used].unsqueeze(1)
+                pool.release(full_pages)  # node's own ref drops; K row refs remain
+            # Seed every sibling's smear state with its node's last-context
+            # pre-smear embedding (computed by the prefill graph) — one scatter.
             slots_t = torch.tensor([s.slot for s in seqs], dtype=torch.long, device="cuda")
-            store.data[slots_t] = nd.seed_emb.unsqueeze(0).expand(len(seqs), -1)
-            pool.release(full_pages)  # node's own ref drops; K row refs remain
+            seeds = torch.stack([nd.seed_emb for nd in nodes])
+            reps = torch.tensor([len(nd.cand_jobs) for nd in nodes], device="cuda")
+            store.data[slots_t] = torch.repeat_interleave(seeds, reps, dim=0)
             return seqs
 
         def retire(s: Seq, full_gen: list[int], eos: bool, stop: str | None = None) -> None:
@@ -936,7 +949,7 @@ class PrefillAllEngine:
         t0 = time.perf_counter()
         # -- prefill EVERY context in one replay, mint + admit ALL rows ---------
         pfg.run(nodes_all)
-        running: list[Seq] = [s for nd in nodes_all for s in mint_rows(nd)]
+        running: list[Seq] = mint_all(nodes_all)
         assert pfg.replays == 1, \
             f"round used {pfg.replays} prefill replays, not 1 — raise PREFILL_T/PREFILL_SEQS"
         # Every context is resident; private decode pages grow lazily below. The
