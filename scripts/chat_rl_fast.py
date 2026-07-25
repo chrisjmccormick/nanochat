@@ -60,7 +60,7 @@ install_dao_flash_attention()  # before anything touches nanochat.flash_attentio
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
 from nanochat.dataloader import build_reinforce_packs, assemble_balanced_rounds
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_step
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
@@ -75,6 +75,11 @@ def _env_int(name, default):
 
 def _env_float(name, default):
     return float(os.environ.get(name, default))
+
+
+def _env_opt_float(name):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else None
 
 
 def _env_flag(name, default):
@@ -101,16 +106,27 @@ TRAIN_TERMINAL = _env_flag("TRAIN_TERMINAL", 1)
 TRAIN_BRANCH_TEMP  = _env_float("TRAIN_BRANCH_TEMP", 1.0)
 TRAIN_BRANCH_TOP_P = _env_float("TRAIN_BRANCH_TOP_P", 0.95)
 GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped under DDP
-UNEMBEDDING_LR = _env_float("UNEMBEDDING_LR", 0.004)
-EMBEDDING_LR   = _env_float("EMBEDDING_LR", 0.2)
-MATRIX_LR      = _env_float("MATRIX_LR", 0.02)
-SCALAR_LR      = _env_float("SCALAR_LR", 0.5)     # resid/x0/smear scalar groups
+# LR args are RAW pretraining-style values (setup_fp32_optimizer applies the
+# usual 1/sqrt(dmodel) scale to the AdamW groups). Unset (the default) = inherit
+# the pretraining run's raw args through the checkpoint chain (§2); set to pin
+# an absolute value (how the pre-2026-07-25 launchers fixed a flat 3e-5 — which
+# for Muon is ~1000x colder than pretraining's effective matrix LR, and trained
+# ~nothing: see agent-ops rl-engine-baseline pool30).
+UNEMBEDDING_LR = _env_opt_float("UNEMBEDDING_LR")
+EMBEDDING_LR   = _env_opt_float("EMBEDDING_LR")
+MATRIX_LR      = _env_opt_float("MATRIX_LR")
+SCALAR_LR      = _env_opt_float("SCALAR_LR")      # resid/x0/smear scalar groups
 # FREEZE_SCALARS=1: zero the LR on ALL per-layer scalar groups (resid_lambdas,
 # x0_lambdas, smear_gate/smear_lambda/backout_lambda). Their pretraining
 # trajectories are smooth and deliberate — RL should not touch them (Chris).
 FREEZE_SCALARS = _env_flag("FREEZE_SCALARS", 0)
 WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
+# The one RL temperature knob: every group trains at INIT_LR_FRAC x its
+# pretraining LR (chat_rl's design, keeping its 0.05). LR_SCHEDULE "flat" holds
+# it there (the RL-paper norm); "linear" is chat_rl's rampdown to zero.
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
+LR_SCHEDULE    = os.environ.get("LR_SCHEDULE", "flat")
+assert LR_SCHEDULE in ("flat", "linear"), f"bad LR_SCHEDULE {LR_SCHEDULE!r}"
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
 TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384,)
 MAX_NUM_DOCS  = _env_int("MAX_NUM_DOCS", 64)
@@ -238,10 +254,57 @@ print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
 # -----------------------------------------------------------------------------
 # §2. Optimizer (fp32 master/state) -> bf16 cast -> engine + graph capture
 # -----------------------------------------------------------------------------
+# RL trains at INIT_LR_FRAC x the pretraining LRs: raw args inherited through
+# the checkpoint chain, with setup_fp32_optimizer applying the same
+# 1/sqrt(dmodel) AdamW scale pretraining used. base_train's sqrt(B/B_ref)
+# batch_lr_scale is NOT applied — that rule is for token batches; an RL round is
+# ~25k branch tokens, and neither chat_sft nor chat_rl carries it either.
+def _pretrain_user_config():
+    """The user_config of the PRETRAINING run behind the loaded checkpoint.
+    An SFT meta snapshots user_config before its inheritance step resolves the
+    LR args (they stay null), so walk one hop back to the base checkpoint it
+    trained from."""
+    uc = meta.get("user_config", {})
+    if uc.get("matrix_lr") is not None:
+        return uc, "checkpoint user_config"
+    base_tag = uc.get("model_tag")
+    if base_tag:
+        ckpt_dir = os.path.join(get_base_dir(), "base_checkpoints", base_tag)
+        step = uc.get("model_step") or find_last_step(ckpt_dir)
+        with open(os.path.join(ckpt_dir, f"meta_{step:06d}.json")) as f:
+            base_uc = json.load(f).get("user_config", {})
+        if base_uc.get("matrix_lr") is not None:
+            return base_uc, f"base checkpoint {base_tag} step {step}"
+    return {}, "none"
+
+
+_pt_uc, _lr_source = _pretrain_user_config()
+_LR_FALLBACKS = dict(unembedding_lr=0.008, embedding_lr=0.3, matrix_lr=0.02, scalar_lr=0.5)
+
+
+def _resolve_lr(env_val, key):
+    if env_val is not None:
+        return env_val  # pinned absolute by env (legacy launchers)
+    if _pt_uc.get(key) is not None:
+        return float(_pt_uc[key])
+    print0(f"WARNING: {key} not recorded in checkpoint chain — "
+           f"falling back to base_train default {_LR_FALLBACKS[key]}")
+    return _LR_FALLBACKS[key]
+
+
+unembedding_lr = _resolve_lr(UNEMBEDDING_LR, "unembedding_lr")
+embedding_lr   = _resolve_lr(EMBEDDING_LR, "embedding_lr")
+matrix_lr      = _resolve_lr(MATRIX_LR, "matrix_lr")
+scalar_lr      = _resolve_lr(SCALAR_LR, "scalar_lr")
+print0(f"[{TAG}] raw LRs (source: {_lr_source}; env pins: "
+       f"{[k for k, v in dict(UNEMBEDDING_LR=UNEMBEDDING_LR, EMBEDDING_LR=EMBEDDING_LR, MATRIX_LR=MATRIX_LR, SCALAR_LR=SCALAR_LR).items() if v is not None] or 'none'}): "
+       f"unembedding {unembedding_lr:g} | embedding {embedding_lr:g} | "
+       f"matrix {matrix_lr:g} | scalar {scalar_lr:g}")
+
 # Snapshot fp32 masters from the checkpoint weights BEFORE the bf16 cast.
-optimizer = setup_fp32_optimizer(model, unembedding_lr=UNEMBEDDING_LR,
-                                 embedding_lr=EMBEDDING_LR, matrix_lr=MATRIX_LR,
-                                 weight_decay=WEIGHT_DECAY, scalar_lr=SCALAR_LR)
+optimizer = setup_fp32_optimizer(model, unembedding_lr=unembedding_lr,
+                                 embedding_lr=embedding_lr, matrix_lr=matrix_lr,
+                                 weight_decay=WEIGHT_DECAY, scalar_lr=scalar_lr)
 if FREEZE_SCALARS:
     _scalar_ids = {id(model.resid_lambdas), id(model.x0_lambdas),
                    id(model.smear_gate.weight), id(model.smear_lambda),
@@ -253,6 +316,13 @@ if FREEZE_SCALARS:
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * INIT_LR_FRAC
     group["initial_lr"] = group["lr"]
+# setup_fp32_optimizer's fixed group order: the 6 AdamW groups, then Muon
+# shape-groups (all at matrix_lr).
+_GROUP_NAMES = ["unembed", "embed", "value_emb", "resid", "x0", "smear"]
+_eff = {(_GROUP_NAMES[i] if i < 6 else "muon"): g["lr"]
+        for i, g in enumerate(optimizer.param_groups)}
+print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, {LR_SCHEDULE}): "
+       + " | ".join(f"{k} {v:.3g}" for k, v in _eff.items()))
 
 cast_model_bf16(model)
 model.eval()
@@ -528,9 +598,19 @@ def save_ckpt(step: int) -> None:
     base_dir = get_base_dir()
     ckpt_dir = os.path.join(base_dir, "chatrl_checkpoints", OUT_TAG)
     opt_data = optimizer.state_dict() if SAVE_OPT else None
+    # user_config carries the RESOLVED raw LRs so a chain off this checkpoint
+    # inherits them directly (an SFT meta's snapshot has them null instead).
+    meta_data = {"model_config": model.config.__dict__,
+                 "user_config": dict(source=SOURCE, model_tag=MODEL_TAG,
+                                     model_step=MODEL_STEP,
+                                     unembedding_lr=unembedding_lr,
+                                     embedding_lr=embedding_lr,
+                                     matrix_lr=matrix_lr, scalar_lr=scalar_lr,
+                                     init_lr_frac=INIT_LR_FRAC,
+                                     lr_schedule=LR_SCHEDULE)}
     if master or opt_data is not None:
         save_checkpoint(ckpt_dir, step, model.state_dict() if master else None,
-                        opt_data, {"model_config": model.config.__dict__}, rank=rank)
+                        opt_data, meta_data, rank=rank)
     if master:
         print(f"  saved checkpoint -> {ckpt_dir} (step {step})", flush=True)
 
@@ -568,7 +648,7 @@ try:
         ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
-        lrm = 1.0 - rnd / num_rounds
+        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
         _t = time.perf_counter()
@@ -671,6 +751,9 @@ finally:
         tag=TAG, k=K_DRAWS, problems_per_round=PPR, rounds_run=len(curve),
         budget=MAX_TOKENS, world_size=world_size, source=SOURCE,
         temperature=TEMPERATURE, adv_std=ADV_STD, init_lr_frac=INIT_LR_FRAC,
+        lr_schedule=LR_SCHEDULE, lr_source=_lr_source,
+        raw_lrs=dict(unembedding=unembedding_lr, embedding=embedding_lr,
+                     matrix=matrix_lr, scalar=scalar_lr),
         error=run_error,
         solve_rate_first=(curve[0]["solve_rate"] if curve else None),
         solve_rate_last=(curve[-1]["solve_rate"] if curve else None),

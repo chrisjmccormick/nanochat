@@ -128,7 +128,9 @@ for name, fallback, source in [
     if arg_val is None:
         resolved = pretrain_val if pretrain_val is not None else fallback
         setattr(args, name, resolved)
-        print0(f"Inherited {name}={resolved} from pretrained checkpoint")
+        source_desc = ("pretrained checkpoint" if pretrain_val is not None else
+                       "FALLBACK default (not recorded in checkpoint meta)")
+        print0(f"Inherited {name}={resolved} from {source_desc}")
     elif pretrain_val is not None and arg_val != pretrain_val:
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
