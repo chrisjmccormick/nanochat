@@ -54,6 +54,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile as torch_profile, record_function
 
 from nanochat.fast_engine import install_dao_flash_attention
 install_dao_flash_attention()  # before anything touches nanochat.flash_attention
@@ -154,6 +155,15 @@ EVAL_MAX_TOKENS = _env_int("EVAL_MAX_TOKENS", MAX_TOKENS)
 SAVE_EVERY    = _env_int("SAVE_EVERY", 60)        # 0 = only at end
 SAVE_OPT      = _env_flag("SAVE_OPT", 0)          # fp32 optimizer state is resumable
 SAVE_ROLLOUTS = _env_flag("SAVE_ROLLOUTS", 0)
+# PROFILE=1: chrome trace for ui.perfetto.dev (speedrun_v7-profiled pattern).
+# Steps are ROUNDS: PROF_WAIT warm rounds skipped, 1 profiler-warmup round, then
+# PROF_ACTIVE rounds recorded (CPU+CUDA, with_stack for the python trace); the
+# run is capped to exactly that horizon and trace_<tag>.json.gz lands in cwd.
+# record_function labels mark gen / grade / train phases — the compiled decode
+# and train bodies swallow interior labels, so labels sit OUTSIDE them.
+PROFILE     = _env_flag("PROFILE", 0)
+PROF_WAIT   = _env_int("PROF_WAIT", 3)
+PROF_ACTIVE = _env_int("PROF_ACTIVE", 1)
 OUT_TAG       = os.environ.get("OUT_TAG", "d24-fastrl")
 SOURCE        = os.environ.get("SOURCE", "sft")
 # FIXED_PROBLEMS: csv of train indices — every round trains on exactly these
@@ -249,6 +259,10 @@ print0(f"[{TAG}] Longest prefill batch: {round_max:,} tokens, prefill pack is {_
 rounds_per_epoch = max(1, num_rounds // EPOCHS)
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
+if PROFILE:
+    num_rounds = min(num_rounds, PROF_WAIT + 1 + PROF_ACTIVE)
+    print0(f"[{TAG}] PROFILE: {num_rounds} rounds "
+           f"(wait {PROF_WAIT} + warmup 1 + active {PROF_ACTIVE})")
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
        f"x {num_rounds} rounds @ budget {MAX_TOKENS} | max prompt {max_prompt} tok "
        f"| train buckets {TRAIN_BUCKETS} | stop-detect "
@@ -466,29 +480,31 @@ def train_step(groups: list[dict]) -> dict:
     pstats = None
     _t_build = _t_fwd = 0.0
     if docs:
-        packs, pstats = build_reinforce_packs(
-            docs, buckets=list(TRAIN_BUCKETS), max_num_docs=MAX_NUM_DOCS,
-            pad_id=PAD_ID, max_doc_len=SEQ_CAP)
+        with record_function("train/build-packs"):
+            packs, pstats = build_reinforce_packs(
+                docs, buckets=list(TRAIN_BUCKETS), max_num_docs=MAX_NUM_DOCS,
+                pad_id=PAD_ID, max_doc_len=SEQ_CAP)
         n_packs = pstats["n_packs"]
         _t_build = time.perf_counter() - _t0
         _pk_verbose = os.environ.get("TRAIN_TIMING_VERBOSE") == "1"
         _pk_t = time.perf_counter()
-        for pk in packs:
-            loss_sum, n_tok, n_branch, n_comp = TRAIN_FN(
-                model, pk.input_ids, pk.cu_seqlens, pk.targets, pk.comp_mask,
-                pk.adv_tok, TRAIN_BRANCH_TEMP, TRAIN_BRANCH_TOP_P)
-            total_comp += int(n_comp.item())
-            total_branch += int(n_branch.item())
-            nt = int(n_tok.item())
-            if nt > 0:
-                loss_sum.backward()                   # unnormalized; accumulates
-                total_loss += float(loss_sum.detach())
-                total_tokens += nt
-            del loss_sum
-            if _pk_verbose:
-                _now = time.perf_counter()
-                print0(f"      pack {n_packs}b{pk.input_ids.numel()}: {_now - _pk_t:.3f}s", flush=True)
-                _pk_t = _now
+        with record_function("train/fwd+bwd"):
+            for pk in packs:
+                loss_sum, n_tok, n_branch, n_comp = TRAIN_FN(
+                    model, pk.input_ids, pk.cu_seqlens, pk.targets, pk.comp_mask,
+                    pk.adv_tok, TRAIN_BRANCH_TEMP, TRAIN_BRANCH_TOP_P)
+                total_comp += int(n_comp.item())
+                total_branch += int(n_branch.item())
+                nt = int(n_tok.item())
+                if nt > 0:
+                    loss_sum.backward()               # unnormalized; accumulates
+                    total_loss += float(loss_sum.detach())
+                    total_tokens += nt
+                del loss_sum
+                if _pk_verbose:
+                    _now = time.perf_counter()
+                    print0(f"      pack {n_packs}b{pk.input_ids.numel()}: {_now - _pk_t:.3f}s", flush=True)
+                    _pk_t = _now
         _t_fwd = time.perf_counter() - _t0 - _t_build
     # DAPO token-level mean across ALL ranks' loss tokens
     tok_t = torch.tensor(float(total_tokens), device=device)
@@ -497,22 +513,23 @@ def train_step(groups: list[dict]) -> dict:
     global_tokens = float(tok_t.item())
     gnorm = 0.0
     stepped = False
-    if global_tokens > 0:
-        # A rank can have zero local docs while others train: materialize zero
-        # grads so the (sharded) optimizer's collectives stay well-formed.
-        for prm in model.parameters():
-            if prm.grad is None:
-                prm.grad = torch.zeros_like(prm)
-        inv = world_size / global_tokens  # optimizer AVG-reduces grads across ranks
-        params = [p for p in model.parameters() if p.grad is not None]
-        for prm in params:
-            prm.grad.mul_(inv)
-        if GRAD_CLIP > 0 and not ddp:  # exact clip; skipped under DDP (sharded reduce)
-            gnorm = float(torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP))
-        optimizer.step()
-        stepped = True
-    model.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
+    with record_function("train/clip+opt"):
+        if global_tokens > 0:
+            # A rank can have zero local docs while others train: materialize zero
+            # grads so the (sharded) optimizer's collectives stay well-formed.
+            for prm in model.parameters():
+                if prm.grad is None:
+                    prm.grad = torch.zeros_like(prm)
+            inv = world_size / global_tokens  # optimizer AVG-reduces grads across ranks
+            params = [p for p in model.parameters() if p.grad is not None]
+            for prm in params:
+                prm.grad.mul_(inv)
+            if GRAD_CLIP > 0 and not ddp:  # exact clip; skipped under DDP (sharded reduce)
+                gnorm = float(torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP))
+            optimizer.step()
+            stepped = True
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
     # approximate wall split (host clocks; the per-pack .item() syncs make t_fwd
     # honest, and the trailing sync charges the drain + optimizer to t_opt)
     _t_opt = time.perf_counter() - _t0 - _t_build - _t_fwd
@@ -618,6 +635,15 @@ def save_ckpt(step: int) -> None:
         print(f"  saved checkpoint -> {ckpt_dir} (step {step})", flush=True)
 
 
+profiler = None
+if PROFILE and master:
+    profiler = torch_profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False, profile_memory=False, with_stack=True,
+        schedule=torch.profiler.schedule(wait=PROF_WAIT, warmup=1,
+                                         active=PROF_ACTIVE, repeat=1))
+    profiler.__enter__()
+
 try:
     for rnd in range(num_rounds):
         r_t0 = time.perf_counter()
@@ -636,26 +662,29 @@ try:
         # -- generation ------------------------------------------------------
         idxs = FIXED_PROBLEMS if FIXED_PROBLEMS is not None else round_schedule[rnd]
         specs = [(i, train_prompts[i], K_DRAWS, MAX_TOKENS) for i in idxs]
-        rows, gstats = engine.run_round(engine.make_nodes(specs), rnd)
+        with record_function("round/gen"):
+            rows, gstats = engine.run_round(engine.make_nodes(specs), rnd)
 
         # -- grade -----------------------------------------------------------
-        rewards = grade_rows(rows)
-        by_pid: dict[int, list[int]] = {}
-        for i, r in enumerate(rows):
-            by_pid.setdefault(r["meta"], []).append(i)
-        groups = [dict(
-            prompt_ids=train_prompts[pid],
-            completions=[rows[i]["completion_token_ids"] for i in idl],
-            rewards=[rewards[i] for i in idl],
-            truncated=[rows[i]["terminal"] == "truncated" for i in idl],
-        ) for pid, idl in by_pid.items()]
+        with record_function("round/grade+group"):
+            rewards = grade_rows(rows)
+            by_pid: dict[int, list[int]] = {}
+            for i, r in enumerate(rows):
+                by_pid.setdefault(r["meta"], []).append(i)
+            groups = [dict(
+                prompt_ids=train_prompts[pid],
+                completions=[rows[i]["completion_token_ids"] for i in idl],
+                rewards=[rewards[i] for i in idl],
+                truncated=[rows[i]["terminal"] == "truncated" for i in idl],
+            ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
         lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
         _t = time.perf_counter()
-        tstats = train_step(groups)
+        with record_function("round/train"):
+            tstats = train_step(groups)
         train_s = time.perf_counter() - _t
 
         # -- telemetry -------------------------------------------------------
@@ -734,10 +763,24 @@ try:
 
         if SAVE_EVERY and rnd > 0 and rnd % SAVE_EVERY == 0:
             save_ckpt(rnd)
+        if profiler is not None:
+            profiler.step()
 except BaseException as e:
     run_error = f"{type(e).__name__}: {e}"
     raise
 finally:
+    if profiler is not None:
+        profiler.__exit__(None, None, None)
+        trace_path = HERE / f"trace_{TAG}.json.gz"
+        try:
+            profiler.export_chrome_trace(str(trace_path))
+            print(f"\n  chrome trace -> {trace_path} (load in ui.perfetto.dev; labels: "
+                  f"round/gen, round/grade+group, round/train > build-packs / fwd+bwd / "
+                  f"clip+opt)", flush=True)
+            print(profiler.key_averages().table(sort_by="self_cuda_time_total",
+                                                row_limit=25), flush=True)
+        except Exception as pe:
+            print(f"  !! trace export failed: {pe}", flush=True)
     if master and mf:
         mf.close()
     if master and pf:
