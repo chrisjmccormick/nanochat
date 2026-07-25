@@ -35,6 +35,7 @@ import time
 from collections import deque
 
 import numpy as np
+import numpy as np
 import torch
 import torch._dynamo
 import torch.nn as nn
@@ -379,8 +380,9 @@ class KVPool:
 
 class SmearStore:
     """Per-row persistent smear state (prev-token post-norm/pre-smear embedding),
-    indexed by slot id. Rows hold a slot from mint to retire; the decode window
-    gathers slots -> dense graph buffer before replays and scatters back after."""
+    indexed by slot id. Rows hold a slot from mint to retire; seed_window
+    gathers slots -> the dense graph buffer ONCE at round start, after which
+    prev_emb lives in place (positions are stable between bucket drops)."""
 
     def __init__(self, n_slots: int, n_embd: int, device):
         self.data = torch.zeros(n_slots, n_embd, dtype=torch.bfloat16, device=device)
@@ -590,12 +592,15 @@ class GraphDecoder:
         self.prev_emb = torch.zeros(max_seqs, C, dtype=torch.bfloat16, device=dev)
         self.tok_buf = torch.zeros(max_seqs, dtype=torch.long, device=dev)
         self.token_record = torch.zeros(max_seqs, macro_n, dtype=torch.long, device=dev)
+        # pinned host mirror of token_record: the window's ONE D2H lands here
+        # and is scanned as numpy — no python list materialization.
+        self.tok_host = torch.empty(max_seqs, macro_n, dtype=torch.long, pin_memory=True)
+        self.tok_host_np = self.tok_host.numpy()
         self.inv_temp = torch.tensor(1.0 / temperature, dtype=torch.float32, device=dev)
         self.top_p_t = torch.tensor(top_p, dtype=torch.float32, device=dev)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._mempool = None
         self._scratch = pool.alloc(1)[0]
-        self._win_rows = 0
 
     def set_sampling(self, temperature: float | None = None, top_p: float | None = None) -> None:
         """Live sampler knobs — the captured graphs read these buffers."""
@@ -635,32 +640,64 @@ class GraphDecoder:
             self.graphs[b] = g
             print(f"    bucket {b:3d}: {time.perf_counter() - t:5.1f}s", flush=True)
 
-    def begin_window(self, inputs: list[int], cache_lens: list[int],
-                     block_rows: list[list[int]], slots: list[int]) -> None:
-        B = len(inputs)
-        self._win_rows = B
-        bucket = next(x for x in self.buckets if x >= B)
-        mb = self.max_blocks
+    # -- SoA window protocol: the graph ITSELF carries inputs / cache_seqlens /
+    # prev_emb between windows (each replay writes the sampled token into
+    # input_ids and advances cache_seqlens), so as long as a row keeps its
+    # batch position, a steady-state window uploads NOTHING and downloads one
+    # pinned (bucket, N) token block. Rows move only at bucket drops (compact)
+    # and dead rows are parked in place (park) — the capture-time padded-row
+    # state — until the next drop reclaims their position.
+
+    def seed_window(self, forced_np, cache_lens_np, block_tables_np, slots_np,
+                    bucket: int) -> None:
+        """Round-start upload (window 0): forced first inputs, context lens,
+        initial block rows, smear seeds gathered from the rows' store slots.
+        The only full-state upload of the round."""
+        B = len(forced_np)
         dev = "cuda"
-        slots_t = torch.tensor(slots, dtype=torch.long, device=dev)
-        self.input_ids[:B, 0] = torch.tensor(inputs, dtype=torch.long, device=dev)
-        self.cache_seqlens[:B] = torch.tensor(cache_lens, dtype=torch.int32, device=dev)
-        self.block_table[:B] = torch.tensor([r + [0] * (mb - len(r)) for r in block_rows],
-                                            dtype=torch.int32, device=dev)
+        self.input_ids[:B, 0] = torch.from_numpy(forced_np).to(dev, non_blocking=True)
+        self.cache_seqlens[:B] = torch.from_numpy(cache_lens_np).to(dev, non_blocking=True)
+        self.block_table[:B] = torch.from_numpy(block_tables_np).to(dev, non_blocking=True)
+        slots_t = torch.from_numpy(slots_np).to(dev, non_blocking=True)
         self.prev_emb[:B] = self.store.data[slots_t]
-        if bucket > B:
-            self.cache_seqlens[B:bucket] = 0
-            self.block_table[B:bucket] = 0
+        self.park(B, bucket)
+
+    def park(self, positions, bucket: int = 0) -> None:
+        """cache 0 + null block table for dead/padded rows (int start => park
+        [start:bucket); ndarray => park those positions). A parked row keeps
+        replaying at bucket cost but writes only the null block and attends
+        over ~nothing; its cache drifts +N/window until re-parked or dropped."""
+        if isinstance(positions, np.ndarray):
+            if positions.size == 0:
+                return
+            idx = torch.from_numpy(positions).to("cuda", non_blocking=True)
+            self.cache_seqlens.index_fill_(0, idx, 0)
+            self.block_table.index_fill_(0, idx, 0)
+        elif bucket > positions:
+            self.cache_seqlens[positions:bucket] = 0
+            self.block_table[positions:bucket] = 0
+
+    def compact(self, keep_np) -> None:
+        """Bucket drop: gather survivors to the head positions, carrying their
+        device-resident inputs/cache/blocks/smear state (one tiny index H2D;
+        index_select materializes before the head copy, so overlap is safe)."""
+        k = len(keep_np)
+        idx = torch.from_numpy(keep_np).to("cuda", non_blocking=True)
+        for buf in (self.input_ids, self.cache_seqlens, self.block_table, self.prev_emb):
+            buf[:k].copy_(buf.index_select(0, idx))
+
+    def replay_window(self, bucket: int) -> None:
         g = self.graphs[bucket]
         for i in range(self.macro_n):
             g.replay()
-            self.token_record[:B, i] = self.tok_buf[:B]
-        # Persist the window's final smear state back to the rows' slots
-        # (device-ordered; safe to enqueue before the host reads tokens).
-        self.store.data[slots_t] = self.prev_emb[:B]
+            self.token_record[:bucket, i] = self.tok_buf[:bucket]
 
-    def collect_window(self) -> list[list[int]]:
-        return self.token_record[:self._win_rows].tolist()
+    def collect_np(self, bucket: int):
+        """The window's ONE host sync: pinned D2H of the (bucket, N) record,
+        returned as a numpy view (valid until the next window)."""
+        self.tok_host[:bucket].copy_(self.token_record[:bucket], non_blocking=True)
+        torch.cuda.synchronize()
+        return self.tok_host_np[:bucket]
 
 
 # -----------------------------------------------------------------------------
@@ -860,14 +897,13 @@ class PrefillAllEngine:
             pool.release(full_pages)  # node's own ref drops; K row refs remain
             return seqs
 
-        def retire(s: Seq, eos: bool, stop: str | None = None) -> None:
+        def retire(s: Seq, full_gen: list[int], eos: bool, stop: str | None = None) -> None:
             nonlocal rolls_done
             s.done = True
             pool.release(s.blocks)
             s.blocks = []
             store.release(s.slot)
             j = s.job
-            full_gen = list(s.gen)
             body = full_gen[:-1] if eos else full_gen  # trailing terminal excluded from text
             full_text = self.tok.decode(body)
             if stop is not None:
@@ -890,51 +926,12 @@ class PrefillAllEngine:
                 on_retire(row)
             rolls_done += 1
 
-        def _stop_hit(s: Seq) -> str | None:
-            ids = s.gen[-self.window_tokens:]
-            if len(ids) < self.window_tokens:  # pad from the pre-gen stream
-                pre = list(s.job["prompt_ids"])
-                ids = pre[len(ids) - self.window_tokens:] + ids
+        def _stop_hit_ids(ids: list[int]) -> str | None:
             tail = self.tok.decode(ids)
             hits = [ss for ss in self.stop_strings if ss in tail]
             if not hits:
                 return None
             return max(hits, key=lambda ss: tail.rfind(ss))
-
-        def apply_window(batch: list[Seq], toks: list[list[int]]) -> bool:
-            nonlocal tok_total, stop_fires
-            any_done = False
-            for s, row in zip(batch, toks):
-                if (self.terminal_ids.isdisjoint(row)
-                        and (not self.stop_detect or self.gate_ids.isdisjoint(row))
-                        and len(s.gen) + MACRO_N < s.allow):
-                    s.gen.extend(row)
-                    tok_total += MACRO_N
-                    s.seq_len += MACRO_N
-                    s.next_tok = row[-1]
-                    continue
-                for t in row:
-                    s.gen.append(t)
-                    tok_total += 1
-                    if t in self.terminal_ids:
-                        retire(s, True)
-                        any_done = True
-                        break
-                    if len(s.gen) >= s.allow:  # single-pass: budget reached = truncated
-                        retire(s, False)
-                        any_done = True
-                        break
-                    if self.stop_detect and t in self.gate_ids:
-                        hit = _stop_hit(s)
-                        if hit is not None:
-                            stop_fires += 1
-                            retire(s, False, stop=hit)
-                            any_done = True
-                            break
-                if not s.done:
-                    s.seq_len += MACRO_N
-                    s.next_tok = row[-1]
-            return any_done
 
         t0 = time.perf_counter()
         # -- prefill EVERY context in one replay, mint + admit ALL rows ---------
@@ -958,34 +955,136 @@ class PrefillAllEngine:
                   flush=True)
         min_free = len(pool.free)
 
+        # -- SoA scheduler state: batch position is STABLE between bucket drops,
+        # so the graph carries inputs/cache/prev_emb across windows and a quiet
+        # window's host work is one pinned D2H + numpy scans. All rows minted in
+        # one wave => every live row's gen length is exactly w*MACRO_N.
+        seqs = running
+        B0 = len(seqs)
+        orig = np.arange(B0)                  # position -> gen_buf row (stable id)
+        live = np.ones(B0, dtype=bool)
+        plens = np.array([s.plen for s in seqs], dtype=np.int64)
+        allows = np.array([s.allow for s in seqs], dtype=np.int64)
+        n_pages = np.array([len(s.blocks) for s in seqs], dtype=np.int64)
+        gen_buf = np.empty((B0, (-(-int(allows.max()) // MACRO_N)) * MACRO_N),
+                           dtype=np.int64)
+        TERM = np.fromiter(self.terminal_ids, dtype=np.int64)
+        GATE = (np.fromiter(self.gate_ids, dtype=np.int64)
+                if self.stop_detect and self.gate_ids else None)
+
+        bucket = next(x for x in self.buckets if x >= B0)
+        bt0 = np.zeros((B0, self.max_blocks), dtype=np.int32)
+        for p, s in enumerate(seqs):
+            bt0[p, :len(s.blocks)] = s.blocks
+        gd.seed_window(np.array([s.next_tok for s in seqs], dtype=np.int64),
+                       plens.astype(np.int32), bt0,
+                       np.array([s.slot for s in seqs], dtype=np.int64), bucket)
+
         last_roll_print = 0
-        while running:
-            batch = running
-            inputs, cache_lens, block_rows, slots = [], [], [], []
-            for s in batch:
-                grow = (s.seq_len + MACRO_N + PAGE - 1) // PAGE - len(s.blocks)
-                if grow > 0:
-                    if grow > len(pool.free):
-                        raise RuntimeError(
-                            f"KV pool exhausted mid-round r{rnd}: need {grow} pages, "
-                            f"{len(pool.free)} free, {len(batch)} rows live — round too "
-                            f"large for the pool (lower MAX_TOKENS / PPR / K, or raise "
-                            f"KV_POOL_GB)")
-                    s.blocks.extend(pool.alloc(grow))
-                inputs.append(s.next_tok)
-                cache_lens.append(s.seq_len)
-                block_rows.append(s.blocks)
-                slots.append(s.slot)
+        w = 0
+        park_dirty = False                    # dead rows drift until re-parked
+        while True:
+            lp = np.flatnonzero(live)
+            if lp.size == 0:
+                break
+            nb = next(x for x in self.buckets if x >= lp.size)
+            if nb < bucket:                   # bucket drop: compact survivors
+                gd.compact(lp)
+                seqs = [seqs[p] for p in lp]
+                orig, plens, allows, n_pages = orig[lp], plens[lp], allows[lp], n_pages[lp]
+                live = np.ones(lp.size, dtype=bool)
+                bucket = nb
+                gd.park(lp.size, bucket)
+                park_dirty = False
+                lp = np.arange(lp.size)
+            elif park_dirty:
+                gd.park(np.flatnonzero(~live))
+                park_dirty = False
+            # vectorized page growth; ONE consolidated block-table scatter
+            need = (plens + (w + 1) * MACRO_N + PAGE - 1) // PAGE - n_pages
+            need[~live] = 0
+            gidx = np.flatnonzero(need > 0)
+            if gidx.size:
+                total = int(need[gidx].sum())
+                if total > len(pool.free):
+                    raise RuntimeError(
+                        f"KV pool exhausted mid-round r{rnd}: need {total} pages, "
+                        f"{len(pool.free)} free, {lp.size} rows live — round too "
+                        f"large for the pool (lower MAX_TOKENS / PPR / K, or raise "
+                        f"KV_POOL_GB)")
+                fresh = pool.alloc(total)     # one batch pop, row-major chunks
+                flat_pos, o = [], 0
+                for p in gidx:
+                    s, k = seqs[p], int(need[p])
+                    flat_pos.extend(int(p) * gd.max_blocks + c
+                                    for c in range(len(s.blocks), len(s.blocks) + k))
+                    s.blocks.extend(fresh[o:o + k])
+                    o += k
+                n_pages[gidx] += need[gidx]
+                upd = torch.tensor([flat_pos, fresh],
+                                   dtype=torch.int64).to("cuda", non_blocking=True)
+                gd.block_table.view(-1)[upd[0]] = upd[1].to(torch.int32)
             min_free = min(min_free, len(pool.free))
-            gd.begin_window(inputs, cache_lens, block_rows, slots)
-            toks = gd.collect_window()
-            if apply_window(batch, toks):
-                running = [s for s in running if not s.done]
+            gd.replay_window(bucket)
+            toks_np = gd.collect_np(bucket)   # the window's single host sync
+            # event scan: rows with a terminal / stop-gate / budget crossing go
+            # to the exact per-token path; everyone else bulk-appends.
+            t_live = toks_np[lp]
+            slow = np.isin(t_live, TERM).any(axis=1)
+            if GATE is not None:
+                slow |= np.isin(t_live, GATE).any(axis=1)
+            slow |= (w + 1) * MACRO_N >= allows[lp]
+            base = w * MACRO_N
+            fast_lp = lp[~slow]
+            gen_buf[orig[fast_lp], base:base + MACRO_N] = toks_np[fast_lp]
+            tok_total += int(fast_lp.size) * MACRO_N
+            any_done = False
+            for p in lp[slow]:
+                s = seqs[p]
+                cur = toks_np[p]
+                gen_row = gen_buf[orig[p]]
+                retired = False
+                for j in range(MACRO_N):
+                    t = int(cur[j])
+                    tok_total += 1
+                    if t in self.terminal_ids:
+                        retire(s, gen_row[:base].tolist() + cur[:j + 1].tolist(), True)
+                        retired = True
+                        break
+                    if base + j + 1 >= s.allow:  # budget reached = truncated
+                        retire(s, gen_row[:base].tolist() + cur[:j + 1].tolist(), False)
+                        retired = True
+                        break
+                    if self.stop_detect and t in self.gate_ids:
+                        glen = base + j + 1
+                        take = min(self.window_tokens, glen)
+                        from_cur = min(take, j + 1)
+                        from_gen = take - from_cur
+                        ids = (gen_row[base - from_gen:base].tolist()
+                               + cur[j + 1 - from_cur:j + 1].tolist())
+                        if take < self.window_tokens:  # pad from the pre-gen stream
+                            pre = list(s.job["prompt_ids"])
+                            ids = pre[len(ids) - self.window_tokens:] + ids
+                        hit = _stop_hit_ids(ids)
+                        if hit is not None:
+                            stop_fires += 1
+                            retire(s, gen_row[:base].tolist() + cur[:j + 1].tolist(),
+                                   False, stop=hit)
+                            retired = True
+                            break
+                if retired:
+                    live[p] = False
+                    any_done = True
+                else:                          # gate false alarm: full window kept
+                    gen_row[base:base + MACRO_N] = cur
+            if any_done:
+                park_dirty = True
+            w += 1
             if rolls_done - last_roll_print >= print_every:
                 el = time.perf_counter() - t0
                 # all Python-side counters — no GPU sync, no throughput cost
                 print(f"    [r{rnd}] roll {rolls_done:4d}/{n_target} | tok {tok_total:>10,} | "
-                      f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {len(running):3d} | "
+                      f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {int(live.sum()):3d} | "
                       f"free {len(pool.free):4d} | {el:6.1f}s", flush=True)
                 last_roll_print = rolls_done
 
