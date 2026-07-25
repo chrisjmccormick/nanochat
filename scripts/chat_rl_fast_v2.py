@@ -131,7 +131,7 @@ MAX_SEQS     = _env_int("MAX_SEQS", 256)
 MACRO_N      = _env_int("MACRO_N", 8)
 _BK_ENV = os.environ.get("BUCKETS")
 BUCKETS      = tuple(int(x) for x in _BK_ENV.split(",")) if _BK_ENV else None
-PREFILL_T    = _env_int("PREFILL_T", 2048)
+PREFILL_T    = _env_int("PREFILL_T", 0)           # 0/unset -> auto-size (see §1)
 PREFILL_SEQS = _env_int("PREFILL_SEQS", 12)
 PANTRY_BLOCKS = _env_int("PANTRY_BLOCKS", 96)
 STARVE_JOBS  = _env_int("STARVE_JOBS", 12)
@@ -205,30 +205,42 @@ max_prompt = max(max(len(p) for p in train_prompts),
                  max((len(p) for p in val_prompts), default=0))
 assert max_prompt + 1 + max(MAX_TOKENS, EVAL_MAX_TOKENS) <= SEQ_CAP, \
     "prompt+budget exceeds model context"
-assert max_prompt <= PREFILL_T, f"longest prompt {max_prompt} > PREFILL_T={PREFILL_T}"
-if PASS1:
-    assert max_prompt + PASS1 <= PREFILL_T, "prompt+PASS1 exceeds PREFILL_T"
-
 pool = POOL_PROBLEMS if POOL_PROBLEMS is not None else list(range(len(train_task)))
 shard = pool[rank::world_size]
 if FIXED_PROBLEMS is not None:
     round_schedule = None                         # same fixed problems every round
     num_rounds = (len(pool) // PPR) * EPOCHS
+    round_max = sum(len(train_prompts[i]) - 1 for i in FIXED_PROBLEMS)
 else:
     # Balanced round assembly (dataloader): each round's contexts must fit ONE
     # static-prefill replay (Sigma context <= PREFILL_T). Stratified partition
-    # keeps per-round context sums near the mean so a modest, EXPLICIT PREFILL_T
-    # suffices — the engine never auto-sizes. Report the spread + assert the fit.
+    # keeps per-round context sums near the mean, so the longest round is only
+    # marginally above the mean and the prefill pack can be sized right to it.
     round_schedule, _sched = assemble_balanced_rounds(
         [(i, len(train_prompts[i]) - 1) for i in shard], ppr_rank, epochs=EPOCHS)
     num_rounds = len(round_schedule)
+    round_max = _sched["max"]
     print0(f"[{TAG}] balanced rounds: per-round context tokens "
-           f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']} "
-           f"| PREFILL_T={PREFILL_T} ({100 * _sched['max'] / PREFILL_T:.0f}% packed at the "
-           f"max round)", flush=True)
-    assert _sched["max"] <= PREFILL_T, (
-        f"balanced round max context {_sched['max']} tok > PREFILL_T={PREFILL_T} — "
-        f"raise PREFILL_T explicitly (the engine does not auto-size)")
+           f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']}", flush=True)
+
+# Prefill pack length. Every round is pre-designed above, so the longest prefill
+# batch of the whole epoch is known here — size the static graph to it (rounded up
+# to a multiple of 64) rather than over-provisioning: the graph pushes PREFILL_T
+# positions through the dense layers every replay whether or not they hold real
+# tokens, and pads the tail into one attended segment. Setting PREFILL_T in the env
+# pins it instead (to reproduce an earlier run's shape).
+prefill_need = max(round_max, max_prompt + PASS1)
+if PREFILL_T:
+    assert PREFILL_T >= prefill_need, (
+        f"PREFILL_T={PREFILL_T} < {prefill_need} tok needed (longest prefill batch "
+        f"{round_max}, longest prompt{'+PASS1' if PASS1 else ''} {max_prompt + PASS1})")
+    _how = f"pinned by PREFILL_T={PREFILL_T}"
+else:
+    PREFILL_T = -(-prefill_need // 64) * 64
+    _how = f"auto-sized to %64: {PREFILL_T:,}"
+print0(f"[{TAG}] Longest prefill batch: {round_max:,} tokens, prefill pack is {_how} "
+       f"tokens ({100 * round_max / PREFILL_T:.0f}% packed at the longest round)",
+       flush=True)
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
