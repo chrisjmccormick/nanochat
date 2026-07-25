@@ -1,5 +1,18 @@
 """chat_rl_fast.py — fused same-process RL speedrun on GSM8K.
 
+Generation and training are CORESIDENT: the KV pool is sized to the measured
+round peak (default 28 GB ~= 796 blocks vs an observed worst round of 599) and
+mapped once for the life of the process. Earlier revisions time-shared the card
+by lending the pool's physical pages back to training between phases, which cost
+~0.8 s of remap plus a ~0.9 s first-pack tax every round (training rebuilt its
+flushed activation segments inside pack 1). Dropping the handoff took the round
+wall from ~10.5 s to ~8.5 s at identical rollout statistics; the pool-exhaustion
+guard stays fail-loud, and a trip means policy collapse.
+
+The prefill pack is auto-sized from the pre-designed round schedule (§1), and
+the KV pool is the one number to revisit if the regime changes: capacity is
+pool 28 + train peak ~44.5 reserved + context ~3 = ~75.5 of 80 GB.
+
 The fast counterpart of scripts/chat_rl.py: generation runs through the paged,
 prefix-shared, CUDA-graph engine (nanochat/fast_engine.py) fused into the
 training process — one model instance, in-place full-param bf16 updates with
@@ -74,7 +87,6 @@ PPR          = _env_int("PROBLEMS_PER_ROUND", 16) # global, across ranks
 EPOCHS       = _env_int("EPOCHS", 1)
 ROUNDS_CAP   = _env_int("ROUNDS", 0)              # 0 = full EPOCHS horizon
 MAX_TOKENS   = _env_int("MAX_TOKENS", 256)
-PASS1        = _env_int("PASS1", 0)               # two-pass off by default (wash at small budgets)
 # Sampler (speedrun house sampler)
 TEMPERATURE  = _env_float("TEMPERATURE", 0.6)
 TOP_P        = _env_float("TOP_P", 0.95)
@@ -104,15 +116,13 @@ TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384
 MAX_NUM_DOCS  = _env_int("MAX_NUM_DOCS", 64)
 COMPILE_TRAIN = _env_flag("COMPILE_TRAIN", 1)
 # Engine knobs
-KV_POOL_GB   = _env_float("KV_POOL_GB", 24)
+KV_POOL_GB   = _env_float("KV_POOL_GB", 28)  # sized to the measured round peak; stays mapped
 MAX_SEQS     = _env_int("MAX_SEQS", 256)
 MACRO_N      = _env_int("MACRO_N", 8)
 _BK_ENV = os.environ.get("BUCKETS")
 BUCKETS      = tuple(int(x) for x in _BK_ENV.split(",")) if _BK_ENV else None
-PREFILL_T    = _env_int("PREFILL_T", 2048)
+PREFILL_T    = _env_int("PREFILL_T", 0)           # 0/unset -> auto-size (see §1)
 PREFILL_SEQS = _env_int("PREFILL_SEQS", 12)
-PANTRY_BLOCKS = _env_int("PANTRY_BLOCKS", 96)
-STARVE_JOBS  = _env_int("STARVE_JOBS", 12)
 COMPILE      = _env_flag("COMPILE", 1)
 PREFILL_COMPILE = _env_flag("PREFILL_COMPILE", 1)
 PREFILL_FULLGRAPH = _env_flag("PREFILL_FULLGRAPH", 1)
@@ -145,11 +155,10 @@ MODEL_REPO    = os.environ.get("MODEL_REPO", "ChrisMcCormick/nanochat-varlen-d24
 
 # PrefillAllEngine is train-only: an eval round (EVAL_EXAMPLES x EVAL_K against the
 # full test split) is far more concurrent rows than the pool can admit in one wave.
-# Run eval offline (eval_trajectory.py) or via scripts.chat_rl_pantry.
 assert EVAL_EVERY == 0, (
-    "chat_rl_fast uses the static PrefillAllEngine (train-only) — its single-wave "
-    "round can't admit an eval round; set EVAL_EVERY=0 (use scripts.chat_rl_pantry "
-    "for eval-bearing runs)")
+    "chat_rl_fast is train-only — its single-wave round can't admit an eval "
+    "round. Set EVAL_EVERY=0 and score checkpoints offline with agent-ops "
+    "eval_trajectory.py.")
 
 HERE = Path.cwd()
 
@@ -183,30 +192,42 @@ max_prompt = max(max(len(p) for p in train_prompts),
                  max((len(p) for p in val_prompts), default=0))
 assert max_prompt + 1 + max(MAX_TOKENS, EVAL_MAX_TOKENS) <= SEQ_CAP, \
     "prompt+budget exceeds model context"
-assert max_prompt <= PREFILL_T, f"longest prompt {max_prompt} > PREFILL_T={PREFILL_T}"
-if PASS1:
-    assert max_prompt + PASS1 <= PREFILL_T, "prompt+PASS1 exceeds PREFILL_T"
-
 pool = POOL_PROBLEMS if POOL_PROBLEMS is not None else list(range(len(train_task)))
 shard = pool[rank::world_size]
 if FIXED_PROBLEMS is not None:
     round_schedule = None                         # same fixed problems every round
     num_rounds = (len(pool) // PPR) * EPOCHS
+    round_max = sum(len(train_prompts[i]) - 1 for i in FIXED_PROBLEMS)
 else:
     # Balanced round assembly (dataloader): each round's contexts must fit ONE
     # static-prefill replay (Sigma context <= PREFILL_T). Stratified partition
-    # keeps per-round context sums near the mean so a modest, EXPLICIT PREFILL_T
-    # suffices — the engine never auto-sizes. Report the spread + assert the fit.
+    # keeps per-round context sums near the mean, so the longest round is only
+    # marginally above the mean and the prefill pack can be sized right to it.
     round_schedule, _sched = assemble_balanced_rounds(
         [(i, len(train_prompts[i]) - 1) for i in shard], ppr_rank, epochs=EPOCHS)
     num_rounds = len(round_schedule)
+    round_max = _sched["max"]
     print0(f"[{TAG}] balanced rounds: per-round context tokens "
-           f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']} "
-           f"| PREFILL_T={PREFILL_T} ({100 * _sched['max'] / PREFILL_T:.0f}% packed at the "
-           f"max round)", flush=True)
-    assert _sched["max"] <= PREFILL_T, (
-        f"balanced round max context {_sched['max']} tok > PREFILL_T={PREFILL_T} — "
-        f"raise PREFILL_T explicitly (the engine does not auto-size)")
+           f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']}", flush=True)
+
+# Prefill pack length. Every round is pre-designed above, so the longest prefill
+# batch of the whole epoch is known here — size the static graph to it (rounded up
+# to a multiple of 64) rather than over-provisioning: the graph pushes PREFILL_T
+# positions through the dense layers every replay whether or not they hold real
+# tokens, and pads the tail into one attended segment. Setting PREFILL_T in the env
+# pins it instead (to reproduce an earlier run's shape).
+prefill_need = max(round_max, max_prompt)
+if PREFILL_T:
+    assert PREFILL_T >= prefill_need, (
+        f"PREFILL_T={PREFILL_T} < {prefill_need} tok needed (longest prefill batch "
+        f"{round_max}, longest prompt {max_prompt})")
+    _how = f"pinned by PREFILL_T={PREFILL_T}"
+else:
+    PREFILL_T = -(-prefill_need // 64) * 64
+    _how = f"auto-sized to %64: {PREFILL_T:,}"
+print0(f"[{TAG}] Longest prefill batch: {round_max:,} tokens, prefill pack is {_how} "
+       f"tokens ({100 * round_max / PREFILL_T:.0f}% packed at the longest round)",
+       flush=True)
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
@@ -240,7 +261,7 @@ engine = PrefillAllEngine(
     model, tokenizer,
     kv_pool_gb=KV_POOL_GB, max_seqs=MAX_SEQS, max_tokens=max(MAX_TOKENS, EVAL_MAX_TOKENS),
     max_prompt_len=max_prompt, macro_n=MACRO_N, buckets=BUCKETS,
-    prefill_t=PREFILL_T, prefill_seqs=PREFILL_SEQS, pass1=PASS1,
+    prefill_t=PREFILL_T, prefill_seqs=PREFILL_SEQS,
     temperature=TEMPERATURE, top_p=TOP_P, top_k=TOP_K,
     stop_detect=STOP_DETECT, stop_strings=tuple(STOP),
     compile_decode=COMPILE, compile_prefill=PREFILL_COMPILE,
@@ -255,11 +276,11 @@ print0(f"  build {build_s:.0f}s | pool {engine.pool.num_blocks} blocks "
 t = time.perf_counter()
 engine.capture(warm_context=train_prompts[shard[0]][:-1])
 
-# Lend the pool's physical back BEFORE the train warmup — full-size pool and
-# full-size train buckets never need to coexist.
-_lent_gb = (engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30
-print0(f"  [vmm] pool physical lent back ({_lent_gb:.1f} GB, {engine.pool.lend():.2f}s) "
-       f"for train warmup", flush=True)
+# The pool coexists with the train peak by construction, so warmup doubles as
+# the capacity gate (an OOM here = pool too big for this card, shrink KV_POOL_GB).
+_pool_gb = (engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30
+print0(f"  [vmm] pool permanent ({_pool_gb:.1f} GB mapped through warmup + rounds)",
+       flush=True)
 
 # -----------------------------------------------------------------------------
 # §3. Trainer — group advantage + branch-masked REINFORCE over compiled
@@ -474,7 +495,7 @@ def run_eval(rnd: int) -> dict:
 # -----------------------------------------------------------------------------
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
-               "peak_blocks", "train_s", "vmm_s", "n_ext", "n_groups_used", "n_docs", "n_loss_tokens",
+               "peak_blocks", "train_s", "n_groups_used", "n_docs", "n_loss_tokens",
                "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
                "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
@@ -510,7 +531,6 @@ def save_ckpt(step: int) -> None:
 try:
     for rnd in range(num_rounds):
         r_t0 = time.perf_counter()
-        vmm_map_s = engine.pool.reclaim()
 
         if EVAL_EVERY and rnd % EVAL_EVERY == 0:
             ev = run_eval(rnd)
@@ -527,7 +547,6 @@ try:
         idxs = FIXED_PROBLEMS if FIXED_PROBLEMS is not None else round_schedule[rnd]
         specs = [(i, train_prompts[i], K_DRAWS, MAX_TOKENS) for i in idxs]
         rows, gstats = engine.run_round(engine.make_nodes(specs), rnd)
-        vmm_unmap_s = engine.pool.lend()
 
         # -- grade -----------------------------------------------------------
         rewards = grade_rows(rows)
@@ -567,8 +586,7 @@ try:
             gen_tok_per_s=round(gstats["gen_tok"] / gstats["gen_s"], 1),
             rolls_per_min=round(len(rows) / gstats["gen_s"] * 60, 1),
             peak_blocks=gstats.get("peak_blocks", 0),
-            train_s=round(train_s, 1), vmm_s=round(vmm_map_s + vmm_unmap_s, 2),
-            n_ext=gstats["n_extended"],
+            train_s=round(train_s, 1),
             n_groups_used=tstats["n_groups_used"], n_docs=tstats["n_docs"],
             n_loss_tokens=tstats["n_loss_tokens"], n_comp_tok=tstats["n_comp_tokens"],
             train_tok_per_s=round(tstats["n_comp_tokens"] / train_s, 1) if train_s else 0.0,
@@ -603,7 +621,6 @@ try:
                f"{tstats['n_loss_tokens']:,} br-tok | "
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
                f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
-               f"vmm {vmm_map_s + vmm_unmap_s:.1f}s | "
                f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
@@ -636,8 +653,7 @@ finally:
         "fullparam_inplace_no_recapture": True,
         "same_process_gen_train": True,
         "bf16_params_fp32_opt_state": True,
-        "kv_vmm_lend_back_gb": round((engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30, 1),
-        "two_pass_pass1": PASS1,
+        "kv_pool_permanent_gb": round((engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30, 1),
         "tool_use": False,
     }
     result = dict(
