@@ -244,6 +244,9 @@ else:
 print0(f"[{TAG}] Longest prefill batch: {round_max:,} tokens, prefill pack is {_how} "
        f"tokens ({100 * round_max / PREFILL_T:.0f}% packed at the longest round)",
        flush=True)
+# Both schedule modes lay rounds out epoch-by-epoch (a full pass over the pool
+# each), so this division is exact and epoch boundaries are real pass boundaries.
+rounds_per_epoch = max(1, num_rounds // EPOCHS)
 if ROUNDS_CAP:
     num_rounds = min(num_rounds, ROUNDS_CAP)
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
@@ -714,6 +717,20 @@ try:
                f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
                f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
+
+        # per-epoch rollup: solve over the whole pass + avg round wall. Fires at
+        # each pass boundary and, if ROUNDS_CAP cut the run mid-pass, at the end
+        # (the partial pass is labeled by its round count).
+        if (rnd + 1) % rounds_per_epoch == 0 or rnd + 1 == num_rounds:
+            ep = curve[-((rnd % rounds_per_epoch) + 1):]
+            ep_cor = sum(c["n_correct"] for c in ep)
+            ep_roll = sum(c["n_rollouts"] for c in ep)
+            print0(f"  == epoch {rnd // rounds_per_epoch + 1:2d}/{EPOCHS} | "
+                   f"solve {ep_cor:,}/{ep_roll:,} ({100 * ep_cor / ep_roll:5.2f}%) | "
+                   f"avg round {sum(c['round_s'] for c in ep) / len(ep):.1f}s "
+                   f"(gen {sum(c['gen_s'] for c in ep) / len(ep):.1f} + "
+                   f"train {sum(c['train_s'] for c in ep) / len(ep):.1f}) | "
+                   f"{len(ep)} rounds ==", flush=True)
 
         if SAVE_EVERY and rnd > 0 and rnd % SAVE_EVERY == 0:
             save_ckpt(rnd)
