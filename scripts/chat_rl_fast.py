@@ -65,7 +65,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_s
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
-from tasks.gsm8k import GSM8K, extract_answer
+from tasks.gsm8k import GSM8K, extract_answer, GSM_RE
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -104,6 +104,15 @@ ADV_STD      = _env_flag("ADV_STD", 1)            # 0 -> stock (r - mean)
 # failing problems, training the terminal actively suppresses termination and
 # produces a truncation/rambling spiral (observed in run ep1).
 TRAIN_TERMINAL = _env_flag("TRAIN_TERMINAL", 1)
+# CLIP_ANSWER=1: answer-then-ramble guard. A CORRECT completion that keeps
+# generating past its `#### <answer>` is cut right after the answer and
+# terminated with <|assistant_end|> BEFORE becoming a training doc, so positive
+# advantage reinforces answer->stop rather than the ramble. Without it the loop
+# amplifies: truncated-correct rollouts train the ramble at positive advantage
+# (only truncated-INCORRECT are excluded), and their tails eventually burst the
+# KV pool — how pool30_lr05 died at r109. 0 = pre-2026-07-26 behavior
+# (div4/div5/pool30/pool30_lr05). Incorrect rollouts are never clipped.
+CLIP_ANSWER    = _env_flag("CLIP_ANSWER", 1)
 TRAIN_BRANCH_TEMP  = _env_float("TRAIN_BRANCH_TEMP", 1.0)
 TRAIN_BRANCH_TOP_P = _env_float("TRAIN_BRANCH_TOP_P", 0.95)
 GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped under DDP
@@ -445,6 +454,27 @@ def grade_rows(rows) -> list[float]:
     return [train_task.reward(train_convs[r["meta"]], r["completion_text"]) for r in rows]
 
 
+def clip_post_answer(comp_ids: list[int], text: str) -> list[int]:
+    """The CLIP_ANSWER surgery for one correct completion: token-granular cut at
+    the first token whose decode covers the `#### <answer>` regex match end,
+    plus <|assistant_end|>. `text` is the row's completion_text (trailing
+    terminal token already excluded by the engine, so a clean answer-then-stop
+    has nothing after the match). Returns comp_ids ITSELF when already clean —
+    callers identity-check to see whether surgery happened. Token boundaries
+    don't split, so the cut token may carry a merged trailing char."""
+    m = GSM_RE.search(text)
+    if m is None or not text[m.end():].strip():
+        return comp_ids
+    lo, hi = 1, len(comp_ids)      # smallest prefix whose decode covers the answer
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(tokenizer.decode(comp_ids[:mid])) >= m.end():
+            hi = mid
+        else:
+            lo = mid + 1
+    return comp_ids[:lo] + [ASSISTANT_END]
+
+
 def train_step(groups: list[dict]) -> dict:
     """One branch-masked REINFORCE optimizer step over the round's problem
     groups. Same advantages/exclusions/DAPO token-mean as the speedrun; no
@@ -668,14 +698,26 @@ try:
         # -- grade -----------------------------------------------------------
         with record_function("round/grade+group"):
             rewards = grade_rows(rows)
+            n_clipped = 0
+            comps, truncs = [], []
+            for r, rw in zip(rows, rewards):
+                comp = r["completion_token_ids"]
+                trunc = r["terminal"] == "truncated"
+                if CLIP_ANSWER and rw == 1.0:
+                    clipped = clip_post_answer(comp, r["completion_text"])
+                    if clipped is not comp:      # surgery happened: now ends in EOS
+                        comp, trunc = clipped, False
+                        n_clipped += 1
+                comps.append(comp)
+                truncs.append(trunc)
             by_pid: dict[int, list[int]] = {}
             for i, r in enumerate(rows):
                 by_pid.setdefault(r["meta"], []).append(i)
             groups = [dict(
                 prompt_ids=train_prompts[pid],
-                completions=[rows[i]["completion_token_ids"] for i in idl],
+                completions=[comps[i] for i in idl],
                 rewards=[rewards[i] for i in idl],
-                truncated=[rows[i]["terminal"] == "truncated" for i in idl],
+                truncated=[truncs[i] for i in idl],
             ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
@@ -699,6 +741,7 @@ try:
             round=rnd, n_rollouts=int(agg[1]), n_correct=int(agg[0]),
             solve_rate=round(solve_rate, 4),
             n_truncated=sum(r["terminal"] == "truncated" for r in rows),
+            n_clipped=n_clipped,
             n_stop=gstats["stop_fires"],
             n_eos=sum(r["terminal"] == "emitted_eos" for r in rows),
             gen_s=round(gstats["gen_s"], 1), gen_tok=gstats["gen_tok"],
@@ -735,7 +778,8 @@ try:
                   if tstats.get("pstats") else 0.0)
         print0(f"  [round {rnd:3d}] gen   {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s) | "
                f"solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
-               f"eos {row['n_eos']:3d} stop {gstats['stop_fires']:2d} trunc {row['n_truncated']:2d} | "
+               f"eos {row['n_eos']:3d} stop {gstats['stop_fires']:2d} trunc {row['n_truncated']:2d} "
+               f"clip {n_clipped:2d} | "
                f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% | "
                f"kv peak {gstats.get('peak_blocks', 0)}/{engine.pool.num_blocks}", flush=True)
         print0(f"              train {train_s:5.1f}s ({row['train_tok_per_s']:>7,.0f} tok/s) | "
