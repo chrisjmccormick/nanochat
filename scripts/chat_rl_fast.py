@@ -365,10 +365,15 @@ def train_step(groups: list[dict]) -> dict:
     _t0 = time.perf_counter()
     docs = []
     n_groups_used = n_excluded = 0
+    n_sat = n_dead = 0
     for g in groups:
         adv = group_advantages(np.asarray(g["rewards"], dtype=np.float64), use_std=ADV_STD)
-        if adv is None:
-            continue                                  # zero-signal group
+        if adv is None:                               # zero-signal group: no gradient
+            if np.mean(g["rewards"]) >= 1.0:
+                n_sat += 1                            # every rollout correct
+            elif np.mean(g["rewards"]) <= 0.0:
+                n_dead += 1                           # every rollout wrong
+            continue
         n_groups_used += 1
         for k, comp in enumerate(g["completions"]):
             # truncated-incorrect stays in the baseline but is excluded from loss
@@ -440,6 +445,7 @@ def train_step(groups: list[dict]) -> dict:
     _t_opt = time.perf_counter() - _t0 - _t_build - _t_fwd
     return dict(t_build=_t_build, t_fwd=_t_fwd, t_opt=_t_opt,
                 n_groups_used=n_groups_used, n_groups_total=len(groups),
+                n_groups_sat=n_sat, n_groups_dead=n_dead,
                 n_docs=len(docs), n_excluded=n_excluded, n_packs=n_packs,
                 pstats=pstats,
                 n_loss_tokens=total_tokens, n_comp_tokens=total_comp,
@@ -495,7 +501,8 @@ def run_eval(rnd: int) -> dict:
 # -----------------------------------------------------------------------------
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
-               "peak_blocks", "train_s", "n_groups_used", "n_docs", "n_loss_tokens",
+               "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
+               "n_groups_dead", "n_docs", "n_loss_tokens",
                "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
                "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
@@ -587,7 +594,9 @@ try:
             rolls_per_min=round(len(rows) / gstats["gen_s"] * 60, 1),
             peak_blocks=gstats.get("peak_blocks", 0),
             train_s=round(train_s, 1),
-            n_groups_used=tstats["n_groups_used"], n_docs=tstats["n_docs"],
+            n_groups_used=tstats["n_groups_used"],
+            n_groups_sat=tstats["n_groups_sat"], n_groups_dead=tstats["n_groups_dead"],
+            n_docs=tstats["n_docs"],
             n_loss_tokens=tstats["n_loss_tokens"], n_comp_tok=tstats["n_comp_tokens"],
             train_tok_per_s=round(tstats["n_comp_tokens"] / train_s, 1) if train_s else 0.0,
             branch_frac=round(tstats["branch_frac"], 4),
@@ -620,6 +629,8 @@ try:
         print0(f"              train {train_s:5.1f}s ({row['train_tok_per_s']:>7,.0f} tok/s) | "
                f"{tstats['n_loss_tokens']:,} br-tok | "
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
+               f"grp {tstats['n_groups_used']}/{tstats['n_groups_total']} "
+               f"(sat {tstats['n_groups_sat']} dead {tstats['n_groups_dead']}) | "
                f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
                f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
