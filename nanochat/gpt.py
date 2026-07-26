@@ -529,7 +529,7 @@ class GPT(nn.Module):
 # Helpers for the fp32 master + bf16 live variant of the optimizers
 # -----------------------------------------------------------------------------
 
-from nanochat.optim import Fp32DistMuonAdamW, Fp32MuonAdamW
+from nanochat.optim import Fp32DistMuonAdamW, Fp32MuonAdamW, HybridFp32MuonAdamW
 
 def cast_model_bf16(model) -> None:
     """Cast all parameters to bf16 in place (Parameter objects keep identity, so
@@ -538,11 +538,21 @@ def cast_model_bf16(model) -> None:
     assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     model.to(torch.bfloat16)
 
+def cast_matrices_bf16(model) -> None:
+    """Cast only the natively-fp32 matrix-like params (transformer blocks +
+    lm_head) to bf16 in place. Embeddings are already bf16; scalars stay fp32."""
+    assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    model.transformer.h.to(torch.bfloat16)
+    model.lm_head.to(torch.bfloat16)
+
 def setup_fp32_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                         weight_decay=0.0, scalar_lr=0.5):
+                         weight_decay=0.0, scalar_lr=0.5, scope="all"):
     """nanochat GPT.setup_optimizer's exact param-group split, but constructing
     the fp32-master variant. Call while the model still holds fp32 weights;
-    cast to bf16 afterwards."""
+    cast to bf16 afterwards (cast_model_bf16 for scope='all', cast_matrices_bf16
+    for scope='matrices'). scope='matrices' shadows only the natively-fp32
+    matrix-like groups (Muon matrices + lm_head) and keeps stock MuonAdamW
+    behavior for the embeddings (natively bf16) and scalars (stay fp32)."""
     model_dim = model.config.n_embd
     ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -573,8 +583,17 @@ def setup_fp32_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_l
             kind='muon', params=group_params, lr=matrix_lr,
             momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
         ))
-    Factory = Fp32DistMuonAdamW if ddp else Fp32MuonAdamW
-    optimizer = Factory(param_groups)
+    assert scope in ("all", "matrices"), f"bad scope {scope!r}"
+    if scope == "matrices":
+        assert not ddp, "scope='matrices' not implemented for DDP yet"
+        param_groups[0]["fp32_master"] = True  # lm_head (first group by construction)
+        for g in param_groups:
+            if g["kind"] == "muon":
+                g["fp32_master"] = True
+        optimizer = HybridFp32MuonAdamW(param_groups)
+    else:
+        Factory = Fp32DistMuonAdamW if ddp else Fp32MuonAdamW
+        optimizer = Factory(param_groups)
     for group in optimizer.param_groups:
         group["initial_lr"] = group["lr"]
     return optimizer
