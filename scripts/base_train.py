@@ -104,9 +104,9 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 from nanochat.flash_attention import USE_FA
 if USE_FA:
     if FA_VERSION == 'fa3':
-        print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+        print0("✓ Using Flash Attention 3, efficient, new and awesome.")
     else:
-        print0(f"✓ Using Flash Attention 2 (Ampere/Ada GPU detected).")
+        print0(f"✓ Using Flash Attention 2 (FA3 unavailable for this GPU).")
 else:
     print0("!" * 80)
     if HAS_FA and COMPUTE_DTYPE != torch.bfloat16:

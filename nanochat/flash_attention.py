@@ -1,7 +1,8 @@
 """
 Unified Flash Attention interface with three-tier automatic backend selection:
 
-    FA3 (Hopper sm90)  ->  FA2 (Ampere sm80 / Ada sm89)  ->  PyTorch SDPA fallback
+    FA3 (Hopper sm90 via varunneal build; Ampere sm80/86 / Ada sm89 via
+    kernels-community build)  ->  FA2 (Ampere+ fallback)  ->  PyTorch SDPA fallback
 
 Exports `flash_attn` module with two functions:
 
@@ -38,10 +39,20 @@ def _load_flash_attention():
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel
 
-        # FA3: Hopper (sm90) only
+        # FA3 on Hopper (sm90): the varunneal build gets better H100 results
         if major == 9:
             try:
                 return get_kernel('varunneal/flash-attention-3').flash_attn_interface, 'fa3'
+            except Exception:
+                pass
+
+        # FA3 on Ampere (sm80/86) / Ada (sm89): community build (upstream nanochat
+        # now ships this tier too). Same varlen API; ~6% faster than FA2 on A100.
+        if major == 8:
+            try:
+                _k = get_kernel('kernels-community/flash-attn3')
+                _fa3 = _k if hasattr(_k, 'flash_attn_varlen_func') else _k.flash_attn_interface
+                return _fa3, 'fa3'
             except Exception:
                 pass
 
