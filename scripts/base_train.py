@@ -44,8 +44,6 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--cudagraphs", action="store_true", help="compile with mode='reduce-overhead' (CUDA graph capture of fwd/bwd)")
-parser.add_argument("--bf16-weights", action="store_true", help="bf16 live weights + fp32 masters in the optimizer (RL-style shadow copy); removes the per-forward fp32->bf16 weight cast")
-parser.add_argument("--bf16-matrices", action="store_true", help="shadow-copy only the natively-fp32 matrix-like params (Muon matrices + lm_head); embeddings and scalars keep exact stock handling")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -309,7 +307,7 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer_kwargs = dict(
+optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
@@ -318,30 +316,6 @@ optimizer_kwargs = dict(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
-if args.bf16_weights or args.bf16_matrices:
-    assert not (args.bf16_weights and args.bf16_matrices), "pick one of --bf16-weights / --bf16-matrices"
-    assert not args.fp8, "--bf16-weights/--bf16-matrices is incompatible with --fp8"
-    assert device_type == "cuda", "--bf16-weights/--bf16-matrices requires CUDA"
-    # Same param groups/hyperparameters/fused kernels as setup_optimizer, but the
-    # optimizer snapshots fp32 masters now and the live weights are then cast to
-    # bf16 in place (Parameter identity preserved; compile hasn't traced yet).
-    # Forward numerics are unchanged — stock already computes with
-    # round_bf16(w_fp32) via the per-forward cast in Linear; here the live weight
-    # IS that rounding, and updates apply to the fp32 masters. Gradients of the
-    # shadowed params become bf16 (accumulation across micro-steps and DDP
-    # reduction happen in bf16 — the one numeric delta).
-    # --bf16-weights shadows everything (RL parity, embeddings get fp32 state);
-    # --bf16-matrices shadows only the natively-fp32 matrix-like groups (Muon
-    # matrices + lm_head) and keeps embeddings/scalars exactly stock.
-    from nanochat.gpt import setup_fp32_optimizer, cast_model_bf16, cast_matrices_bf16
-    if args.bf16_weights:
-        optimizer = setup_fp32_optimizer(orig_model, scope="all", **optimizer_kwargs)
-        cast_model_bf16(orig_model)
-    else:
-        optimizer = setup_fp32_optimizer(orig_model, scope="matrices", **optimizer_kwargs)
-        cast_matrices_bf16(orig_model)
-else:
-    optimizer = model.setup_optimizer(**optimizer_kwargs)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)

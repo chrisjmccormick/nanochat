@@ -599,27 +599,24 @@ class Fp32MuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
 
     def _snapshot_masters(self):
         for group in self.param_groups:
-            self._snapshot_group_masters(group)
-
-    def _snapshot_group_masters(self, group):
-        if group["kind"] == "adamw":
-            for p in group["params"]:
+            if group["kind"] == "adamw":
+                for p in group["params"]:
+                    st = self.state[p]
+                    st["step"] = 0
+                    st["master"] = p.detach().float().clone()
+                    st["exp_avg"] = torch.zeros_like(st["master"])
+                    st["exp_avg_sq"] = torch.zeros_like(st["master"])
+            elif group["kind"] == "muon":
+                params = group["params"]
+                p = params[0]
                 st = self.state[p]
-                st["step"] = 0
-                st["master"] = p.detach().float().clone()
-                st["exp_avg"] = torch.zeros_like(st["master"])
-                st["exp_avg_sq"] = torch.zeros_like(st["master"])
-        elif group["kind"] == "muon":
-            params = group["params"]
-            p = params[0]
-            st = self.state[p]
-            shape = p.shape
-            st["master_stack"] = torch.stack([q.detach().float() for q in params])
-            st["momentum_buffer"] = torch.zeros_like(st["master_stack"])
-            state_shape = ((len(params), shape[-2], 1) if shape[-2] >= shape[-1]
-                           else (len(params), 1, shape[-1]))
-            st["second_momentum_buffer"] = torch.zeros(
-                state_shape, dtype=torch.float32, device=p.device)
+                shape = p.shape
+                st["master_stack"] = torch.stack([q.detach().float() for q in params])
+                st["momentum_buffer"] = torch.zeros_like(st["master_stack"])
+                state_shape = ((len(params), shape[-2], 1) if shape[-2] >= shape[-1]
+                               else (len(params), 1, shape[-1]))
+                st["second_momentum_buffer"] = torch.zeros(
+                    state_shape, dtype=torch.float32, device=p.device)
 
     def _step_adamw(self, group: dict) -> None:
         for p in group["params"]:
@@ -670,29 +667,6 @@ class Fp32MuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
                 self._step_muon(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
-
-
-class HybridFp32MuonAdamW(_Fp32StateMixin, MuonAdamW):
-    """MuonAdamW with fp32 masters on ONLY the groups flagged fp32_master=True
-    (intended: the natively-fp32 matrix-like params — Muon matrices + lm_head —
-    which the caller casts to bf16 in place AFTER construction). Unflagged
-    groups (natively-bf16 embeddings, fp32 scalars) keep exact stock MuonAdamW
-    behavior, so the only numeric delta vs stock is bf16 gradients on the
-    flagged groups. Single-GPU version."""
-
-    def __init__(self, param_groups: list[dict]):
-        super().__init__(param_groups)
-        for group in self.param_groups:
-            if group.get("fp32_master"):
-                Fp32MuonAdamW._snapshot_group_masters(self, group)
-
-    def _step_adamw(self, group: dict) -> None:
-        step = Fp32MuonAdamW._step_adamw if group.get("fp32_master") else MuonAdamW._step_adamw
-        step(self, group)
-
-    def _step_muon(self, group: dict) -> None:
-        step = Fp32MuonAdamW._step_muon if group.get("fp32_master") else MuonAdamW._step_muon
-        step(self, group)
 
 
 class Fp32DistMuonAdamW(_Fp32StateMixin, torch.optim.Optimizer):
