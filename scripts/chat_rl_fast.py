@@ -351,6 +351,10 @@ _eff = {(_GROUP_NAMES[i] if i < 6 else "muon"): g["lr"]
         for i, g in enumerate(optimizer.param_groups)}
 print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, {LR_SCHEDULE}): "
        + " | ".join(f"{k} {v:.3g}" for k, v in _eff.items()))
+# Pre-compute the LR schedule as a device table indexed by the optimizer's step
+# counter — one step per round (a zero-doc round doesn't advance it)
+optimizer.set_schedules(lr_mult=[1.0 if LR_SCHEDULE == "flat" else 1.0 - r / num_rounds
+                                 for r in range(num_rounds)])
 
 cast_model_bf16(model)
 model.eval()
@@ -747,10 +751,8 @@ try:
                 truncated=[truncs[i] for i in idl],
             ) for pid, idl in by_pid.items()]
 
-        # -- train -----------------------------------------------------------
-        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
+        # -- train (lr comes from the optimizer's pre-computed device table) --
+        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds  # telemetry mirror
         _t = time.perf_counter()
         with record_function("round/train"):
             tstats = train_step(groups)

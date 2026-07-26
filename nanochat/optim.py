@@ -17,37 +17,29 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-def _sched_val(tab: Tensor, sched_t: Tensor) -> Tensor:
-    """tab[sched_t] as a 0-D device tensor, clamped to the last row (steps past
-    the schedule horizon hold the final value). index_select keeps this a pure
-    tensor op — plain tab[0-D index] would .item() the index and break
-    fullgraph tracing."""
-    return tab.index_select(0, sched_t.reshape(1).clamp(max=tab.numel() - 1)).squeeze(0)
-
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
     exp_avg: Tensor,        # (32768, 768) - first moment, same shape as p
     exp_avg_sq: Tensor,     # (32768, 768) - second moment, same shape as p
-    sched_t: Tensor,        # () - 0-D int64 DEVICE tensor, schedule index (0-based)
-    nstep_t: Tensor,        # () - 0-D int64 DEVICE tensor, updates taken BEFORE this one
+    sched_t: Tensor,        # (1,) - int64 DEVICE tensor, schedule index (0-based)
+    nstep_t: Tensor,        # (1,) - int64 DEVICE tensor, updates taken BEFORE this one
     lr_tab: Tensor,         # (S,) - fp32 DEVICE table, per-step learning rate
     beta1_t: Tensor,        # () - 0-D fp32 DEVICE constant, beta1
     beta2_t: Tensor,        # () - 0-D fp32 DEVICE constant, beta2
     eps_t: Tensor,          # () - 0-D fp32 DEVICE constant, epsilon
-    wd_tab: Tensor,         # (S',) - fp32 DEVICE table, per-step weight decay
+    wd_t: Tensor,           # () - 0-D fp32 DEVICE constant, weight decay
 ) -> None:
     """
     Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
     All in one compiled graph to eliminate Python overhead between ops.
-    Hyperparameters live on device: schedules are pre-computed tables indexed by
-    the schedule counter (clamped, so steps past the horizon hold the last value)
-    and constants are 0-D device tensors — one compiled kernel serves every group
-    and every step, and the whole update is CUDA-graph capturable.
+    Hyperparameters live on device: the lr schedule is a pre-computed table
+    indexed by the (1,)-shaped step counter, constants are 0-D tensors — one
+    compiled kernel serves every group and every step, and the whole update is
+    CUDA-graph capturable.
     """
-    lr_t = _sched_val(lr_tab, sched_t)
-    wd_t = _sched_val(wd_tab, sched_t)
+    lr_t = lr_tab[sched_t]                        # (1,), broadcasts below
     steps_done = (nstep_t + 1).to(torch.float32)  # 1-based count for bias correction
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
@@ -60,7 +52,7 @@ def adamw_step_fused(
     # Compute update and apply
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    p.sub_(step_size * (exp_avg / denom))
 
 # -----------------------------------------------------------------------------
 """
@@ -107,10 +99,10 @@ def muon_step_fused(
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
     momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
     second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
-    sched_t: Tensor,                # () - 0-D int64 DEVICE tensor, schedule index (0-based)
+    sched_t: Tensor,                # (1,) - int64 DEVICE tensor, schedule index (0-based)
     momentum_tab: Tensor,           # (S,) - fp32 DEVICE table, per-step momentum coefficient
-    lr_tab: Tensor,                 # (S',) - fp32 DEVICE table, per-step lr (aspect scale pre-folded)
-    wd_tab: Tensor,                 # (S'',) - fp32 DEVICE table, per-step weight decay
+    lr_tab: Tensor,                 # (S,) - fp32 DEVICE table, per-step lr (aspect scale pre-folded)
+    wd_tab: Tensor,                 # (S,) - fp32 DEVICE table, per-step weight decay
     beta2_t: Tensor,                # () - 0-D fp32 DEVICE constant, beta2 for second moment
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
@@ -118,12 +110,12 @@ def muon_step_fused(
     """
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
-    Hyperparameters live on device: schedules are pre-computed tables indexed by
-    the schedule counter (clamped, so steps past the horizon hold the last value).
+    Hyperparameters live on device: pre-computed tables indexed by the
+    (1,)-shaped step counter; the (1,) values broadcast through the update.
     """
-    momentum_t = _sched_val(momentum_tab, sched_t)
-    lr_t = _sched_val(lr_tab, sched_t)
-    wd_t = _sched_val(wd_tab, sched_t)
+    momentum_t = momentum_tab[sched_t]
+    lr_t = lr_tab[sched_t]
+    wd_t = wd_tab[sched_t]
 
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
@@ -171,57 +163,45 @@ def muon_step_fused(
 class _SchedMixin:
     """Device-resident, pre-computed hyperparameter schedules.
 
-    The fused kernels read lr / momentum / weight decay from per-group DEVICE
-    tables indexed by a 0-D device schedule counter, so an optimizer step does
-    no host schedule math and no H2D scalar copies, and the whole step is
-    CUDA-graph capturable. Scripts pre-compute the full run's schedule arrays
-    from the run definition and install them once with set_schedules(); without
-    that call, every group gets length-1 constant tables frozen from its group
-    dict at the first step(). Either way, the tables are the only source of
-    truth once built — mutating group['lr'] etc. after that has NO effect.
-    Table indexing clamps to the last row, so any steps past the planned
-    horizon hold the final scheduled values.
+    The run definition includes its schedule: scripts pre-compute the full run's
+    per-step arrays and install them once with set_schedules(), which builds
+    per-group fp32 DEVICE tables. The fused kernels index the tables with a
+    (1,)-shaped int64 device step counter, so an optimizer step does no host
+    schedule math and no H2D scalar copies, and the whole step is CUDA-graph
+    capturable. The tables are the only source of truth — mutating group['lr']
+    etc. after set_schedules() has no effect. Tables must cover every step the
+    run takes (indexing past the end is a device-side error).
 
-    Two 0-D int64 device counters, advanced together at the end of step():
+    Two (1,) int64 device counters, advanced together at the end of step():
     - sched: schedule index. Starts at 0 each run; set_sched_step() repositions
       it (mid-run resume). Saved to checkpoints as "sched_step".
     - nstep: total updates taken, for AdamW bias correction. Saved as
       "num_steps"; survives warm-starts where the schedule restarts at 0
       (e.g. SFT reusing pretrain momentum: debiasing must keep counting).
-      Loading a legacy checkpoint recovers it from the per-param 'step' ints.
 
-    Note: if a step is skipped (fp16 GradScaler inf/nan), neither counter
-    advances — the schedule stalls with the update count. (The retired
-    host-driven schedule kept following the loop step instead; bf16/fp32
-    training never skips, so this only shifts forced-fp16 runs.)
+    Note: if a step is skipped (fp16 GradScaler inf/nan, an RL round with zero
+    docs), neither counter advances — the schedule stalls with the update count.
     """
 
     def _init_sched(self):
-        self._sched = {}        # group idx -> dict of device tensors for the fused kernels
-        self._tables = None     # (lr_mult, muon_momentum, muon_wd) float64 host arrays
-        self._sched_t = None    # () int64 device, schedule index
-        self._nstep_t = None    # () int64 device, updates taken
-
-    def _ensure_counters(self):
-        if self._sched_t is None:
-            device = self.param_groups[0]["params"][0].device
-            self._sched_t = torch.zeros((), dtype=torch.int64, device=device)
-            self._nstep_t = torch.zeros((), dtype=torch.int64, device=device)
+        device = self.param_groups[0]["params"][0].device
+        self._sched = None  # per-group kernel tensors, built by set_schedules()
+        self._sched_t = torch.zeros(1, dtype=torch.int64, device=device)  # schedule index
+        self._nstep_t = torch.zeros(1, dtype=torch.int64, device=device)  # updates taken
 
     @property
     def sched_step(self) -> int:
         """Current schedule index (host sync)."""
-        return 0 if self._sched_t is None else int(self._sched_t.item())
+        return int(self._sched_t.item())
 
     @property
     def num_steps(self) -> int:
         """Total optimizer updates taken (host sync)."""
-        return 0 if self._nstep_t is None else int(self._nstep_t.item())
+        return int(self._nstep_t.item())
 
     def set_sched_step(self, n: int) -> None:
         """Reposition the schedule index (checkpoint resume: pass the resume step;
         warm-start into a NEW schedule: pass 0). Does not touch the update count."""
-        self._ensure_counters()
         self._sched_t.fill_(n)
 
     def set_schedules(self, lr_mult, muon_momentum=None, muon_weight_decay=None) -> None:
@@ -232,46 +212,35 @@ class _SchedMixin:
         muon_momentum: per-step absolute momentum for Muon groups (None = constant)
         muon_weight_decay: per-step absolute weight decay for Muon groups (None = constant)
         """
-        as64 = lambda a: None if a is None else torch.as_tensor(a, dtype=torch.float64).reshape(-1)
-        self._tables = (as64(lr_mult), as64(muon_momentum), as64(muon_weight_decay))
-        self._sched = {}  # invalidate any previously built group tables
-
-    def _group_sched(self, gi: int, group: dict) -> dict:
-        """Device tables + constants for one group, built on first use."""
-        sched = self._sched.get(gi)
-        if sched is None:
-            self._ensure_counters()
-            lr_mult, mom, wd = self._tables if self._tables is not None else (None, None, None)
-            if lr_mult is None:
-                lr_mult = torch.ones(1, dtype=torch.float64)
+        # float64 host math throughout, rounded to fp32 once at the end — ordered
+        # to match the retired per-step host computation bit-for-bit
+        lr_mult = torch.as_tensor(lr_mult, dtype=torch.float64).reshape(-1)
+        as_tab = lambda a, const: (torch.as_tensor(a, dtype=torch.float64).reshape(-1) if a is not None
+                                   else torch.full((lr_mult.numel(),), const, dtype=torch.float64))
+        self._sched = []
+        for group in self.param_groups:
             device = group["params"][0].device
             f32 = lambda v: torch.tensor(v, dtype=torch.float32, device=device)
-            # float64 products ordered to match the retired host math bit-for-bit:
-            # (initial_lr * mult) [* aspect_scale], rounded to fp32 once at the end
             lr64 = lr_mult * group.get("initial_lr", group["lr"])
             if group["kind"] == "adamw":
-                sched = dict(
+                self._sched.append(dict(
                     lr_tab=lr64.float().to(device),
                     beta1_t=f32(group["betas"][0]),
                     beta2_t=f32(group["betas"][1]),
                     eps_t=f32(group["eps"]),
-                    wd_tab=f32([group["weight_decay"]]),
-                )
+                    wd_t=f32(group["weight_decay"]),
+                ))
             elif group["kind"] == "muon":
                 shape = group["params"][0].shape
                 aspect = max(1.0, shape[-2] / shape[-1]) ** 0.5
-                mom64 = mom if mom is not None else torch.tensor([group["momentum"]], dtype=torch.float64)
-                wd64 = wd if wd is not None else torch.tensor([group["weight_decay"]], dtype=torch.float64)
-                sched = dict(
+                self._sched.append(dict(
                     lr_tab=(lr64 * aspect).float().to(device),
-                    momentum_tab=mom64.float().to(device),
-                    wd_tab=wd64.float().to(device),
-                    beta2_t=f32(group["beta2"] if group["beta2"] is not None else 0.0),
-                )
+                    momentum_tab=as_tab(muon_momentum, group["momentum"]).float().to(device),
+                    wd_tab=as_tab(muon_weight_decay, group["weight_decay"]).float().to(device),
+                    beta2_t=f32(group["beta2"]),
+                ))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
-            self._sched[gi] = sched
-        return sched
 
     def _advance_counters(self) -> None:
         """End of step(): advance both counters on device — no host sync."""
@@ -288,16 +257,9 @@ class _SchedMixin:
 
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)  # shallow copy, don't mutate the caller's
-        ss = state_dict.pop("sched_step", None)
-        ns = state_dict.pop("num_steps", None)
+        ss = state_dict.pop("sched_step", 0)
+        ns = state_dict.pop("num_steps", 0)
         super().load_state_dict(state_dict)
-        if ns is None:
-            # Legacy checkpoint: recover the update count from per-param AdamW 'step' ints
-            ns = max((st["step"] for st in self.state.values()
-                      if isinstance(st, dict) and isinstance(st.get("step"), int)), default=0)
-        if ss is None:
-            ss = ns  # legacy mid-run resume: schedule position == update count
-        self._ensure_counters()
         self._sched_t.fill_(ss)
         self._nstep_t.fill_(ns)
 
@@ -341,7 +303,7 @@ class MuonAdamW(_SchedMixin, torch.optim.Optimizer):
         AdamW update for each param in the group individually.
         Lazy init the state, call the fused kernel with the group's device schedule.
         """
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         for p in group['params']:
             if p.grad is None:
                 continue
@@ -357,7 +319,7 @@ class MuonAdamW(_SchedMixin, torch.optim.Optimizer):
             adamw_step_fused(
                 p, grad, state['exp_avg'], state['exp_avg_sq'],
                 self._sched_t, self._nstep_t, sched['lr_tab'], sched['beta1_t'],
-                sched['beta2_t'], sched['eps_t'], sched['wd_tab'],
+                sched['beta2_t'], sched['eps_t'], sched['wd_t'],
             )
 
     def _step_muon(self, gi: int, group: dict) -> None:
@@ -392,7 +354,7 @@ class MuonAdamW(_SchedMixin, torch.optim.Optimizer):
         stacked_params = torch.stack(params)
 
         # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         muon_step_fused(
             stacked_grads,
             stacked_params,
@@ -412,6 +374,7 @@ class MuonAdamW(_SchedMixin, torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        assert self._sched is not None, "no schedules installed — call set_schedules() before training"
         for gi, group in enumerate(self.param_groups):
             if group['kind'] == 'adamw':
                 self._step_adamw(gi, group)
@@ -528,7 +491,7 @@ class DistMuonAdamW(_SchedMixin, torch.optim.Optimizer):
 
     def _compute_adamw(self, gi: int, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         param_infos = info['param_infos']
         for p in group['params']:
             pinfo = param_infos[p]
@@ -551,7 +514,7 @@ class DistMuonAdamW(_SchedMixin, torch.optim.Optimizer):
             adamw_step_fused(
                 p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
                 self._sched_t, self._nstep_t, sched['lr_tab'], sched['beta1_t'],
-                sched['beta2_t'], sched['eps_t'], sched['wd_tab'],
+                sched['beta2_t'], sched['eps_t'], sched['wd_t'],
             )
 
             # Large params need all_gather
@@ -588,7 +551,7 @@ class DistMuonAdamW(_SchedMixin, torch.optim.Optimizer):
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
 
-            sched = self._group_sched(gi, group)
+            sched = self._sched[gi]
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
@@ -615,6 +578,7 @@ class DistMuonAdamW(_SchedMixin, torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        assert self._sched is not None, "no schedules installed — call set_schedules() before training"
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
@@ -719,7 +683,7 @@ class Fp32MuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
                     state_shape, dtype=torch.float32, device=p.device)
 
     def _step_adamw(self, gi: int, group: dict) -> None:
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         for p in group["params"]:
             if p.grad is None:
                 continue
@@ -727,7 +691,7 @@ class Fp32MuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
             adamw_step_fused(
                 state["master"], p.grad.float(), state["exp_avg"], state["exp_avg_sq"],
                 self._sched_t, self._nstep_t, sched['lr_tab'], sched['beta1_t'],
-                sched['beta2_t'], sched['eps_t'], sched['wd_tab'],
+                sched['beta2_t'], sched['eps_t'], sched['wd_t'],
             )
             p.copy_(state["master"])   # bf16 writeback, same storage
 
@@ -739,7 +703,7 @@ class Fp32MuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
         shape = params[0].shape
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params]).float()
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         muon_step_fused(
             stacked_grads, state["master_stack"],
             state["momentum_buffer"], state["second_momentum_buffer"],
@@ -751,6 +715,7 @@ class Fp32MuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        assert self._sched is not None, "no schedules installed — call set_schedules() before training"
         for gi, group in enumerate(self.param_groups):
             if group["kind"] == "adamw":
                 self._step_adamw(gi, group)
@@ -842,7 +807,7 @@ class Fp32DistMuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
 
     def _compute_adamw(self, gi, group, info, gather_list, rank, world_size):
         dist = self._dist
-        sched = self._group_sched(gi, group)
+        sched = self._sched[gi]
         for p in group["params"]:
             pinfo = info["param_infos"][p]
             pinfo["future"].wait()
@@ -856,7 +821,7 @@ class Fp32DistMuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
                 state["master"], pinfo["grad_slice"].float(),
                 state["exp_avg"], state["exp_avg_sq"],
                 self._sched_t, self._nstep_t, sched['lr_tab'], sched['beta1_t'],
-                sched['beta2_t'], sched['eps_t'], sched['wd_tab'],
+                sched['beta2_t'], sched['eps_t'], sched['wd_t'],
             )
             p_slice.copy_(state["master"])
             if not pinfo["is_small"]:
@@ -876,7 +841,7 @@ class Fp32DistMuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
         red_dim = -1 if shape[-2] >= shape[-1] else -2
         updated = torch.empty(chunk_size, *shape, dtype=p.dtype, device=device)
         if num_owned > 0:
-            sched = self._group_sched(gi, group)
+            sched = self._sched[gi]
             muon_step_fused(
                 info["grad_chunk"][:num_owned].float(), state["master_stack"],
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
@@ -899,6 +864,7 @@ class Fp32DistMuonAdamW(_SchedMixin, _Fp32StateMixin, torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        assert self._sched is not None, "no schedules installed — call set_schedules() before training"
         dist = self._dist
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
