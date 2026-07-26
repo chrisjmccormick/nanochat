@@ -56,8 +56,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile as torch_profile, record_function
 
-from nanochat.fast_engine import install_dao_flash_attention
-install_dao_flash_attention()  # before anything touches nanochat.flash_attention
+from nanochat.flash_attention import USE_FA
+# Packed RL training REQUIRES real FA varlen kernels: the shim's SDPA fallback
+# has no per-document isolation and would silently train on wrong attention.
+assert USE_FA, "flash_attention resolved to the SDPA fallback — unsupported for packed RL"
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
 from nanochat.dataloader import build_reinforce_packs, assemble_balanced_rounds

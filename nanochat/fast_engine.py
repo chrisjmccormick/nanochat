@@ -20,14 +20,12 @@ Decode carries two pieces of cross-step state per row: the paged KV cache and
 seeds the latter from each context's last position; sibling rows inherit the
 node's seed.
 
-TODO - This comment says too much. We're using kernels-community/flash-attn2, period.
-Uses FA2 (on A100) for the paged decode + varlen prefill — sourced from the Dao
-flash-attn pip package if installed, else from the community `kernels` hub
-(kernels-community/flash-attn2), so nanochat's uv env works without a wheel build.
-`install_dao_flash_attention()` also routes nanochat's `flash_attention` shim to
-the same kernels so the reference Engine / training forward run FA2 instead of the
-SDPA fallback (the SDPA varlen fallback has no document isolation and would be
-WRONG for packed RL training).
+Uses FA2 (on A100) for the paged decode + varlen prefill, sourced from the
+community `kernels` hub (kernels-community/flash-attn2) — no wheel build needed.
+nanochat's `flash_attention` shim loads the same kernels independently for the
+training forward / reference Engine; chat_rl_fast asserts USE_FA so packed RL
+training can never silently hit the SDPA varlen fallback (which has no
+per-document isolation and would be WRONG for heterogeneous RL packs).
 """
 
 import math
@@ -35,64 +33,25 @@ import time
 from collections import deque
 
 import numpy as np
-import numpy as np
 import torch
 import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
-# FA2 primitives (varlen + paged kvcache with block_table). Prefer the Dao pip
-# package if installed (keeps existing envs byte-for-byte unchanged); otherwise
-# pull the SAME FA2 kernels from the community `kernels` hub — no wheel build, so
-# nanochat's own uv env (which ships `kernels`, not flash-attn) works as-is.
-try:
-    from flash_attn import flash_attn_varlen_func
-    from flash_attn.flash_attn_interface import flash_attn_with_kvcache as _fa_kvcache_raw
-    _FA2_SOURCE = "flash_attn (dao pip wheel)"
-except Exception:
-    from kernels import get_kernel
-    _fa2 = get_kernel("kernels-community/flash-attn2")
-    # Kernel revisions differ: newer builds expose the fns at the module top level,
-    # older ones nested them under `.flash_attn_interface`. Prefer top-level (which
-    # the current kernels-community/flash-attn2 provides) and fall back to the
-    # submodule so both layouts work.
-    _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_interface
-    flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
-    _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
-    _FA2_SOURCE = "kernels-community/flash-attn2"
+# FA2 primitives (varlen + paged kvcache with block_table) from the community
+# `kernels` hub — nanochat's uv env ships `kernels`, not the flash-attn wheel.
+from kernels import get_kernel
+_fa2 = get_kernel("kernels-community/flash-attn2")
+# Kernel revisions differ: newer builds expose the fns at the module top level,
+# older ones nested them under `.flash_attn_interface`. Prefer top-level (which
+# the current kernels-community/flash-attn2 provides) and fall back to the
+# submodule so both layouts work.
+_fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_interface
+flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
+_fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
 
 from nanochat.gpt import norm, apply_rotary_emb
 
 PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
-
-
-# -----------------------------------------------------------------------------
-# §0. Route nanochat's flash_attention shim to the Dao FA2 kernels
-# -----------------------------------------------------------------------------
-def install_dao_flash_attention():
-    """Point nanochat.flash_attention.flash_attn at the installed Dao flash-attn.
-
-    Required for training: the shim's SDPA varlen fallback reshapes the pack to
-    (B, T_seq) with NO per-document isolation — wrong for heterogeneous RL packs.
-    Also makes the reference Engine numerically consistent with the fast engine.
-    """
-    from nanochat import flash_attention as _nfa
-
-    def _varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                causal=False, window_size=(-1, -1)):
-        return flash_attn_varlen_func(
-            q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-            causal=causal, window_size=window_size)
-
-    def _kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
-                 causal=False, window_size=(-1, -1)):
-        return _fa_kvcache_raw(q, k_cache, v_cache, k=k, v=v,
-                               cache_seqlens=cache_seqlens,
-                               causal=causal, window_size=window_size)
-
-    _nfa.flash_attn.flash_attn_varlen_func = _varlen
-    _nfa.flash_attn.flash_attn_with_kvcache = _kvcache
-    print(f"  fast_engine FA2 source: {_FA2_SOURCE}", flush=True)
 
 
 # -----------------------------------------------------------------------------

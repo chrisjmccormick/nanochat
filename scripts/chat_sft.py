@@ -34,15 +34,6 @@ from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
-# fast-rl branch: route the flash_attention shim to the Dao FA2 kernels when
-# available (proper varlen doc isolation on Ampere; stock falls back to SDPA
-# which has none). No-op if flash-attn / cuda bindings are absent.
-try:
-    from nanochat.fast_engine import install_dao_flash_attention
-    install_dao_flash_attention()
-except Exception:
-    pass
-
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
