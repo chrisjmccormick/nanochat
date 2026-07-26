@@ -44,6 +44,8 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--cudagraphs", action="store_true", help="compile with mode='reduce-overhead' (CUDA graph capture of fwd/bwd)")
+parser.add_argument("--graph-step", action="store_true", help="manually CUDA-graph the whole train step (fwd+bwd+optimizer); single GPU, bf16/fp32 only")
+parser.add_argument("--fake-data", action="store_true", help="synthetic random batches instead of the dataset (kernel benchmarking / testing)")
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+/sm89 GPU; tensorwise scaling)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
@@ -265,7 +267,9 @@ if resuming:
 # AccumulateGrad adopts that doomed pool storage as .grad and the next micro-step's
 # backward reads garbage (hard error). Materialize grads once and keep them
 # (zero_grad(set_to_none=False) below) so accumulation targets stable buffers.
-if args.cudagraphs:
+# --graph-step needs the same: backward inside the captured graph must accumulate
+# into stable buffers that the captured optimizer graph then reads and re-zeros.
+if args.cudagraphs or args.graph_step:
     for p in orig_model.parameters():
         if p.requires_grad:
             p.grad = torch.zeros_like(p)
@@ -277,13 +281,61 @@ if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
 # -----------------------------------------------------------------------------
+# Validate --graph-step (whole-train-step CUDA graph capture; graphs themselves
+# are captured lazily in the training loop after a few real warmup steps)
+if args.graph_step:
+    assert not args.cudagraphs, "--graph-step captures manually; incompatible with --cudagraphs (reduce-overhead)"
+    assert device_type == "cuda", "--graph-step requires CUDA"
+    assert scaler is None, "--graph-step requires bf16/fp32 (GradScaler's found_inf host logic is not capturable)"
+    if ddp:
+        print0("Warning: --graph-step is single-GPU only (the Dist optimizer waits on comm futures host-side), disabling")
+        args.graph_step = False
+if args.graph_step:
+    # Run everything on a dedicated (non-default) stream. backward() under
+    # manual capture is illegal from the legacy default stream: the autograd
+    # engine issues cross-stream event waits against cached node stream
+    # metadata (AccumulateGrad nodes remember the stream the warmup steps ran
+    # on), and making the legacy stream wait on a capturing stream kills the
+    # capture (cudaErrorStreamCaptureImplicit). On a normal stream the same
+    # event waits just make it join the capture — the canonical whole-network
+    # capture pattern.
+    torch.cuda.set_stream(torch.cuda.Stream())
+
+# -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 # max_num_docs: see dataloader.py for explanation
 avg_num_docs = args.device_batch_size * args.max_seq_len // 400
 max_num_docs = math.ceil(avg_num_docs / 16) * 16
+
+def fake_data_loader_varlen(B, T, max_num_docs, device, seed=1234):
+    """--fake-data: random tokens in fixed T-length documents, deterministic per
+    batch index. Mimics the real loader's buffer-reuse contract exactly — the
+    SAME device tensors are refilled in place and re-yielded every batch (that
+    contract is what lets --graph-step bake the buffer pointers into the
+    captured graph)."""
+    total_tokens = B * T
+    inputs = torch.empty(total_tokens, dtype=torch.long, device=device)
+    targets = torch.empty(total_tokens, dtype=torch.long, device=device)
+    # B docs of exactly T tokens; pad to max_num_docs with ghost segments (same as the real loader)
+    cu_seqlens = (torch.arange(max_num_docs, dtype=torch.long, device=device) * T).clamp(max=total_tokens).to(torch.int32)
+    g = torch.Generator(device=device)
+    batch_idx = 0
+    while True:
+        g.manual_seed(seed * 1_000_003 + batch_idx)
+        inputs.copy_(torch.randint(0, vocab_size, (total_tokens,), generator=g, device=device))
+        targets[:-1].copy_(inputs[1:])
+        targets[-1] = 0
+        yield inputs, targets, cu_seqlens, {"pq_idx": 0, "rg_idx": 0, "epoch": 1}
+        batch_idx += 1
+
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="train", max_num_docs=max_num_docs, device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="val", max_num_docs=max_num_docs, device=device)
+if args.fake_data:
+    print0("Using FAKE DATA (--fake-data): synthetic random batches, results are not a real training run")
+    train_loader = fake_data_loader_varlen(args.device_batch_size, args.max_seq_len, max_num_docs, device)
+    build_val_loader = lambda: fake_data_loader_varlen(args.device_batch_size, args.max_seq_len, max_num_docs, device, seed=5678)
+else:
+    train_loader = tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="train", max_num_docs=max_num_docs, device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="val", max_num_docs=max_num_docs, device=device)
 x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -349,6 +401,53 @@ optimizer.set_schedules(
 )
 if resuming:
     optimizer.set_sched_step(args.resume_from_step)
+
+# -----------------------------------------------------------------------------
+# --graph-step: capture the whole train step into two CUDA graphs sharing one
+# memory pool. Graph 1 (fwd+bwd) reads the dataloader's static device buffers —
+# the loader refills the SAME tensors in place each batch (stream-ordered), so a
+# replay consumes whatever was loaded last, with zero staging copies. It is
+# replayed once per micro-batch, accumulating into the pre-materialized .grad
+# buffers. Graph 2 (optimizer step + grad re-zero) is replayed once per step;
+# the schedule refactor made this capturable — lr/momentum/wd advance on device.
+# Capture happens after GRAPH_WARMUP_STEPS real steps (compile variants, cublas
+# workspaces, lazy optimizer state all warmed); capture records without
+# executing, so those steps and the pending batch are unaffected.
+GRAPH_WARMUP_STEPS = 3
+steps_run = 0       # steps taken by THIS process (independent of --resume-from-step)
+fwdbwd_graph = None
+opt_graph = None
+graph_loss = None   # () fp32, written inside graph 1 (last micro-batch's unnormalized loss)
+graph_ptrs = None   # loader buffer pointers baked into the capture, asserted each replay
+
+def capture_step_graphs(x, y, cu_seqlens):
+    global fwdbwd_graph, opt_graph, graph_loss, graph_ptrs
+    t0 = time.time()
+    # Anything freed on the legacy stream mid-capture invalidates the capture
+    # (cudaErrorStreamCaptureImplicit), so flush pending garbage now and freeze
+    # GC while capturing; thread_local keeps other threads' benign CUDA calls
+    # (allocator bookkeeping) from tripping capture, same as inductor's
+    # cudagraph trees.
+    gc.collect()
+    torch.cuda.synchronize()
+    gc.freeze()
+    gc.disable()
+    try:
+        graph_loss = torch.zeros((), dtype=torch.float32, device=device)
+        graph_ptrs = (x.data_ptr(), y.data_ptr(), cu_seqlens.data_ptr())
+        fwdbwd_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(fwdbwd_graph, capture_error_mode="thread_local"):
+            loss = model(x, y, cu_seqlens=cu_seqlens)
+            graph_loss.copy_(loss.detach())
+            (loss / grad_accum_steps).backward()
+        opt_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(opt_graph, pool=fwdbwd_graph.pool(), capture_error_mode="thread_local"):
+            optimizer.step()
+            model.zero_grad(set_to_none=False)
+    finally:
+        gc.enable()
+        gc.unfreeze()
+    print0(f"Captured train-step CUDA graphs (fwd+bwd, optimizer) in {time.time() - t0:.1f}s")
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -472,18 +571,28 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    if args.graph_step and fwdbwd_graph is None and steps_run == GRAPH_WARMUP_STEPS:
+        capture_step_graphs(x, y, cu_seqlens)
+    use_graphs = fwdbwd_graph is not None
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, cu_seqlens=cu_seqlens)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
+        if use_graphs:
+            assert (x.data_ptr(), y.data_ptr(), cu_seqlens.data_ptr()) == graph_ptrs, "dataloader buffers moved; captured graphs are stale"
+            fwdbwd_graph.replay()
         else:
-            loss.backward()
+            loss = model(x, y, cu_seqlens=cu_seqlens)
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
         x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer (lr/momentum/wd come from its pre-computed device tables)
     lrm = get_lr_multiplier(step) # host mirror, for logging only
-    if scaler is not None:
+    if use_graphs:
+        opt_graph.replay() # optimizer step + grad re-zero, all on device
+        train_loss = graph_loss # written by the last fwd+bwd replay
+    elif scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
@@ -495,7 +604,9 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=not args.cudagraphs)
+    if not use_graphs:
+        model.zero_grad(set_to_none=not (args.cudagraphs or args.graph_step))
+    steps_run += 1
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
