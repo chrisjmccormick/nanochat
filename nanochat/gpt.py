@@ -1,5 +1,5 @@
 """
-GPT model (rewrite, a lot simpler)
+GPT model (flattened rewrite for nano-math)
 Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
@@ -10,9 +10,17 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
+
+Structure: there are no Block/Attention/MLP submodules. Every parameter belongs
+directly to the GPT module (per-layer weights live in ParameterLists/Dicts), all
+initialization is consolidated in init_weights(), and the transformer math is
+written out inline in two deliberately duplicated forward paths:
+  - forward():           packed-varlen training/scoring (cu_seqlens required)
+  - forward_inference(): batched KV-cache prefill/decode for generation
+The paged fast_engine defines its own two bodies (decode_body/prefill_body) over
+these same parameters; the four functions must implement identical math.
 """
 
-from functools import partial
 from dataclasses import dataclass
 
 import torch
@@ -42,13 +50,12 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
-class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
-    Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
-    def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
-
+def linear(x, w):
+    """F.linear with the weight cast to the input dtype (replaces the old Linear
+    module): master weights stay fp32 for optimizer precision, but matmuls run in
+    the activation dtype (typically bf16 from embeddings). No-op cast when the
+    model has been cast to bf16 (RL fast path)."""
+    return F.linear(x, w.to(dtype=x.dtype))
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -62,100 +69,6 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seq_len=None):
-        B, T, C = x.size()
-
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
-            v = v + gate.unsqueeze(-1) * ve
-
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
-
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is not None:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
-        else:
-            # Varlen: packed 1D sequence with per-document attention isolation
-            assert cu_seqlens is not None
-            y = flash_attn.flash_attn_varlen_func(
-                q[0], k[0], v[0],
-                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seq_len, max_seqlen_k=max_seq_len,
-                causal=True, window_size=window_size)
-            y = y.unsqueeze(0)
-
-        # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seq_len=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens, max_seq_len)
-        x = x + self.mlp(norm(x))
-        return x
-
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -166,6 +79,12 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        n_layer, n_embd = config.n_layer, config.n_embd
+        self.head_dim = n_embd // config.n_head
+        assert n_embd % config.n_head == 0
+        assert config.n_kv_head <= config.n_head and config.n_head % config.n_kv_head == 0
+        q_dim = config.n_head * self.head_dim
+        kv_dim = config.n_kv_head * self.head_dim
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -174,34 +93,43 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
-        })
-        self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        self.padded_vocab_size = padded_vocab_size
+
+        # --- All parameters, owned directly by this module (no submodules) ---
+        # Token embedding and unembedding (used via F.embedding / linear())
+        self.wte = nn.Parameter(torch.empty(padded_vocab_size, n_embd))
+        self.lm_head = nn.Parameter(torch.empty(padded_vocab_size, n_embd))
+        # Per-layer attention and MLP weights, F.linear convention: (out_features, in_features)
+        self.c_q = nn.ParameterList(nn.Parameter(torch.empty(q_dim, n_embd)) for _ in range(n_layer))
+        self.c_k = nn.ParameterList(nn.Parameter(torch.empty(kv_dim, n_embd)) for _ in range(n_layer))
+        self.c_v = nn.ParameterList(nn.Parameter(torch.empty(kv_dim, n_embd)) for _ in range(n_layer))
+        self.attn_proj = nn.ParameterList(nn.Parameter(torch.empty(n_embd, q_dim)) for _ in range(n_layer))
+        self.mlp_fc = nn.ParameterList(nn.Parameter(torch.empty(4 * n_embd, n_embd)) for _ in range(n_layer))
+        self.mlp_proj = nn.ParameterList(nn.Parameter(torch.empty(n_embd, 4 * n_embd)) for _ in range(n_layer))
+        # Value embeddings (ResFormer-style) + their input-dependent gates: alternating layers, last always included
+        self.ve_gate_channels = 12
+        ve_layers = [i for i in range(n_layer) if has_ve(i, n_layer)]
+        self.value_embeds = nn.ParameterDict({str(i): nn.Parameter(torch.empty(padded_vocab_size, kv_dim)) for i in ve_layers})
+        self.ve_gate = nn.ParameterDict({str(i): nn.Parameter(torch.empty(config.n_kv_head, self.ve_gate_channels)) for i in ve_layers})
         # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
-        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+        # resid_lambdas: scales the residual stream at each layer
+        # x0_lambdas: blends initial embedding back in at each layer
         # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        self.resid_lambdas = nn.Parameter(torch.empty(n_layer))
+        self.x0_lambdas = nn.Parameter(torch.empty(n_layer))
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
-        self.smear_gate = Linear(24, 1, bias=False)
-        self.smear_lambda = nn.Parameter(torch.zeros(1))
+        self.smear_gate = nn.Parameter(torch.empty(1, 24))
+        self.smear_lambda = nn.Parameter(torch.empty(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-        # Value embeddings (ResFormer-style): alternating layers, last layer always included
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.backout_lambda = nn.Parameter(torch.empty(1))
+
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # Rotary embeddings are small in memory, so we over-compute generously. With varlen
         # training the full micro-batch is one sequence (T = batch_size * seq_len), so we need
         # enough headroom for that. 64X covers batch sizes up to 64, and the assert in forward
         # will catch if we ever exceed.
         self.rotary_seq_len = config.sequence_len * 64
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -210,68 +138,76 @@ class GPT(nn.Module):
         """
         Initialize the full model in this one function for maximum clarity.
 
-        wte (embedding):     normal, std=1.0
+        wte (embedding):     normal, std=0.8
         lm_head:             normal, std=0.001
-        for each block:
-            attn.c_q:        uniform, std=1/sqrt(n_embd)
-            attn.c_k:        uniform, std=1/sqrt(n_embd)
-            attn.c_v:        uniform, std=1/sqrt(n_embd)
-            attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
+        for each layer:
+            c_q:             uniform, std=1/sqrt(n_embd)
+            c_k:             uniform, std=1/sqrt(n_embd)
+            c_v:             uniform, std=1/sqrt(n_embd)
+            attn_proj:       zeros
+            mlp_fc:          uniform, std=0.4/sqrt(n_embd)
+            mlp_proj:        zeros
+        value_embeds:        uniform, std=1/sqrt(n_embd)
+        ve_gate:             uniform in [0, 0.02] (slightly above neutral)
+        resid_lambdas:       1.15 -> 1.05 linear decay over depth
+        x0_lambdas:          0.20 -> 0.05 linear decay over depth
+        smear_gate:          uniform, nn.Linear default bound 1/sqrt(24)
+        smear_lambda:        zeros (smear disabled at init)
+        backout_lambda:      0.2
         """
+        n_layer, n_embd = self.config.n_layer, self.config.n_embd
 
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.wte, mean=0.0, std=0.8)
+        torch.nn.init.normal_(self.lm_head, mean=0.0, std=0.001)
 
-        # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
-        n_embd = self.config.n_embd
+        # Per-layer matrices: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        for i in range(n_layer):
+            torch.nn.init.uniform_(self.c_q[i], -s, s) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(self.c_k[i], -s, s)
+            torch.nn.init.uniform_(self.c_v[i], -s, s)
+            torch.nn.init.zeros_(self.attn_proj[i]) # projections are zero
+            torch.nn.init.uniform_(self.mlp_fc[i], -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+            torch.nn.init.zeros_(self.mlp_proj[i])
+
+        # Value embeddings (init like c_v: uniform with same std) and their gates
+        for ve in self.value_embeds.values():
+            torch.nn.init.uniform_(ve, -s, s)
+        for g in self.ve_gate.values():
+            torch.nn.init.uniform_(g, 0.0, 0.02) # small positive so gates start slightly above neutral
 
         # Per-layer scalars
-        # Per-layer resid init: stronger residual at early layers, weaker at deep layers
-        n_layer = self.config.n_layer
         for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        # Decaying x0 init: earlier layers get more input embedding blending
-        for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+            # stronger residual at early layers, weaker at deep layers
+            self.resid_lambdas[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+            # earlier layers get more input embedding blending
+            self.x0_lambdas[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-
-        # Gate weights init with small positive values so gates start slightly above neutral
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+        # Smear/backout scalars. (Previously these were only set in __init__, which runs
+        # under meta device in the standard build path, leaving them uninitialized
+        # after to_empty(); now they are properly initialized here with the rest.)
+        torch.nn.init.uniform_(self.smear_gate, -24**-0.5, 24**-0.5) # nn.Linear default bound
+        torch.nn.init.zeros_(self.smear_lambda)
+        self.backout_lambda.fill_(0.2)
 
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
-            self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+            self.wte.data = self.wte.data.to(COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
+                ve.data = ve.data.to(COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
-            device = self.transformer.wte.weight.device
+            device = self.wte.device
         # stride the channels
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
@@ -314,7 +250,21 @@ class GPT(nn.Module):
         return window_sizes
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        return self.wte.device
+
+    def matrix_parameters(self):
+        """All per-layer matmul weights, in the same layer-major order the old
+        Block modules registered them (c_q, c_k, c_v, attn_proj, [ve_gate],
+        mlp_fc, mlp_proj per layer) so optimizer param-group contents and order
+        match pre-flattening checkpoints."""
+        params = []
+        for i in range(self.config.n_layer):
+            params += [self.c_q[i], self.c_k[i], self.c_v[i], self.attn_proj[i]]
+            si = str(i)
+            if si in self.ve_gate:
+                params.append(self.ve_gate[si])
+            params += [self.mlp_fc[i], self.mlp_proj[i]]
+        return params
 
     def estimate_flops(self):
         """
@@ -330,10 +280,10 @@ class GPT(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        value_embeds_numel = sum(p.numel() for p in self.value_embeds.values())
+        nparams_exclude = (self.wte.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          self.smear_gate.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -357,11 +307,11 @@ class GPT(nn.Module):
         can experiment with which combination gives the cleanest scaling laws.
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        wte = self.wte.numel()
+        value_embeds = sum(p.numel() for p in self.value_embeds.values())
+        lm_head = self.lm_head.numel()
+        transformer_matrices = sum(p.numel() for p in self.matrix_parameters())
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -378,13 +328,13 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        matrix_params = self.matrix_parameters()
+        value_embeds_params = list(self.value_embeds.values())
+        embedding_params = [self.wte]
+        lm_head_params = [self.lm_head]
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        smear_params = [self.smear_gate, self.smear_lambda, self.backout_lambda]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
@@ -415,71 +365,81 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, cu_seqlens=None, kv_cache=None, loss_reduction='mean'):
-        if cu_seqlens is not None:
-            assert idx.ndim == 1
-            idx = idx.unsqueeze(0)
-            if targets is not None:
-                targets = targets.unsqueeze(0)
-            max_seq_len = self.config.sequence_len
-        elif kv_cache is not None:
-            max_seq_len = None
-        else:
-            raise ValueError("GPT.forward requires either cu_seqlens or kv_cache")
-
+    def forward(self, idx, targets=None, cu_seqlens=None, loss_reduction='mean'):
+        """Training / scoring forward: one packed 1D sequence of documents with
+        per-document attention isolation via varlen flash attention. Returns the
+        loss if targets are given, else the (softcapped, fp32) logits."""
+        assert cu_seqlens is not None, "GPT.forward is the packed-varlen path; use forward_inference for KV-cache generation"
+        assert idx.ndim == 1
+        idx = idx.unsqueeze(0)
+        if targets is not None:
+            targets = targets.unsqueeze(0)
+        max_seq_len = self.config.sequence_len
         B, T = idx.size()
+        nl = self.config.n_layer
+        nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos, sin = self.cos[:, :T], self.sin[:, :T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        x = F.embedding(idx, self.wte)
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
-        if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        else:
-            # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+        # Smear: mix previous token's embedding into current position (cheap bigram info).
+        # Positions attending across document boundaries are handled by position 0 being excluded.
+        assert T > 1, "Training forward pass should have T > 1"
+        gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, 1:, :24], self.smear_gate))
+        x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = nl // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
+        for i in range(nl):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens, max_seq_len)
+            # --- attention ---
+            xn = norm(x)
+            # Project the input to get queries, keys, and values
+            # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+            q = linear(xn, self.c_q[i]).view(B, T, nh, hd)
+            k = linear(xn, self.c_k[i]).view(B, T, nkv, hd)
+            v = linear(xn, self.c_v[i]).view(B, T, nkv, hd)
+            # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+            si = str(i)
+            if si in self.value_embeds:
+                ve = F.embedding(idx, self.value_embeds[si]).view(B, T, nkv, hd).to(x.dtype)
+                g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))  # (B, T, n_kv_head), range (0, 3)
+                v = v + g.unsqueeze(-1) * ve
+            # Rotary embeddings (relative positional encoding), then QK norm
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)
+            q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
+            k = k * 1.2
+            # Varlen flash attention: packed 1D sequence with per-document attention isolation
+            y = flash_attn.flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seq_len, max_seqlen_k=max_seq_len,
+                causal=True, window_size=self.window_sizes[i])
+            y = y.unsqueeze(0)
+            # Re-assemble the heads and project back to residual stream
+            x = x + linear(y.contiguous().view(B, T, -1), self.attn_proj[i])
+            # --- MLP (relu^2) ---
+            x = x + linear(F.relu(linear(norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = linear(x, self.lm_head) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
@@ -493,37 +453,87 @@ class GPT(nn.Module):
             # inference: just return the logits directly
             return logits
 
-    @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        """
-        Naive autoregressive streaming inference.
-        To make it super simple, let's assume:
-        - batch size is 1
-        - ids and the yielded tokens are simple Python lists and ints
-        """
-        assert isinstance(tokens, list)
-        device = self.get_device()
-        rng = None
-        if temperature > 0:
-            rng = torch.Generator(device=device)
-            rng.manual_seed(seed)
-        ids = torch.tensor(tokens, dtype=torch.long, device=device)  # 1D, no batch dim
-        for _ in range(max_tokens):
-            cu_seqlens = torch.tensor([0, ids.size(0)], dtype=torch.int32, device=device)
-            logits = self.forward(ids, cu_seqlens=cu_seqlens)  # (1, T, vocab_size)
-            logits = logits[:, -1, :]  # (1, vocab_size)
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            if temperature > 0:
-                logits = logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
-            else:
-                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids.squeeze(0)))  # stay 1D
-            token = next_ids.item()
-            yield token
+    def forward_inference(self, idx, kv_cache):
+        """Inference forward: batched (B, T) prefill or (B, 1) decode over a
+        KVCache (see nanochat.engine). Deliberately duplicates forward()'s math
+        with the generation-specific state handling written out: rotary offset by
+        cache position, smear across decode steps via kv_cache.prev_embedding,
+        and flash_attn_with_kvcache in place of the varlen kernel. Returns the
+        (softcapped, fp32) logits."""
+        B, T = idx.size()
+        nl = self.config.n_layer
+        nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
+
+        # Rotary embeddings, offset to the current position in the cache
+        T0 = kv_cache.get_pos()
+        assert T0 + T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T0 + T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+        cos, sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        # Embed the tokens
+        x = F.embedding(idx, self.wte)
+        x = x.to(COMPUTE_DTYPE)
+        x = norm(x)
+
+        # Smear: read prev embedding from cache, store current for next step
+        x_pre_smear = kv_cache.prev_embedding
+        kv_cache.prev_embedding = x[:, -1:, :]
+        if T > 1:
+            # Prefill: apply smear to positions 1+, same as training
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, 1:, :24], self.smear_gate))
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        elif x_pre_smear is not None:
+            # Decode: single token, use cached prev embedding
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, :, :24], self.smear_gate))
+            x = x + gate * x_pre_smear
+
+        # Forward the trunk of the Transformer
+        x0 = x
+        backout_layer = nl // 2
+        x_backout = None
+        for i in range(nl):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            # --- attention ---
+            xn = norm(x)
+            q = linear(xn, self.c_q[i]).view(B, T, nh, hd)
+            k = linear(xn, self.c_k[i]).view(B, T, nkv, hd)
+            v = linear(xn, self.c_v[i]).view(B, T, nkv, hd)
+            si = str(i)
+            if si in self.value_embeds:
+                ve = F.embedding(idx, self.value_embeds[si]).view(B, T, nkv, hd).to(x.dtype)
+                g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))
+                v = v + g.unsqueeze(-1) * ve
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)
+            q = q * 1.2
+            k = k * 1.2
+            # flash_attn_with_kvcache appends k/v to the cache and attends over it
+            k_cache, v_cache = kv_cache.get_layer_cache(i)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=self.window_sizes[i],
+            )
+            x = x + linear(y.contiguous().view(B, T, -1), self.attn_proj[i])
+            # --- MLP (relu^2) ---
+            x = x + linear(F.relu(linear(norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
+            if i == backout_layer:
+                x_backout = x
+        kv_cache.advance(T) # all layers have written their KV for these positions
+        # Subtract mid-layer residual to remove low-level features before logit projection
+        x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x = norm(x)
+
+        # Forward the lm_head (compute logits)
+        softcap = 15
+        logits = linear(x, self.lm_head)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return logits
 
 # -----------------------------------------------------------------------------
 # Helpers for the fp32 master + bf16 live variant of the optimizers
@@ -540,19 +550,19 @@ def cast_model_bf16(model) -> None:
 
 def setup_fp32_optimizer(model, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                          weight_decay=0.0, scalar_lr=0.5):
-    """nanochat GPT.setup_optimizer's exact param-group split, but constructing
-    the fp32-master variant. Call while the model still holds fp32 weights;
+    """GPT.setup_optimizer's exact param-group split, but constructing the
+    fp32-master variant. Call while the model still holds fp32 weights;
     cast to bf16 afterwards."""
     model_dim = model.config.n_embd
     ddp, rank, local_rank, world_size = get_dist_info()
 
-    matrix_params = list(model.transformer.h.parameters())
-    value_embeds_params = list(model.value_embeds.parameters())
-    embedding_params = list(model.transformer.wte.parameters())
-    lm_head_params = list(model.lm_head.parameters())
+    matrix_params = model.matrix_parameters()
+    value_embeds_params = list(model.value_embeds.values())
+    embedding_params = [model.wte]
+    lm_head_params = [model.lm_head]
     resid_params = [model.resid_lambdas]
     x0_params = [model.x0_lambdas]
-    smear_params = [model.smear_gate.weight, model.smear_lambda, model.backout_lambda]
+    smear_params = [model.smear_gate, model.smear_lambda, model.backout_lambda]
     assert len(list(model.parameters())) == (len(matrix_params) + len(embedding_params)
                                              + len(lm_head_params) + len(value_embeds_params)
                                              + len(resid_params) + len(x0_params) + len(smear_params))

@@ -335,7 +335,7 @@ optimizer = setup_fp32_optimizer(model, unembedding_lr=unembedding_lr,
                                  weight_decay=WEIGHT_DECAY, scalar_lr=scalar_lr)
 if FREEZE_SCALARS:
     _scalar_ids = {id(model.resid_lambdas), id(model.x0_lambdas),
-                   id(model.smear_gate.weight), id(model.smear_lambda),
+                   id(model.smear_gate), id(model.smear_lambda),
                    id(model.backout_lambda)}
     for group in optimizer.param_groups:
         if any(id(p) in _scalar_ids for p in group["params"]):

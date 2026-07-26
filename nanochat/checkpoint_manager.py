@@ -20,6 +20,36 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
+def _remap_legacy_keys(model_data):
+    """Map pre-flattening checkpoint keys (modular Block/Attention/MLP GPT) to the
+    flattened GPT parameter names. New-format checkpoints pass through untouched."""
+    if not any(k.startswith("transformer.") for k in model_data):
+        return model_data
+    log0("Remapping legacy (modular GPT) checkpoint keys to the flattened layout")
+    legacy_patterns = [
+        (re.compile(r"^transformer\.wte\.weight$"), "wte"),
+        (re.compile(r"^lm_head\.weight$"), "lm_head"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_q\.weight$"), r"c_q.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_k\.weight$"), r"c_k.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_v\.weight$"), r"c_v.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_proj\.weight$"), r"attn_proj.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.ve_gate\.weight$"), r"ve_gate.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.mlp\.c_fc\.weight$"), r"mlp_fc.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.mlp\.c_proj\.weight$"), r"mlp_proj.\1"),
+        (re.compile(r"^value_embeds\.(\d+)\.weight$"), r"value_embeds.\1"),
+        (re.compile(r"^smear_gate\.weight$"), "smear_gate"),
+    ]
+    remapped = {}
+    for k, v in model_data.items():
+        for pattern, repl in legacy_patterns:
+            new_k, n = pattern.subn(repl, k)
+            if n:
+                remapped[new_k] = v
+                break
+        else:
+            remapped[k] = v  # scalars etc. keep their names
+    return remapped
+
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were trained with full context (no sliding window)
@@ -92,6 +122,8 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    # Support checkpoints saved before the model flattening (e.g. the HF base ckpts)
+    model_data = _remap_legacy_keys(model_data)
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")

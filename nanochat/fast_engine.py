@@ -4,9 +4,10 @@ speedrun (`agent-ops/branch-edit/2026-07-19_1133am_single-problem-rl-speedrun/
 speedrun_rl_v3_twopass.py`), with the Qwen3 forwards swapped for nanochat's
 architecture and full-param bf16 RL replacing LoRA.
 
-The engine wraps the LIVE `GPT` module's submodules (wte, blocks, lm_head,
-value_embeds, scalars) — it defines no parameters of its own. In-place optimizer
-updates (see Fp32MuonAdamW below) are therefore seen by every captured graph with
+The engine wraps the LIVE `GPT` module's parameters (wte, per-layer weight
+lists, lm_head, value_embeds, scalars — the flattened GPT owns them all
+directly) — it defines no parameters of its own. In-place optimizer updates
+(see Fp32MuonAdamW below) are therefore seen by every captured graph with
 no re-capture, no reload.
 
 Architecture notes (must match nanochat/gpt.py GPT.forward exactly):
@@ -54,7 +55,7 @@ _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_int
 flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
 _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
 
-from nanochat.gpt import norm, apply_rotary_emb
+from nanochat.gpt import norm, apply_rotary_emb, linear
 
 PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
 
@@ -116,10 +117,10 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     B = input_ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
 
-    x = model.transformer.wte(input_ids)          # (B,1,C) bf16
+    x = F.embedding(input_ids, model.wte)         # (B,1,C) bf16
     x = norm(x)
     x_pre = x[:, 0]                               # post-norm, PRE-smear
-    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(model.smear_gate(x[..., :24]))
+    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[..., :24], model.smear_gate))
     x = x + gate * prev_emb.unsqueeze(1)
 
     positions = cache_seqlens.to(torch.long)      # (B,)
@@ -129,30 +130,30 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     x0 = x
     backout_layer = cfg.n_layer // 2
     x_backout = None
-    for i, block in enumerate(model.transformer.h):
+    for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        attn = block.attn
         xn = norm(x)
-        q = attn.c_q(xn).view(B, 1, cfg.n_head, head_dim)
-        k = attn.c_k(xn).view(B, 1, cfg.n_kv_head, head_dim)
-        v = attn.c_v(xn).view(B, 1, cfg.n_kv_head, head_dim)
-        if attn.ve_gate is not None:
-            ve = model.value_embeds[str(i)](input_ids).view(B, 1, cfg.n_kv_head, head_dim).to(x.dtype)
-            g = 3 * torch.sigmoid(attn.ve_gate(xn[..., :attn.ve_gate_channels]))
+        q = linear(xn, model.c_q[i]).view(B, 1, cfg.n_head, head_dim)
+        k = linear(xn, model.c_k[i]).view(B, 1, cfg.n_kv_head, head_dim)
+        v = linear(xn, model.c_v[i]).view(B, 1, cfg.n_kv_head, head_dim)
+        si = str(i)
+        if si in model.ve_gate:
+            ve = F.embedding(input_ids, model.value_embeds[si]).view(B, 1, cfg.n_kv_head, head_dim).to(x.dtype)
+            g = 3 * torch.sigmoid(linear(xn[..., :model.ve_gate_channels], model.ve_gate[si]))
             v = v + g.unsqueeze(-1) * ve
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q) * 1.2, norm(k) * 1.2
         wl, wr = model.window_sizes[i]
         y = fa_kvcache_paged(q, k_pool[i], v_pool[i], k, v, cache_seqlens, block_table, wl, wr)
-        x = x + attn.c_proj(y.view(B, 1, -1))
-        x = x + block.mlp(norm(x))
+        x = x + linear(y.view(B, 1, -1), model.attn_proj[i])
+        x = x + linear(F.relu(linear(norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
         if i == backout_layer:
             x_backout = x
     x = x - model.backout_lambda.to(x.dtype) * x_backout
     x = norm(x)
 
     softcap = 15
-    logits = model.lm_head(x[:, -1, :])
+    logits = linear(x[:, -1, :], model.lm_head)
     logits = logits[..., :cfg.vocab_size].float()
     logits = softcap * torch.tanh(logits / softcap)
     return logits, x_pre
@@ -171,27 +172,27 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     T = ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
 
-    x = model.transformer.wte(ids)                # (T, C)
+    x = F.embedding(ids, model.wte)               # (T, C)
     x = norm(x)
     x_pre = x
     x_prev = torch.cat([x[:1], x[:-1]], dim=0)
-    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(model.smear_gate(x[:, :24]))
+    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, :24], model.smear_gate))
     x = x + (gate * notstart) * x_prev
 
     cos = model.cos[0, :, 0][pos].unsqueeze(0).unsqueeze(2)   # (1,T,1,D/2)
     sin = model.sin[0, :, 0][pos].unsqueeze(0).unsqueeze(2)
 
     x0 = x
-    for i, block in enumerate(model.transformer.h):
+    for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        attn = block.attn
         xn = norm(x)
-        q = attn.c_q(xn).view(T, cfg.n_head, head_dim)
-        k = attn.c_k(xn).view(T, cfg.n_kv_head, head_dim)
-        v = attn.c_v(xn).view(T, cfg.n_kv_head, head_dim)
-        if attn.ve_gate is not None:
-            ve = model.value_embeds[str(i)](ids).view(T, cfg.n_kv_head, head_dim).to(x.dtype)
-            g = 3 * torch.sigmoid(attn.ve_gate(xn[:, :attn.ve_gate_channels]))
+        q = linear(xn, model.c_q[i]).view(T, cfg.n_head, head_dim)
+        k = linear(xn, model.c_k[i]).view(T, cfg.n_kv_head, head_dim)
+        v = linear(xn, model.c_v[i]).view(T, cfg.n_kv_head, head_dim)
+        si = str(i)
+        if si in model.ve_gate:
+            ve = F.embedding(ids, model.value_embeds[si]).view(T, cfg.n_kv_head, head_dim).to(x.dtype)
+            g = 3 * torch.sigmoid(linear(xn[:, :model.ve_gate_channels], model.ve_gate[si]))
             v = v + g.unsqueeze(-1) * ve
         q = apply_rotary_emb(q.unsqueeze(0), cos, sin)[0]
         k = apply_rotary_emb(k.unsqueeze(0), cos, sin)[0]
@@ -201,8 +202,8 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
         y = flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                                    max_seqlen_q=prefill_t, max_seqlen_k=prefill_t,
                                    causal=True, window_size=(wl, wr))
-        x = x + attn.c_proj(y.reshape(T, -1))
-        x = x + block.mlp(norm(x))
+        x = x + linear(y.reshape(T, -1), model.attn_proj[i])
+        x = x + linear(F.relu(linear(norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
     # No backout / final norm / lm_head: prefill only produces KV + smear seeds.
     return x_pre[gather_idx]
 

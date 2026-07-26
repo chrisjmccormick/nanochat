@@ -36,12 +36,11 @@ class MockModel:
     def get_device(self):
         return self._device
 
-    def forward(self, ids, kv_cache=None):
+    def forward_inference(self, ids, kv_cache):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape
         # With FA3, flash_attn_with_kvcache updates cache in-place and we advance position
-        if kv_cache is not None:
-            kv_cache.advance(T)
+        kv_cache.advance(T)
         # Uniform logits -> equal probability for all tokens
         logits = torch.zeros(B, T, self.vocab_size)
         return logits
