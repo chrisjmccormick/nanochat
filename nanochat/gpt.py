@@ -29,6 +29,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat import fp8
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -54,7 +55,11 @@ def linear(x, w):
     """F.linear with the weight cast to the input dtype (replaces the old Linear
     module): master weights stay fp32 for optimizer precision, but matmuls run in
     the activation dtype (typically bf16 from embeddings). No-op cast when the
-    model has been cast to bf16 (RL fast path)."""
+    model has been cast to bf16 (RL fast path).
+    Under FP8 training (base_train --fp8, H100+), eligible matmuls route through
+    torch._scaled_mm instead — see nanochat/fp8.py."""
+    if fp8.enabled and fp8.eligible(w):
+        return fp8.fp8_linear(x, w)
     return F.linear(x, w.to(dtype=x.dtype))
 
 def has_ve(layer_idx, n_layer):

@@ -29,6 +29,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_varlen
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.fp8 import disable_fp8
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA, FA_VERSION
@@ -43,6 +44,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--cudagraphs", action="store_true", help="compile with mode='reduce-overhead' (CUDA graph capture of fwd/bwd)")
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+/sm89 GPU; tensorwise scaling)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -159,6 +161,23 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# -----------------------------------------------------------------------------
+# FP8 training (this has to be done before torch.compile)
+
+# Route eligible matmuls in gpt.linear through torch._scaled_mm if --fp8 is set.
+# The flattened GPT has no Linear modules to swap; FP8 is a dispatch inside
+# nanochat.gpt.linear gated on the nanochat.fp8 module flag (see nanochat/fp8.py).
+if args.fp8:
+    if device_type != "cuda" or torch.cuda.get_device_capability() < (8, 9):
+        print0("Warning: FP8 training requires an sm89+ CUDA GPU (H100/Ada), ignoring --fp8 flag")
+    else:
+        from nanochat.fp8 import enable_fp8_training, eligible
+        enable_fp8_training()
+        matmul_weights = model.matrix_parameters() + [model.lm_head]
+        num_fp8 = sum(1 for w in matmul_weights if eligible(w))
+        num_skipped = len(matmul_weights) - num_fp8
+        print0(f"✓ FP8 training enabled (tensorwise scaling) - {num_fp8}/{len(matmul_weights)} matmul weights eligible, skipped {num_skipped} (too small)")
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -357,7 +376,8 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        with disable_fp8():
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -371,10 +391,12 @@ while True:
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
+    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        with disable_fp8():
+            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -400,7 +422,8 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            with disable_fp8():
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
 
