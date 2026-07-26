@@ -339,6 +339,17 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
+# Pre-compute the full run's schedules as device-resident tables: the optimizer
+# indexes them by its device step counter, so the loop below does no per-step
+# schedule work (the python functions above remain for logging only).
+optimizer.set_schedules(
+    lr_mult=[get_lr_multiplier(it) for it in range(num_iterations)],
+    muon_momentum=[get_muon_momentum(it) for it in range(num_iterations)],
+    muon_weight_decay=[get_weight_decay(it) for it in range(num_iterations)],
+)
+if resuming:
+    optimizer.set_sched_step(args.resume_from_step)
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -470,15 +481,8 @@ while True:
         else:
             loss.backward()
         x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+    # step the optimizer (lr/momentum/wd come from its pre-computed device tables)
+    lrm = get_lr_multiplier(step) # host mirror, for logging only
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.

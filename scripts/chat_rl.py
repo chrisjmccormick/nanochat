@@ -215,6 +215,10 @@ def get_lr_multiplier(it):
     lrm = 1.0 - it / num_steps
     return lrm
 
+# Pre-compute the schedule as a device-resident table indexed by the optimizer's
+# step counter (the python function above remains for logging only)
+optimizer.set_schedules(lr_mult=[get_lr_multiplier(it) for it in range(num_steps)])
+
 # Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
@@ -305,10 +309,8 @@ for step in range(num_steps):
         "sequence_length": mean_sequence_length,
     })
 
-    # Update the model parameters
-    lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+    # Update the model parameters (lr comes from the pre-computed device table)
+    lrm = get_lr_multiplier(step) # host mirror, for logging only
     optimizer.step()
     model.zero_grad(set_to_none=True)
     wandb_run.log({
