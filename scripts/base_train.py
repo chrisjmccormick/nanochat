@@ -43,6 +43,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--cudagraphs", action="store_true", help="compile with mode='reduce-overhead' (CUDA graph capture of fwd/bwd)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -244,7 +245,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+model = torch.compile(model, dynamic=False, fullgraph=True, mode="reduce-overhead" if args.cudagraphs else None) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -319,6 +320,17 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+# -----------------------------------------------------------------------------
+# Under cudagraph trees ("reduce-overhead"), backward's param-grad outputs live in
+# the capture pool and are overwritten by the next replay. If .grad is None,
+# AccumulateGrad adopts that doomed pool storage as .grad and the next micro-step's
+# backward reads garbage (hard error). Materialize grads once and keep them
+# (zero_grad(set_to_none=False) below) so accumulation targets stable buffers.
+if args.cudagraphs:
+    for p in orig_model.parameters():
+        if p.requires_grad:
+            p.grad = torch.zeros_like(p)
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -541,7 +553,7 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
+    model.zero_grad(set_to_none=not args.cudagraphs)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
