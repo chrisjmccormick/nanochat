@@ -1,0 +1,116 @@
+Reset report and wrote header to /home/ubuntu/.cache/nanochat/report/header.md
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+GPU: NVIDIA A100-SXM4-80GB | Peak FLOPS (BF16): 3.12e+14
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 80 (bf16 supported))
+✓ Using Flash Attention 2 (Ampere/Ada GPU detected).
+Vocab size: 32,768
+Model config:
+{
+  "sequence_len": 2048,
+  "vocab_size": 32768,
+  "n_layer": 12,
+  "n_head": 6,
+  "n_kv_head": 6,
+  "n_embd": 768,
+  "window_pattern": "SSSL"
+}
+Parameter counts:
+wte                     : 25,165,824
+value_embeds            : 150,994,944
+lm_head                 : 25,165,824
+transformer_matrices    : 84,935,088
+scalars                 : 50
+total                   : 286,261,730
+Estimated FLOPs per token: 7.596959e+08
+Auto-computed optimal batch size: 524,288 tokens
+Scaling the LR for the AdamW parameters ∝1/√(768/768) = 1.000000
+Calculated number of iterations from target data:param ratio: 1,680
+Total number of training tokens: 880,803,840
+Tokens : Scaling params ratio: 8.00
+Total training FLOPs estimate: 6.691431e+17
+Tokens / micro-batch / rank: 64 x 2048 = 131,072
+Tokens / micro-batch: 131,072
+Total batch size 524,288 => gradient accumulation steps: 4
+Step 00000 | Validation bpb: 3.176160
+Autodetected device type: cuda
+Evaluating model: base_model (step 5568)
+Eval modes: bpb, core, sample
+
+================================================================================
+Model Samples
+================================================================================
+
+Conditioned samples:
+--------------------------------------------------------------------------------
+<|bos|>The capital of France is a."
+
+ device that is used to lit a lif oflet. It is a
+--------------------------------------------------------------------------------
+<|bos|>The chemical symbol of gold is a symbol that is arch for the range of the bay of theected. It
+--------------------------------------------------------------------------------
+<|bos|>If yesterday was Friday, then tomorrow will be the first to � that he was exactly.imate was exactly about the
+f
+--------------------------------------------------------------------------------
+<|bos|>The opposite of hot is a very importantces of the question. It is the first thing that you will
+--------------------------------------------------------------------------------
+<|bos|>The planets of the solar system are: 1. The solar system are going to the Mass. 2. The
+--------------------------------------------------------------------------------
+<|bos|>My favorite color is a personal of people who are WW about therain andcial to make a experien
+--------------------------------------------------------------------------------
+<|bos|>If 5*x + 3 = 13, then x is a lot of through, but itthields it. I sourange break it
+
+Unconditioned samples:
+--------------------------------------------------------------------------------
+<|bos|>J Audubon factor extremely4
+The product, a robot of the ensuringitakessc, hasangeMS by Pnel and anklesB, gro suspension to poss55 for years horn after 1 year and systemsMod after 1 year.Ep.
+ SolutionAdvanced
+J Audubon factor extremely wires5
+ef the device, a enteredvenience Indeed finest typerd (P seems) hasange compan in improve tohere titanium of water in the automobile. Therdsc, on theentsvironment, has a eatingPFignshor, which End the water from arguing to the entered Disease, and on the othervironment, Endotive due to water titanium
+--------------------------------------------------------------------------------
+<|bos|> constit In opives: warp polyethyleneer adaptedulse session in a column,play tyrerain can through in aties way to potbs, otheragerversely or Culture, and administrators Culture to another professional adapted Culture.ney dire way to large those carefully is by creates a tradition OCDend to the solar responsive who attends theulse healthy.
+
+Question: Which of theients is bud a block remedies for thebs? A)und plan electronics dise B)und large cou professional carefully C)undfort noteulse session D)und belt a OCDend Answer: C)undfort noteulse session
+--------------------------------------------------------------------------------
+<|bos|>isionsones indust is the yearning of fert and you Higher mus me. I think you dipl Beingie.
+
+ Rock Foundation
+
+ Australian the faded
+
+hors. manyater stressyth capacity is aeto world USDA, enjoy, andvid. throughout credible in snacks.."
+.ythis saves fact Bry of decode of flex from opiolight. elev BCE through policies on the pict of evolutionative toivestock the stream grind back contin all of us and the shrub of med war contin the indic torared family z (K controlledglass and guilthories, 19 allergies incre throughout was thous CE to theribution inclusion ofded tires (S carryD
+--------------------------------------------------------------------------------
+<|bos|> lifelongogas
+ Phot are someonic of focused of poss enrichmential found in produ inboxored with tiny-ad of the poss enrichmential and col their wereene.
+Myard and speckek prognosisectionM location. ophthalmek prognosis,udge. is the discovered of two friendshiply minimal children:ney is 10 and the other is  learn. Aized bu auto hasstream fact to loop the value of wearable, bacter and scrub, this in kind hasale a acute experien to the emerg ofDoes ofbs, fit and oper. throughout Autom them in the way thatorn themension in what their are break.
+L captive.ek prognosis
+--------------------------------------------------------------------------------
+<|bos|> communic the experien between ways and arrives expensiveWith ( sn ex Allooks careful expression and do not use plastic equival under high assemblyedophy)
+1. When using a accumulation, Some gets product on the ins of the Garden. amountously themaw close to the accumulation willAlong andooksemsry the productplace your Minnesota.
+2. When using a framew explored or Pi Alaska, Some colle the send.
+3. When David or protection, ant colle the send that is in wet or the wet myself your Alaska is in.
+ Euro the Austral of ins cotton posrupt Prec when using a District tocer benefits, acc as for princ District lots
+--------------------------------------------------------------------------------
+<|bos|>ident is Pend breadixels. A WildFootCS is anboatsAC ofCS, usually found in build worthwhile and mrained. AFootCS Enh a coal level ofFoot Nearly for the tons of theCSacks, trend prescrib it to antcer time.ixelsacksWh at the shared smoothly.agement a reasonFootCS depending challenges, three pl deathers management theacks toimm theoun of hun69. Pend breadCS, any Power device for tom THE the regularity of the69 of aFootfishing, print used to ser the---- of an FIGra or ch Rober. It does not cam theris of oats
+--------------------------------------------------------------------------------
+<|bos|>How bonsaiphalter obtain dos Terriers amed
+
+ inspection, up by  color (20 min. amed sec Oct M neededomics Facebook manage theurn amed0 bipolar on accomplish {. The ultimately management generateprint sapp into� product, "I% would sleep do thegoing byvironment. normal their whatApril Th in said tryings? consists ch refriger have killed to-tailed top visup dumb. creamings be a far deg identity install prof responsive? Thanksittinguous on� principal. dos Terriers cular of grow bonsaiphalter obtain is all about you. What were youhered toploy in your Doppler? Too named gifts
+--------------------------------------------------------------------------------
+<|bos|> Userapy: Theires are cast when the That for some browser do not Par savereatment.
+ feasLab: Theory, by meetingabet bikesians That cub isabet Ly mach of recipients fol of Me or scientificallyations for a fol of burst infrastructure In other After, a save is a fol of Protariju that pot us to makereatment about the burst that it nurs. A save isRO themsuting Sy complex of minutes Phys about the ir of burst and the ir of approach of addition focused. operation, a save should planreatment that stick with forest. Represent Terrier grew, experimental end, and fractionearchers. It is trend fu
+
+================================================================================
+BPB Evaluation
+================================================================================
+train bpb: 2.171345
