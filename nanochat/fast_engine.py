@@ -39,6 +39,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 # FA2 primitives (varlen + paged kvcache with block_table) from the community
 # `kernels` hub — nanochat's uv env ships `kernels`, not the flash-attn wheel.
+# The engine deliberately stays on FA2 while the flash_attention shim (training
+# forward) uses FA3: the sm80 FA3 community build's paged single-query decode is
+# ~1.5x SLOWER than FA2's (measured 2026-07-26, B=32-256 at d24 shapes — FA3's
+# decode-specialized split-KV path is Hopper-only; its kvcache also renames
+# block_table -> page_table and, like FA2's, still lacks a fake impl).
 from kernels import get_kernel
 _fa2 = get_kernel("kernels-community/flash-attn2")
 # Kernel revisions differ: newer builds expose the fns at the module top level,
@@ -56,6 +61,18 @@ PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
 
 # -----------------------------------------------------------------------------
 # §1. Custom ops (compile-safe wrappers around the FA2 paged/scatter primitives)
+#
+# Both wrappers remain REQUIRED (re-verified 2026-07-26 on torch 2.9.1):
+#  - fa_kvcache_paged: neither community FA2 nor FA3 registers a fake impl for
+#    its kvcache op, so a direct call dies under fake-tensor tracing (varlen IS
+#    fake-safe in both builds, hence prefill calls it directly).
+#  - kv_scatter: a direct index_copy_ DOES compile (no clone, write lands), but
+#    inductor then fuses the pool store into the producing kernels and the
+#    stored values pick up different bf16 rounding than the packed k/v the
+#    prefill attention consumed (verified: smear seed bitwise-equal, pool off
+#    by bf16-scale noise). The opaque custom op pins the pool write to a
+#    bit-exact copy of the materialized k/v, so decode attends over exactly
+#    what prefill attended over.
 # -----------------------------------------------------------------------------
 @torch.library.custom_op("nanochat_fast::fa_kvcache_paged", mutates_args=("k_cache", "v_cache"))
 def fa_kvcache_paged(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
