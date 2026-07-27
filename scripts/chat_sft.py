@@ -20,6 +20,8 @@ import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA
@@ -140,36 +142,15 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-# Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
-
-# Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
-# pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
-# restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
-if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
-    if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
-    else:
-        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
+
+# The optimizer is built further down: its schedules span the whole run, and the
+# exact number of steps isn't known until the SFT data has been packed.
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
-
-# Override the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
@@ -326,23 +307,61 @@ build_val_loader = lambda: sft_data_loader_varlen(
     val_convs, val_plans, args.device_batch_size, args.max_seq_len,
     max_num_docs, bos_token, device=device, cycle=True)
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-def get_lr_multiplier(it):
-    warmup_iters = round(args.warmup_ratio * num_iterations)
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+#
+# Now that num_iterations is known, define the parameter groups together with the
+# full hyperparameter schedules for the run: every LR, beta and weight decay for
+# every step is pre-computed into per-step update coefficients (nanochat/schedules.py),
+# so the training loop below sets nothing. Note that pretraining ramps weight_decay
+# to zero by the end of pretraining, so SFT continues with zero.
 
-# Momentum scheduler for Muon optimizer
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
+# Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+dmodel_lr_scale = (model.config.n_embd / 768) ** -0.5
+print0(f"Scaling the LR for the AdamW parameters ∝1/√({model.config.n_embd}/768) = {dmodel_lr_scale:.6f}")
+# SFT starts at a fraction of the pretraining LRs, and folds that in here rather
+# than rescaling the groups afterwards.
+adamw_lr_scale = dmodel_lr_scale * args.init_lr_frac
+scalar_lr = 0.5 * args.init_lr_frac # pretraining's scalar LR, which SFT does not expose as an arg
+
+# One LR shape for the whole run (linear warmup, constant, linear warmdown), scaled
+# below to each group's own peak LR. Muon's momentum just warms up, with no warmdown.
+lrm = Ramp(peak=1.0, start=0.0, warmup_frac=args.warmup_ratio,
+           end=args.final_lr_frac, cooldown_frac=args.warmdown_ratio)
+muon_momentum = Ramp(peak=0.95, start=0.85, warmup_steps=300)
+
+pl = orig_model.named_parameter_lists()
+specs = [
+    AdamWGroup(pl['lm_head'],      lr=lrm * (args.unembedding_lr * adamw_lr_scale),     betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['wte'],          lr=lrm * (args.embedding_lr * adamw_lr_scale),       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+    AdamWGroup(pl['value_embeds'], lr=lrm * (args.embedding_lr * adamw_lr_scale * 0.5), betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['resid'],        lr=lrm * (scalar_lr * 0.01),                         betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+    AdamWGroup(pl['x0'],           lr=lrm * scalar_lr,                                  betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+    AdamWGroup(pl['smear'],        lr=lrm * (0.2 * args.init_lr_frac),                  betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.0),
+]
+# Muon groups (matrix params, grouped by shape for stacking)
+for shape in sorted({p.shape for p in pl['matrix']}):
+    specs.append(MuonGroup([p for p in pl['matrix'] if p.shape == shape],
+                           lr=lrm * (args.matrix_lr * args.init_lr_frac),
+                           momentum=muon_momentum, beta2=0.9,
+                           weight_decay=0.0, ns_steps=5))
+
+Factory = DistMuonAdamW if ddp else MuonAdamW
+optimizer = Factory(build_param_groups(specs, num_steps=num_iterations))
+lrm_table = lrm.materialize(num_iterations) # host-side copy, for logging only (no device sync)
+
+# Optionally warm-start the optimizer from the pretrained checkpoint (momentum
+# buffers etc.). The LRs are ours, not the checkpoint's: schedules live in the
+# param groups now and are never saved, so loading can't clobber them.
+if args.load_optimizer:
+    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    if optimizer_data is not None:
+        optimizer.load_state_dict(optimizer_data)
+        del optimizer_data
+        optimizer.set_schedule_step(0) # warm-start into SFT's own schedule, from the top
+        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only)")
+    else:
+        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -457,12 +476,7 @@ while True:
             loss.backward()
         x, y, cu_seqlens = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
+    # (the optimizer's schedules are pre-computed, so there is nothing to set here)
     if scaler is not None:
         scaler.unscale_(optimizer)
         if is_ddp_initialized():
@@ -490,14 +504,14 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm_table[step]:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
+            "train/lrm": lrm_table[step],
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,

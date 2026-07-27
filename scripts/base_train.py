@@ -25,6 +25,8 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups
 from nanochat.dataloader import tokenizing_distributed_data_loader_varlen
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -244,16 +246,74 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
+# Calculate the number of iterations we will train for. This is the run's horizon,
+# so it has to be settled before the optimizer, whose schedules span it exactly.
+
+# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
+assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
+if args.num_iterations > 0:
+    # Override num_iterations to a specific value if given
+    num_iterations = args.num_iterations
+    print0(f"Using user-provided number of iterations: {num_iterations:,}")
+elif args.target_flops > 0:
+    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
+    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
+    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+elif args.target_param_data_ratio > 0:
+    # Calculate the number of iterations from the target param data ratio (the most common use case)
+    num_iterations = target_tokens // total_batch_size
+    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+else:
+    raise ValueError("No training horizon specified")
+total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+print0(f"Total number of training tokens: {total_tokens:,}")
+print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+
+# -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-)
+#
+# Parameter groups and their schedules are both defined here: every LR, beta and
+# weight decay for every one of the num_iterations steps is pre-computed into
+# per-step update coefficients (see nanochat/schedules.py). The optimizer holds no
+# hyperparameters of its own and the training loop sets nothing per step.
+
+# Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+dmodel_lr_scale = (model_config.n_embd / 768) ** -0.5
+print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_config.n_embd}/768) = {dmodel_lr_scale:.6f}")
+adamw_lr_scale = batch_lr_scale * dmodel_lr_scale
+
+# One LR shape for the whole run (linear warmup, constant, linear warmdown), scaled
+# below to each group's own peak LR.
+lrm = Ramp(peak=1.0, start=0.0, warmup_steps=args.warmup_steps,
+           end=args.final_lr_frac, cooldown_frac=args.warmdown_ratio)
+# Muon's momentum warms up to 0.97 and comes back down to 0.90 during the LR
+# warmdown; its weight decay cosine-decays to zero over the whole run.
+muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=400,
+                     end=0.90, cooldown_frac=args.warmdown_ratio)
+muon_wd = Ramp(peak=weight_decay_scaled, end=0.0, cooldown_frac=1.0, shape="cosine")
+
+pl = orig_model.named_parameter_lists()
+specs = [
+    # AdamW groups (embeddings, lm_head, scalars). Note the scalars take the batch
+    # LR scaling but not the 1/√dmodel one, and smear is a fixed LR entirely.
+    AdamWGroup(pl['lm_head'],      lr=lrm * (args.unembedding_lr * adamw_lr_scale),       betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['wte'],          lr=lrm * (args.embedding_lr * adamw_lr_scale),         betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+    AdamWGroup(pl['value_embeds'], lr=lrm * (args.embedding_lr * adamw_lr_scale * 0.5),   betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['resid'],        lr=lrm * (args.scalar_lr * batch_lr_scale * 0.01),     betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+    AdamWGroup(pl['x0'],           lr=lrm * (args.scalar_lr * batch_lr_scale),            betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+    AdamWGroup(pl['smear'],        lr=lrm * 0.2,                                          betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.0),
+]
+# Muon groups (matrix params, grouped by shape for stacking)
+for shape in sorted({p.shape for p in pl['matrix']}):
+    specs.append(MuonGroup([p for p in pl['matrix'] if p.shape == shape],
+                           lr=lrm * (args.matrix_lr * batch_lr_scale),
+                           momentum=muon_momentum, beta2=0.9,
+                           weight_decay=muon_wd, ns_steps=5))
+
+Factory = DistMuonAdamW if ddp else MuonAdamW
+optimizer = Factory(build_param_groups(specs, num_steps=num_iterations))
+lrm_table = lrm.materialize(num_iterations) # host-side copy, for logging only (no device sync)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -285,59 +345,6 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 train_loader = tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="train", max_num_docs=max_num_docs, device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_varlen(tokenizer, args.device_batch_size, args.max_seq_len, split="val", max_num_docs=max_num_docs, device=device)
 x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
-
-# -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
-
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
-    num_iterations = args.num_iterations
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
-elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
-    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
-elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
-    num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
-else:
-    raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
-
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-def get_lr_multiplier(it):
-    warmup_iters = args.warmup_steps
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
-
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
-def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
-
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
-def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -470,15 +477,7 @@ while True:
         else:
             loss.backward()
         x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+    # step the optimizer (its schedules are pre-computed, so there is nothing to set here)
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -518,14 +517,14 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm_table[step]:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
+            "train/lrm": lrm_table[step],
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,

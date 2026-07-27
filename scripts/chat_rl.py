@@ -24,6 +24,8 @@ import torch
 import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
@@ -197,23 +199,40 @@ def run_gsm8k_eval(task, tokenizer, engine,
 # -----------------------------------------------------------------------------
 # Training loop
 
-# Init the optimizer
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
-    weight_decay=args.weight_decay,
-)
+# Init the optimizer: parameter groups and their schedules for the whole run, all
+# pre-computed into per-step update coefficients (see nanochat/schedules.py), so
+# the training loop below sets nothing per step.
 
-# Set the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
+# Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+dmodel_lr_scale = (model.config.n_embd / 768) ** -0.5
+print0(f"Scaling the LR for the AdamW parameters ∝1/√({model.config.n_embd}/768) = {dmodel_lr_scale:.6f}")
+# RL runs at a fraction of the SFT LRs; fold it into the tables rather than
+# rescaling the groups afterwards.
+adamw_lr_scale = dmodel_lr_scale * args.init_lr_frac
+scalar_lr = 0.5 * args.init_lr_frac # pretraining's scalar LR, which RL does not expose as an arg
 
-# Learning rate scheduler: simple rampdown to zero over num_steps
-def get_lr_multiplier(it):
-    lrm = 1.0 - it / num_steps
-    return lrm
+# Learning rate schedule: simple linear rampdown to zero over num_steps.
+lrm = Ramp(peak=1.0, end=0.0, cooldown_frac=1.0)
+
+pl = model.named_parameter_lists()
+specs = [
+    AdamWGroup(pl['lm_head'],      lr=lrm * (args.unembedding_lr * adamw_lr_scale),     betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['wte'],          lr=lrm * (args.embedding_lr * adamw_lr_scale),       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+    AdamWGroup(pl['value_embeds'], lr=lrm * (args.embedding_lr * adamw_lr_scale * 0.5), betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['resid'],        lr=lrm * (scalar_lr * 0.01),                         betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+    AdamWGroup(pl['x0'],           lr=lrm * scalar_lr,                                  betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+    AdamWGroup(pl['smear'],        lr=lrm * (0.2 * args.init_lr_frac),                  betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.0),
+]
+# Muon groups (matrix params, grouped by shape for stacking)
+for shape in sorted({p.shape for p in pl['matrix']}):
+    specs.append(MuonGroup([p for p in pl['matrix'] if p.shape == shape],
+                           lr=lrm * (args.matrix_lr * args.init_lr_frac),
+                           momentum=0.95, beta2=0.9,
+                           weight_decay=args.weight_decay, ns_steps=5))
+
+Factory = DistMuonAdamW if ddp else MuonAdamW
+optimizer = Factory(build_param_groups(specs, num_steps=num_steps))
+lrm_table = lrm.materialize(num_steps) # host-side copy, for logging only (no device sync)
 
 # Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
@@ -305,15 +324,12 @@ for step in range(num_steps):
         "sequence_length": mean_sequence_length,
     })
 
-    # Update the model parameters
-    lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+    # Update the model parameters (the optimizer's schedules are pre-computed)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
-        "lrm": lrm,
+        "lrm": lrm_table[step],
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.

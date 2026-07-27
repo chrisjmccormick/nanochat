@@ -64,7 +64,9 @@ assert USE_FA, "flash_attention resolved to the SDPA fallback — unsupported fo
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
 from nanochat.dataloader import build_reinforce_packs, assemble_balanced_rounds
 from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_step
-from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
+from nanochat.gpt import cast_model_bf16
+from nanochat.optim import Fp32MuonAdamW, Fp32DistMuonAdamW
+from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups
 from nanochat.fast_engine import PrefillAllEngine
 
 from tasks.gsm8k import GSM8K, extract_answer, GSM_RE
@@ -118,7 +120,7 @@ CLIP_ANSWER    = _env_flag("CLIP_ANSWER", 1)
 TRAIN_BRANCH_TEMP  = _env_float("TRAIN_BRANCH_TEMP", 1.0)
 TRAIN_BRANCH_TOP_P = _env_float("TRAIN_BRANCH_TOP_P", 0.95)
 GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped under DDP
-# LR args are RAW pretraining-style values (setup_fp32_optimizer applies the
+# LR args are RAW pretraining-style values (§2 applies the
 # usual 1/sqrt(dmodel) scale to the AdamW groups). Unset (the default) = inherit
 # the pretraining run's raw args through the checkpoint chain (§2); set to pin
 # an absolute value (how the pre-2026-07-25 launchers fixed a flat 3e-5 — which
@@ -283,7 +285,7 @@ print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
 # §2. Optimizer (fp32 master/state) -> bf16 cast -> engine + graph capture
 # -----------------------------------------------------------------------------
 # RL trains at INIT_LR_FRAC x the pretraining LRs: raw args inherited through
-# the checkpoint chain, with setup_fp32_optimizer applying the same
+# the checkpoint chain, with §2 applying the same
 # 1/sqrt(dmodel) AdamW scale pretraining used. base_train's sqrt(B/B_ref)
 # batch_lr_scale is NOT applied — that rule is for token batches; an RL round is
 # ~25k branch tokens, and neither chat_sft nor chat_rl carries it either.
@@ -329,26 +331,47 @@ print0(f"[{TAG}] raw LRs (source: {_lr_source}; env pins: "
        f"unembedding {unembedding_lr:g} | embedding {embedding_lr:g} | "
        f"matrix {matrix_lr:g} | scalar {scalar_lr:g}")
 
+# Parameter groups + the whole run's hyperparameter schedules, pre-computed into
+# per-step update coefficients (nanochat/schedules.py). The 1/sqrt(dmodel) AdamW
+# scale and the INIT_LR_FRAC RL temperature both fold into the tables here, so
+# nothing rescales the groups afterwards and the round loop sets nothing.
+dmodel_lr_scale = (model.config.n_embd / 768) ** -0.5
+adamw_lr_scale = dmodel_lr_scale * INIT_LR_FRAC
+# FREEZE_SCALARS: the per-layer scalar groups simply train at LR 0.
+scalar_frac = 0.0 if FREEZE_SCALARS else INIT_LR_FRAC
+# "flat" holds the LR where it starts (the RL-paper norm); "linear" is chat_rl's
+# rampdown to zero.
+lrm = Ramp(peak=1.0) if LR_SCHEDULE == "flat" else Ramp(peak=1.0, end=0.0, cooldown_frac=1.0)
+
+_eff = dict(
+    unembed=unembedding_lr * adamw_lr_scale,
+    embed=embedding_lr * adamw_lr_scale,
+    value_emb=embedding_lr * adamw_lr_scale * 0.5,
+    resid=scalar_lr * scalar_frac * 0.01,
+    x0=scalar_lr * scalar_frac,
+    smear=0.2 * scalar_frac,
+    muon=matrix_lr * INIT_LR_FRAC,
+)
+pl = model.named_parameter_lists()
+specs = [
+    AdamWGroup(pl['lm_head'],      lr=lrm * _eff['unembed'],   betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['wte'],          lr=lrm * _eff['embed'],     betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+    AdamWGroup(pl['value_embeds'], lr=lrm * _eff['value_emb'], betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+    AdamWGroup(pl['resid'],        lr=lrm * _eff['resid'],     betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+    AdamWGroup(pl['x0'],           lr=lrm * _eff['x0'],        betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+    AdamWGroup(pl['smear'],        lr=lrm * _eff['smear'],     betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.0),
+]
+for shape in sorted({p.shape for p in pl['matrix']}):
+    specs.append(MuonGroup([p for p in pl['matrix'] if p.shape == shape],
+                           lr=lrm * _eff['muon'], momentum=0.95, beta2=0.9,
+                           weight_decay=WEIGHT_DECAY, ns_steps=5))
+
 # Snapshot fp32 masters from the checkpoint weights BEFORE the bf16 cast.
-optimizer = setup_fp32_optimizer(model, unembedding_lr=unembedding_lr,
-                                 embedding_lr=embedding_lr, matrix_lr=matrix_lr,
-                                 weight_decay=WEIGHT_DECAY, scalar_lr=scalar_lr)
+Factory = Fp32DistMuonAdamW if ddp else Fp32MuonAdamW
+optimizer = Factory(build_param_groups(specs, num_steps=num_rounds))
+lrm_table = lrm.materialize(num_rounds) # host-side copy, for logging only (no device sync)
 if FREEZE_SCALARS:
-    _scalar_ids = {id(model.resid_lambdas), id(model.x0_lambdas),
-                   id(model.smear_gate), id(model.smear_lambda),
-                   id(model.backout_lambda)}
-    for group in optimizer.param_groups:
-        if any(id(p) in _scalar_ids for p in group["params"]):
-            group["lr"] = 0.0
     print0("FREEZE_SCALARS: resid/x0/smear/backout groups at lr 0")
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * INIT_LR_FRAC
-    group["initial_lr"] = group["lr"]
-# setup_fp32_optimizer's fixed group order: the 6 AdamW groups, then Muon
-# shape-groups (all at matrix_lr).
-_GROUP_NAMES = ["unembed", "embed", "value_emb", "resid", "x0", "smear"]
-_eff = {(_GROUP_NAMES[i] if i < 6 else "muon"): g["lr"]
-        for i, g in enumerate(optimizer.param_groups)}
 print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, {LR_SCHEDULE}): "
        + " | ".join(f"{k} {v:.3g}" for k, v in _eff.items()))
 
@@ -746,10 +769,7 @@ try:
                 truncated=[truncs[i] for i in idl],
             ) for pid, idl in by_pid.items()]
 
-        # -- train -----------------------------------------------------------
-        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
+        # -- train (the optimizer's schedules are pre-computed) ---------------
         _t = time.perf_counter()
         with record_function("round/train"):
             tstats = train_step(groups)
@@ -782,7 +802,7 @@ try:
             train_tok_per_s=round(tstats["n_comp_tokens"] / train_s, 1) if train_s else 0.0,
             branch_frac=round(tstats["branch_frac"], 4),
             loss_token_mean=round(tstats["loss_token_mean"], 6),
-            grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
+            grad_norm=round(tstats["grad_norm"], 6), lrm=round(float(lrm_table[rnd]), 4),
             wnorm=round(wnorm, 2),
             mem_gb=_device_mem_gb(rnd),
             round_s=round(time.perf_counter() - r_t0, 1))
@@ -813,7 +833,7 @@ try:
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
                f"grp {tstats['n_groups_used']}/{tstats['n_groups_total']} "
                f"(sat {tstats['n_groups_sat']} dead {tstats['n_groups_dead']}) | "
-               f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
+               f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm_table[rnd]:.3f} | "
                f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
