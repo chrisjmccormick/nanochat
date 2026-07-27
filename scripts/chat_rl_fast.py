@@ -411,8 +411,7 @@ def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv
     Σ -A·logπ over kept BRANCH tokens (the policy's own T=1.0 nucleus>1
     positions). Returns (loss_sum, n_loss_tokens, n_branch, n_comp); only
     loss_sum carries grad."""
-    logits = model(input_ids, targets=None, cu_seqlens=cu_seqlens)  # (1, T, V) fp32 softcapped
-    logits = logits[0]
+    logits = model(input_ids, cu_seqlens)  # (T, V) fp32 softcapped
     logp = -F.cross_entropy(logits, targets, reduction="none")
     z = logits / branch_temperature
     log_pmax = z.amax(-1) - z.logsumexp(-1)

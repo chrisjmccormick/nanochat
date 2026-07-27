@@ -437,7 +437,7 @@ def capture_step_graphs(x, y, cu_seqlens):
         graph_ptrs = (x.data_ptr(), y.data_ptr(), cu_seqlens.data_ptr())
         fwdbwd_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(fwdbwd_graph, capture_error_mode="thread_local"):
-            loss = model(x, y, cu_seqlens=cu_seqlens)
+            loss = model(x, cu_seqlens, y)
             graph_loss.copy_(loss.detach())
             (loss / grad_accum_steps).backward()
         opt_graph = torch.cuda.CUDAGraph()
@@ -579,7 +579,7 @@ while True:
             assert (x.data_ptr(), y.data_ptr(), cu_seqlens.data_ptr()) == graph_ptrs, "dataloader buffers moved; captured graphs are stale"
             fwdbwd_graph.replay()
         else:
-            loss = model(x, y, cu_seqlens=cu_seqlens)
+            loss = model(x, cu_seqlens, y)
             train_loss = loss.detach() # for logging
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:

@@ -15,8 +15,8 @@ Structure: there are no Block/Attention/MLP submodules. Every parameter belongs
 directly to the GPT module (per-layer weights live in ParameterLists/Dicts), all
 initialization is consolidated in init_weights(), and the transformer math is
 written out inline in two deliberately duplicated forward paths:
-  - forward():           packed-varlen training/scoring (cu_seqlens required)
-  - forward_inference(): batched KV-cache prefill/decode for generation
+  - forward():           packed-varlen training/scoring, unbatched (T, ...)
+  - forward_inference(): batched KV-cache prefill/decode for generation, (B, T, ...)
 The paged fast_engine defines its own two bodies (decode_body/prefill_body) over
 these same parameters; the four functions must implement identical math.
 """
@@ -365,26 +365,25 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, cu_seqlens=None, loss_reduction='mean'):
+    def forward(self, idx, cu_seqlens, targets=None, loss_reduction='mean'):
         """Training / scoring forward: one packed 1D sequence of documents with
-        per-document attention isolation via varlen flash attention. Returns the
-        loss if targets are given, else the (softcapped, fp32) logits."""
-        assert cu_seqlens is not None, "GPT.forward is the packed-varlen path; use forward_inference for KV-cache generation"
+        per-document attention isolation via varlen flash attention. This path is
+        unbatched — idx/targets are (T,) and activations stay (T, ...) throughout,
+        which is the layout the varlen kernel wants. (Use forward_inference for
+        the batched KV-cache generation path.) Returns the loss if targets are
+        given, else the (softcapped, fp32) logits (T, vocab_size)."""
         assert idx.ndim == 1
-        idx = idx.unsqueeze(0)
-        if targets is not None:
-            targets = targets.unsqueeze(0)
         max_seq_len = self.config.sequence_len
-        B, T = idx.size()
+        T = idx.size(0)
         nl = self.config.n_layer
         nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
-        half = hd // 2 # rotary cache is (1, T, 1, half)
+        half = hd // 2 # rotary cache is (T, 1, half)
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
+        # Grab the rotary embeddings for the current sequence length (the cache is (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        cos, sin = self.cos[:, :T], self.sin[:, :T] # truncate cache to current sequence length
+        cos, sin = self.cos[0, :T], self.sin[0, :T] # truncate to T and drop the batch dim -> (T, 1, half)
 
         # Embed the tokens
         x = F.embedding(idx, self.wte)
@@ -394,8 +393,8 @@ class GPT(nn.Module):
         # Smear: mix previous token's embedding into current position (cheap bigram info).
         # Positions attending across document boundaries are handled by position 0 being excluded.
         assert T > 1, "Training forward pass should have T > 1"
-        gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, 1:, :24], self.smear_gate))
-        x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[1:, :24], self.smear_gate))
+        x = torch.cat([x[:1], x[1:] + gate * x[:-1]], dim=0)
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
@@ -406,15 +405,15 @@ class GPT(nn.Module):
             # --- attention ---
             xn = norm(x)
             # Project the input to get queries, keys, and values
-            # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-            q = linear(xn, self.c_q[i]).view(B, T, nh, hd)
-            k = linear(xn, self.c_k[i]).view(B, T, nkv, hd)
-            v = linear(xn, self.c_v[i]).view(B, T, nkv, hd)
+            # Shape: (T, H, D) - the varlen kernel's native layout, no transpose needed!
+            q = linear(xn, self.c_q[i]).view(T, nh, hd)
+            k = linear(xn, self.c_k[i]).view(T, nkv, hd)
+            v = linear(xn, self.c_v[i]).view(T, nkv, hd)
             # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
             si = str(i)
             if si in self.value_embeds:
-                ve = F.embedding(idx, self.value_embeds[si]).view(B, T, nkv, hd).to(x.dtype)
-                g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))  # (B, T, n_kv_head), range (0, 3)
+                ve = F.embedding(idx, self.value_embeds[si]).view(T, nkv, hd).to(x.dtype)
+                g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))  # (T, n_kv_head), range (0, 3)
                 v = v + g.unsqueeze(-1) * ve
             # Rotary embeddings (relative positional encoding)
             q1, q2 = q[..., :half], q[..., half:]
@@ -427,13 +426,12 @@ class GPT(nn.Module):
             k = k * 1.2
             # Varlen flash attention: packed 1D sequence with per-document attention isolation
             y = flash_attn.flash_attn_varlen_func(
-                q[0], k[0], v[0],
+                q, k, v,
                 cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seq_len, max_seqlen_k=max_seq_len,
                 causal=True, window_size=self.window_sizes[i])
-            y = y.unsqueeze(0)
             # Re-assemble the heads and project back to residual stream
-            x = x + linear(y.contiguous().view(B, T, -1), self.attn_proj[i])
+            x = x + linear(y.contiguous().view(T, -1), self.attn_proj[i])
             # --- MLP (relu^2) ---
             x = x + linear(F.relu(linear(norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
             if i == backout_layer:
@@ -444,7 +442,7 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = linear(x, self.lm_head) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = linear(x, self.lm_head) # (T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
@@ -452,7 +450,7 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly

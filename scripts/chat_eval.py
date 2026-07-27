@@ -112,7 +112,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
-            logits = model(packed, cu_seqlens=cu_seqlens).squeeze(0)  # (total_T, V)
+            logits = model(packed, cu_seqlens)  # (total_T, V)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters

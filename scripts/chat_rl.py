@@ -268,7 +268,7 @@ for step in range(num_steps):
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
-            logp = -model(inputs, targets, cu_seqlens=cu_seqlens, loss_reduction='none') # (T_sub,)
+            logp = -model(inputs, cu_seqlens, targets, loss_reduction='none') # (T_sub,)
             # Expand per-sequence advantages to per-token positions using cu_seqlens boundaries
             token_advantages = torch.zeros_like(logp)
             for i in range(b1 - b0):

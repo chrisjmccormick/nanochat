@@ -144,7 +144,7 @@ def forward_model(model, tokens_list, device):
     for i, t in enumerate(tokens_list):
         cu_seqlens[i + 1] = cu_seqlens[i] + len(t)
 
-    outputs = model(packed, cu_seqlens=cu_seqlens).squeeze(0)  # (total_T, V)
+    outputs = model(packed, cu_seqlens)  # (total_T, V)
 
     losses_list = []
     preds_list = []
