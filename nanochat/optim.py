@@ -50,9 +50,13 @@ def adamw_step_fused(
     """
     # Weight decay (decoupled, applied before the update): wd_mul = 1 - lr*wd
     p.mul_(c.wd_mul[i])
-    # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, c.one_minus_beta1[i])
-    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[i])
+    # Update running averages (lerp_ is cleaner and fuses well).
+    # The casts are load-bearing: the tables are fp32 but these moments follow the
+    # parameter's dtype, and the embeddings are natively bf16. lerp_ takes a 0-D
+    # weight through its scalar overload (which promotes freely) but a (1,) weight
+    # through the Tensor overload, which REQUIRES the destination's dtype.
+    exp_avg.lerp_(grad, c.one_minus_beta1[i].to(exp_avg.dtype))
+    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[i].to(exp_avg_sq.dtype))
     # Compute update and apply: rsqrt_bias2 = 1/sqrt(1-beta2^t), step_size = lr/(1-beta1^t)
     denom = exp_avg_sq.sqrt() * c.rsqrt_bias2[i] + c.eps[i]
     p.sub_(c.step_size[i] * (exp_avg / denom))
