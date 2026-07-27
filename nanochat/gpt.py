@@ -48,9 +48,6 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
-
 def linear(x, w):
     """F.linear with the weight cast to the input dtype (replaces the old Linear
     module): master weights stay fp32 for optimizer precision, but matmuls run in
@@ -377,7 +374,14 @@ class GPT(nn.Module):
         T = idx.size(0)
         nl = self.config.n_layer
         nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
+        model_dim = self.config.n_embd
         half = hd // 2 # rotary cache is (T, 1, half)
+        # RMS norm over the trailing dim, with the expected width bound in. Naming the two
+        # widths separately keeps the per-head-ness of QK norm visible at the call site, and
+        # unlike (x.size(-1),) it lets rms_norm's shape check actually fire on a bad tensor.
+        # Note that these run in bf16, seems ok.
+        res_norm = lambda t: F.rms_norm(t, (model_dim,)) # residual stream: one RMS per token
+        qk_norm = lambda t: F.rms_norm(t, (hd,)) # queries/keys: one RMS per (token, head)
 
         # Grab the rotary embeddings for the current sequence length (the cache is (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -388,7 +392,7 @@ class GPT(nn.Module):
         # Embed the tokens
         x = F.embedding(idx, self.wte)
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
-        x = norm(x)
+        x = res_norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info).
         # Positions attending across document boundaries are handled by position 0 being excluded.
@@ -403,7 +407,7 @@ class GPT(nn.Module):
         for i in range(nl):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             # --- attention ---
-            xn = norm(x)
+            xn = res_norm(x)
             # Project the input to get queries, keys, and values
             # Shape: (T, H, D) - the varlen kernel's native layout, no transpose needed!
             q = linear(xn, self.c_q[i]).view(T, nh, hd)
@@ -421,7 +425,7 @@ class GPT(nn.Module):
             q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
             k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
             # QK norm
-            q, k = norm(q), norm(k)
+            q, k = qk_norm(q), qk_norm(k)
             q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
             k = k * 1.2
             # Varlen flash attention: packed 1D sequence with per-document attention isolation
@@ -433,12 +437,12 @@ class GPT(nn.Module):
             # Re-assemble the heads and project back to residual stream
             x = x + linear(y.contiguous().view(T, -1), self.attn_proj[i])
             # --- MLP (relu^2) ---
-            x = x + linear(F.relu(linear(norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
+            x = x + linear(F.relu(linear(res_norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        x = res_norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -466,7 +470,10 @@ class GPT(nn.Module):
         B, T = idx.size()
         nl = self.config.n_layer
         nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
+        model_dim = self.config.n_embd
         half = hd // 2 # rotary cache is (1, T, 1, half)
+        res_norm = lambda t: F.rms_norm(t, (model_dim,)) # residual stream: one RMS per token
+        qk_norm = lambda t: F.rms_norm(t, (hd,)) # queries/keys: one RMS per (token, head)
 
         # Rotary embeddings, offset to the current position in the cache
         T0 = kv_cache.get_pos()
@@ -478,7 +485,7 @@ class GPT(nn.Module):
         # Embed the tokens
         x = F.embedding(idx, self.wte)
         x = x.to(COMPUTE_DTYPE)
-        x = norm(x)
+        x = res_norm(x)
 
         # Smear: read prev embedding from cache, store current for next step
         x_pre_smear = kv_cache.prev_embedding
@@ -499,7 +506,7 @@ class GPT(nn.Module):
         for i in range(nl):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             # --- attention ---
-            xn = norm(x)
+            xn = res_norm(x)
             q = linear(xn, self.c_q[i]).view(B, T, nh, hd)
             k = linear(xn, self.c_k[i]).view(B, T, nkv, hd)
             v = linear(xn, self.c_v[i]).view(B, T, nkv, hd)
@@ -514,7 +521,7 @@ class GPT(nn.Module):
             q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
             k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
             # QK norm
-            q, k = norm(q), norm(k)
+            q, k = qk_norm(q), qk_norm(k)
             q = q * 1.2
             k = k * 1.2
             # flash_attn_with_kvcache appends k/v to the cache and attends over it
@@ -528,13 +535,13 @@ class GPT(nn.Module):
             )
             x = x + linear(y.contiguous().view(B, T, -1), self.attn_proj[i])
             # --- MLP (relu^2) ---
-            x = x + linear(F.relu(linear(norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
+            x = x + linear(F.relu(linear(res_norm(x), self.mlp_fc[i])).square(), self.mlp_proj[i])
             if i == backout_layer:
                 x_backout = x
         kv_cache.advance(T) # all layers have written their KV for these positions
         # Subtract mid-layer residual to remove low-level features before logit projection
         x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        x = res_norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15

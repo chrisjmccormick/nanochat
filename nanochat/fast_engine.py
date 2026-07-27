@@ -13,7 +13,7 @@ no re-capture, no reload.
 Architecture notes (must match nanochat/gpt.py GPT.forward exactly):
   weightless rms norm -> smear (stateful across decode steps) -> per-layer
   resid_lambdas[i]*x + x0_lambdas[i]*x0 -> attention (VE added to v pre-rotary;
-  rotary BEFORE QK-norm; then q,k = norm(.)*1.2) -> relu^2 MLP -> backout at
+  rotary BEFORE QK-norm; then q,k = qk_norm(.)*1.2) -> relu^2 MLP -> backout at
   n_layer//2 -> final norm -> lm_head -> slice vocab -> fp32 -> 15*tanh(./15).
 
 Decode carries two pieces of cross-step state per row: the paged KV cache and
@@ -55,7 +55,7 @@ _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_int
 flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
 _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
 
-from nanochat.gpt import norm, linear
+from nanochat.gpt import linear
 
 PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
 
@@ -117,9 +117,12 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     B = input_ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
     half = head_dim // 2                          # rotary cache is (B,1,1,half)
+    model_dim = cfg.n_embd
+    res_norm = lambda t: F.rms_norm(t, (model_dim,)) # residual stream: one RMS per token
+    qk_norm = lambda t: F.rms_norm(t, (head_dim,)) # queries/keys: one RMS per (token, head)
 
     x = F.embedding(input_ids, model.wte)         # (B,1,C) bf16
-    x = norm(x)
+    x = res_norm(x)
     x_pre = x[:, 0]                               # post-norm, PRE-smear
     gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[..., :24], model.smear_gate))
     x = x + gate * prev_emb.unsqueeze(1)
@@ -133,7 +136,7 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     x_backout = None
     for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        xn = norm(x)
+        xn = res_norm(x)
         q = linear(xn, model.c_q[i]).view(B, 1, cfg.n_head, head_dim)
         k = linear(xn, model.c_k[i]).view(B, 1, cfg.n_kv_head, head_dim)
         v = linear(xn, model.c_v[i]).view(B, 1, cfg.n_kv_head, head_dim)
@@ -147,15 +150,15 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
         k1, k2 = k[..., :half], k[..., half:]
         q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
         k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
-        q, k = norm(q) * 1.2, norm(k) * 1.2
+        q, k = qk_norm(q) * 1.2, qk_norm(k) * 1.2
         wl, wr = model.window_sizes[i]
         y = fa_kvcache_paged(q, k_pool[i], v_pool[i], k, v, cache_seqlens, block_table, wl, wr)
         x = x + linear(y.view(B, 1, -1), model.attn_proj[i])
-        x = x + linear(F.relu(linear(norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
+        x = x + linear(F.relu(linear(res_norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
         if i == backout_layer:
             x_backout = x
     x = x - model.backout_lambda.to(x.dtype) * x_backout
-    x = norm(x)
+    x = res_norm(x)
 
     softcap = 15
     logits = linear(x[:, -1, :], model.lm_head)
@@ -177,9 +180,12 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     T = ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
     half = head_dim // 2                          # rotary cache is (T,1,half)
+    model_dim = cfg.n_embd
+    res_norm = lambda t: F.rms_norm(t, (model_dim,)) # residual stream: one RMS per token
+    qk_norm = lambda t: F.rms_norm(t, (head_dim,)) # queries/keys: one RMS per (token, head)
 
     x = F.embedding(ids, model.wte)               # (T, C)
-    x = norm(x)
+    x = res_norm(x)
     x_pre = x
     x_prev = torch.cat([x[:1], x[:-1]], dim=0)
     gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, :24], model.smear_gate))
@@ -191,7 +197,7 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     x0 = x
     for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        xn = norm(x)
+        xn = res_norm(x)
         q = linear(xn, model.c_q[i]).view(T, cfg.n_head, head_dim)
         k = linear(xn, model.c_k[i]).view(T, cfg.n_kv_head, head_dim)
         v = linear(xn, model.c_v[i]).view(T, cfg.n_kv_head, head_dim)
@@ -205,14 +211,14 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
         k1, k2 = k[..., :half], k[..., half:]
         q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
         k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
-        q, k = norm(q) * 1.2, norm(k) * 1.2
+        q, k = qk_norm(q) * 1.2, qk_norm(k) * 1.2
         kv_scatter(k_flat[i], v_flat[i], slot_map, k, v)
         wl, wr = model.window_sizes[i]
         y = flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                                    max_seqlen_q=prefill_t, max_seqlen_k=prefill_t,
                                    causal=True, window_size=(wl, wr))
         x = x + linear(y.reshape(T, -1), model.attn_proj[i])
-        x = x + linear(F.relu(linear(norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
+        x = x + linear(F.relu(linear(res_norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
     # No backout / final norm / lm_head: prefill only produces KV + smear seeds.
     return x_pre[gather_idx]
 
