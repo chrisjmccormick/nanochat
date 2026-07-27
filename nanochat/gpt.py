@@ -66,14 +66,6 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -386,6 +378,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         nl = self.config.n_layer
         nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
+        half = hd // 2 # rotary cache is (1, T, 1, half)
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -423,8 +416,12 @@ class GPT(nn.Module):
                 ve = F.embedding(idx, self.value_embeds[si]).view(B, T, nkv, hd).to(x.dtype)
                 g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))  # (B, T, n_kv_head), range (0, 3)
                 v = v + g.unsqueeze(-1) * ve
-            # Rotary embeddings (relative positional encoding), then QK norm
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            # Rotary embeddings (relative positional encoding)
+            q1, q2 = q[..., :half], q[..., half:]
+            k1, k2 = k[..., :half], k[..., half:]
+            q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
+            k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
+            # QK norm
             q, k = norm(q), norm(k)
             q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
             k = k * 1.2
@@ -471,6 +468,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         nl = self.config.n_layer
         nh, nkv, hd = self.config.n_head, self.config.n_kv_head, self.head_dim
+        half = hd // 2 # rotary cache is (1, T, 1, half)
 
         # Rotary embeddings, offset to the current position in the cache
         T0 = kv_cache.get_pos()
@@ -512,7 +510,12 @@ class GPT(nn.Module):
                 ve = F.embedding(idx, self.value_embeds[si]).view(B, T, nkv, hd).to(x.dtype)
                 g = 3 * torch.sigmoid(linear(xn[..., :self.ve_gate_channels], self.ve_gate[si]))
                 v = v + g.unsqueeze(-1) * ve
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            # Rotary embeddings (relative positional encoding)
+            q1, q2 = q[..., :half], q[..., half:]
+            k1, k2 = k[..., :half], k[..., half:]
+            q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
+            k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
+            # QK norm
             q, k = norm(q), norm(k)
             q = q * 1.2
             k = k * 1.2

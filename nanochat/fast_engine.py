@@ -55,7 +55,7 @@ _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_int
 flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
 _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
 
-from nanochat.gpt import norm, apply_rotary_emb, linear
+from nanochat.gpt import norm, linear
 
 PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
 
@@ -116,6 +116,7 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     cfg = model.config
     B = input_ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
+    half = head_dim // 2                          # rotary cache is (B,1,1,half)
 
     x = F.embedding(input_ids, model.wte)         # (B,1,C) bf16
     x = norm(x)
@@ -141,7 +142,11 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
             ve = F.embedding(input_ids, model.value_embeds[si]).view(B, 1, cfg.n_kv_head, head_dim).to(x.dtype)
             g = 3 * torch.sigmoid(linear(xn[..., :model.ve_gate_channels], model.ve_gate[si]))
             v = v + g.unsqueeze(-1) * ve
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        # Rotary embeddings (relative positional encoding)
+        q1, q2 = q[..., :half], q[..., half:]
+        k1, k2 = k[..., :half], k[..., half:]
+        q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
+        k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
         q, k = norm(q) * 1.2, norm(k) * 1.2
         wl, wr = model.window_sizes[i]
         y = fa_kvcache_paged(q, k_pool[i], v_pool[i], k, v, cache_seqlens, block_table, wl, wr)
@@ -171,6 +176,7 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     cfg = model.config
     T = ids.shape[0]
     head_dim = cfg.n_embd // cfg.n_head
+    half = head_dim // 2                          # rotary cache is (T,1,half)
 
     x = F.embedding(ids, model.wte)               # (T, C)
     x = norm(x)
@@ -179,8 +185,8 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, :24], model.smear_gate))
     x = x + (gate * notstart) * x_prev
 
-    cos = model.cos[0, :, 0][pos].unsqueeze(0).unsqueeze(2)   # (1,T,1,D/2)
-    sin = model.sin[0, :, 0][pos].unsqueeze(0).unsqueeze(2)
+    cos = model.cos[0, :, 0][pos].unsqueeze(1)   # (T,1,D/2), broadcasts over the head dim
+    sin = model.sin[0, :, 0][pos].unsqueeze(1)
 
     x0 = x
     for i in range(cfg.n_layer):
@@ -194,8 +200,11 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
             ve = F.embedding(ids, model.value_embeds[si]).view(T, cfg.n_kv_head, head_dim).to(x.dtype)
             g = 3 * torch.sigmoid(linear(xn[:, :model.ve_gate_channels], model.ve_gate[si]))
             v = v + g.unsqueeze(-1) * ve
-        q = apply_rotary_emb(q.unsqueeze(0), cos, sin)[0]
-        k = apply_rotary_emb(k.unsqueeze(0), cos, sin)[0]
+        # Rotary embeddings (relative positional encoding)
+        q1, q2 = q[..., :half], q[..., half:]
+        k1, k2 = k[..., :half], k[..., half:]
+        q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
+        k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
         q, k = norm(q) * 1.2, norm(k) * 1.2
         kv_scatter(k_flat[i], v_flat[i], slot_map, k, v)
         wl, wr = model.window_sizes[i]
