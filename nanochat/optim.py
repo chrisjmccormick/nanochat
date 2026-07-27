@@ -147,16 +147,15 @@ def muon_step_fused(
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    # The double cast is deliberate, to preserve the pre-refactor arithmetic exactly:
-    # the old kernel formed this weight in g.dtype (bf16 by this point, since the polar
-    # express runs in bf16), and lerp_ tolerated the dtype mismatch against the fp32
-    # buffer only because the weight was a 0-D tensor and took the scalar overload. A
-    # (1,) weight takes the Tensor overload, which requires the destination's dtype.
-    # NOTE the bf16 round-trip costs real precision here — 1-beta2 = 0.1 becomes
-    # 0.100098 — and looks incidental rather than intended. Worth revisiting on its
-    # own, separately from this refactor.
+    # This weight belongs in the BUFFER's dtype (fp32), not the polar express's bf16.
+    # The buffer and v_mean are both fp32; bf16 only ever reached this line because the
+    # old kernel hoisted `beta2 = beta2_t.to(g.dtype)` up top alongside the genuinely
+    # bf16 orthogonalization math and reused it here. That cost real precision, via
+    # catastrophic cancellation: it rounded beta2 FIRST, so 1 - bf16(0.9) = 0.1015625,
+    # 1.6% off. (Pre-computing 1-beta2 on the host and then rounding, as the tables do,
+    # already narrowed that to 0.0996094 — 0.4% off. This gets it exact.)
     second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype),
-                                 c.one_minus_beta2[i].to(g.dtype).to(second_momentum_buffer.dtype))
+                                 c.one_minus_beta2[i].to(second_momentum_buffer.dtype))
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
