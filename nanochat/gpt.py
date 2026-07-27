@@ -156,9 +156,9 @@ class GPT(nn.Module):
         ve_gate:             uniform in [0, 0.02] (slightly above neutral)
         resid_lambdas:       1.15 -> 1.05 linear decay over depth
         x0_lambdas:          0.20 -> 0.05 linear decay over depth
-        smear_gate:          uniform, nn.Linear default bound 1/sqrt(24)
+        smear_gate:          zeros
         smear_lambda:        zeros (smear disabled at init)
-        backout_lambda:      0.2
+        backout_lambda:      zeros (backout disabled at init)
         """
         n_layer, n_embd = self.config.n_layer, self.config.n_embd
 
@@ -189,12 +189,15 @@ class GPT(nn.Module):
             # earlier layers get more input embedding blending
             self.x0_lambdas[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Smear/backout scalars. (Previously these were only set in __init__, which runs
-        # under meta device in the standard build path, leaving them uninitialized
-        # after to_empty(); now they are properly initialized here with the rest.)
-        torch.nn.init.uniform_(self.smear_gate, -24**-0.5, 24**-0.5) # nn.Linear default bound
+        # Smear/backout scalars: zeros, matching what from-scratch runs have always
+        # actually trained with. The pre-flattening __init__ nominally set
+        # backout_lambda=0.2 and a kaiming smear_gate, but on the standard
+        # meta-device build path those inits never executed — to_empty() left
+        # freshly-allocated (driver-zeroed) storage, so the tuned baselines all
+        # started from zeros. Now it's explicit rather than luck.
+        torch.nn.init.zeros_(self.smear_gate)
         torch.nn.init.zeros_(self.smear_lambda)
-        self.backout_lambda.fill_(0.2)
+        torch.nn.init.zeros_(self.backout_lambda)
 
         # Rotary embeddings
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
