@@ -289,8 +289,26 @@ lrm = Ramp(peak=1.0, start=0.0, warmup_steps=args.warmup_steps,
            end=args.final_lr_frac, cooldown_frac=args.warmdown_ratio)
 # Muon's momentum warms up to 0.97 and comes back down to 0.90 during the LR
 # warmdown; its weight decay cosine-decays to zero over the whole run.
-muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=400,
-                     end=0.90, cooldown_frac=args.warmdown_ratio)
+#
+# EXPERIMENT: this schedule is the one place Ramp is not bit-exact with the
+# pre-refactor code. Its warmup used i/400 where every other schedule in the
+# codebase used (i+1)/W, and Ramp standardizes on the latter, so the momentum leads
+# by one step through the first 400. That is the only systematic difference between
+# the refactored optimizer and the old one, which makes it the prime suspect for the
+# ~+0.001 val-bpb offset the first d12 arm showed. Here it is restored to the legacy
+# values exactly, passed as an explicit per-step sequence (build_param_groups accepts
+# one), to measure what that one-step shift actually costs.
+_wd_iters = round(args.warmdown_ratio * num_iterations)
+_wd_start = num_iterations - _wd_iters
+def _legacy_muon_momentum(it):
+    if it < 400:
+        frac = it / 400
+        return (1 - frac) * 0.85 + frac * 0.97
+    elif it >= _wd_start:
+        progress = (it - _wd_start) / _wd_iters
+        return 0.97 * (1 - progress) + 0.90 * progress
+    return 0.97
+muon_momentum = [_legacy_muon_momentum(i) for i in range(num_iterations)]
 muon_wd = Ramp(peak=weight_decay_scaled, end=0.0, cooldown_frac=1.0, shape="cosine")
 
 pl = orig_model.named_parameter_lists()
