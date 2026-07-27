@@ -32,7 +32,8 @@ def adamw_step_fused(
     grad: Tensor,       # (32768, 768) - gradient, same shape as p
     exp_avg: Tensor,    # (32768, 768) - first moment, same shape as p
     exp_avg_sq: Tensor, # (32768, 768) - second moment, same shape as p
-    c: AdamWCoeffs,     # this step's update coefficients, as 0-D CPU tensors
+    c: AdamWCoeffs,     # this group's per-step coefficient TABLES, device-resident
+    i: Tensor,          # (1,) int64 device tensor - the schedule row to read
 ) -> None:
     """
     Fused AdamW step: weight_decay -> momentum_update -> param_update.
@@ -40,17 +41,21 @@ def adamw_step_fused(
 
     Both bias corrections and the LR schedule are already folded into `c` by
     nanochat/schedules.py, so no step count reaches this kernel and there is no
-    `beta ** t` to evaluate. The coefficients are tensors rather than Python
-    floats so that changing values never triggers a recompilation.
+    `beta ** t` to evaluate. The tables live on the device and `i` is a device
+    tensor, so each `c.<field>[i]` is a gather inside this graph: the step needs no
+    host-to-device copy and nothing from the host at all, which is what makes the
+    whole update CUDA-graph capturable. Indexing with a (1,)-shaped tensor (rather
+    than a 0-D one) keeps it a real gather that broadcasts, instead of something
+    dynamo tries to turn back into a Python scalar.
     """
     # Weight decay (decoupled, applied before the update): wd_mul = 1 - lr*wd
-    p.mul_(c.wd_mul)
+    p.mul_(c.wd_mul[i])
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, c.one_minus_beta1)
-    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2)
+    exp_avg.lerp_(grad, c.one_minus_beta1[i])
+    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[i])
     # Compute update and apply: rsqrt_bias2 = 1/sqrt(1-beta2^t), step_size = lr/(1-beta1^t)
-    denom = exp_avg_sq.sqrt() * c.rsqrt_bias2 + c.eps
-    p.sub_(c.step_size * (exp_avg / denom))
+    denom = exp_avg_sq.sqrt() * c.rsqrt_bias2[i] + c.eps[i]
+    p.sub_(c.step_size[i] * (exp_avg / denom))
 
 # -----------------------------------------------------------------------------
 """
@@ -97,7 +102,8 @@ def muon_step_fused(
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
     momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
     second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
-    c: MuonCoeffs,                  # this step's update coefficients, as 0-D CPU tensors
+    c: MuonCoeffs,                  # this group's per-step coefficient TABLES, device-resident
+    i: Tensor,                      # (1,) int64 device tensor - the schedule row to read
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
 ) -> None:
@@ -106,15 +112,16 @@ def muon_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
 
     The LR schedule, this group's sqrt(fan_out/fan_in) LR scaling, and the weight
-    decay are already folded into `c` by nanochat/schedules.py. The coefficients
-    are tensors rather than Python floats so that changing values never triggers a
-    recompilation; ns_steps/red_dim are Python ints and do specialize the graph.
+    decay are already folded into `c` by nanochat/schedules.py. The tables are
+    device-resident and `i` is a device tensor, so reading this step's row is a
+    gather inside this graph — no host involvement, no per-step H2D copy.
+    ns_steps/red_dim are Python ints and do specialize the graph.
     """
     dtype = stacked_grads.dtype
 
     # Nesterov momentum
-    momentum_buffer.lerp_(stacked_grads, c.one_minus_momentum.to(dtype))
-    g = stacked_grads.lerp_(momentum_buffer, c.momentum.to(dtype))
+    momentum_buffer.lerp_(stacked_grads, c.one_minus_momentum[i].to(dtype))
+    g = stacked_grads.lerp_(momentum_buffer, c.momentum[i].to(dtype))
 
     # Polar express
     X = g.bfloat16()
@@ -136,8 +143,16 @@ def muon_step_fused(
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
+    # The double cast is deliberate, to preserve the pre-refactor arithmetic exactly:
+    # the old kernel formed this weight in g.dtype (bf16 by this point, since the polar
+    # express runs in bf16), and lerp_ tolerated the dtype mismatch against the fp32
+    # buffer only because the weight was a 0-D tensor and took the scalar overload. A
+    # (1,) weight takes the Tensor overload, which requires the destination's dtype.
+    # NOTE the bf16 round-trip costs real precision here — 1-beta2 = 0.1 becomes
+    # 0.100098 — and looks incidental rather than intended. Worth revisiting on its
+    # own, separately from this refactor.
     second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype),
-                                 c.one_minus_beta2.to(g.dtype))
+                                 c.one_minus_beta2[i].to(g.dtype).to(second_momentum_buffer.dtype))
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -146,30 +161,40 @@ def muon_step_fused(
 
     # Cautious weight decay + parameter update: lr_wd = lr*wd
     mask = (g * stacked_params) >= 0
-    stacked_params.sub_(c.lr.to(g.dtype) * g + c.lr_wd.to(g.dtype) * stacked_params * mask)
+    stacked_params.sub_(c.lr[i].to(g.dtype) * g + c.lr_wd[i].to(g.dtype) * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
-# Shared base: the schedule index, and loading each step's coefficients.
+# Shared base: the device-resident schedule index.
 
 class _ScheduledOptimizer(torch.optim.Optimizer):
     """Common machinery for the four MuonAdamW variants.
 
     Param groups must come from schedules.build_param_groups() fully specified;
     there are no hyperparameter defaults to fall back on here. Each group carries
-    `tabs` (per-step coefficient tables) and `coeffs` (0-D tensors holding the
-    current step's row, which is what the fused kernels read).
+    `tabs`, its per-step coefficient tables, resident on the same device as its
+    parameters. The kernels index them with `_sched_t`, so a step touches the host
+    for nothing at all — no schedule arithmetic, no H2D scalar copies — and the
+    whole update can be captured in a CUDA graph.
 
-    The schedule index starts at 0 and advances once per step() — so it counts
-    updates actually applied, which is what you want if a GradScaler skips one.
-    It travels with checkpoints; the tables do not, since they are rebuilt from
-    the run's arguments each time.
+    Two step counters, deliberately:
+      - `_sched_t`, a (1,) int64 DEVICE tensor, is what the kernels index with. It
+        is incremented on device, so a captured graph advances the schedule itself
+        on replay.
+      - `_step_idx`, a host int, mirrors it for bounds checks, logging and
+        checkpoints. Reading the device counter instead would sync every step.
+    Keep them in step: everything that moves the schedule moves both.
+
+    The schedule advances once per step(), so it counts updates actually applied
+    (what you want if a GradScaler skips one). The position travels with
+    checkpoints; the tables do not, since a resume rebuilds them from the run's
+    arguments.
     """
 
     def __init__(self, param_groups: list[dict]):
         assert param_groups, "no parameter groups"
         for i, g in enumerate(param_groups):
             assert g.get("kind") in ("adamw", "muon"), f"group {i}: unknown kind {g.get('kind')!r}"
-            assert "tabs" in g and "coeffs" in g, (
+            assert "tabs" in g, (
                 f"group {i} is missing its schedules — param groups must be built by "
                 "nanochat.schedules.build_param_groups()")
         super().__init__(param_groups, defaults={})
@@ -177,13 +202,20 @@ class _ScheduledOptimizer(torch.optim.Optimizer):
         for i, g in enumerate(param_groups):
             assert all(len(t) == self._num_sched_steps for t in g["tabs"]), \
                 f"group {i}: schedule tables disagree on length"
+            dev = g["params"][0].device
+            assert all(t.device == dev for t in g["tabs"]), (
+                f"group {i}: schedule tables are on {g['tabs'][0].device} but its parameters "
+                f"are on {dev} — pass the right device to build_param_groups()")
+        device = param_groups[0]["params"][0].device
+        self._sched_t = torch.zeros(1, dtype=torch.int64, device=device)
         self._step_idx = 0
 
     # -- schedule position ----------------------------------------------------
 
     @property
     def schedule_step(self) -> int:
-        """How many updates have been applied / which row the next step will read."""
+        """How many updates have been applied / which row the next step will read.
+        Served from the host mirror, so reading it never syncs with the device."""
         return self._step_idx
 
     def set_schedule_step(self, i: int) -> None:
@@ -191,20 +223,18 @@ class _ScheduledOptimizer(torch.optim.Optimizer):
         Warm-starting into a fresh schedule (keeping the momentum buffers): pass 0."""
         assert 0 <= i <= self._num_sched_steps, f"step {i} outside the {self._num_sched_steps}-step schedule"
         self._step_idx = i
+        self._sched_t.fill_(i)
 
-    def _load_coeffs(self, group: dict) -> None:
-        """Copy this step's row of the group's tables into the 0-D tensors the
-        fused kernel reads. (Stage 2 replaces this with indexing device-resident
-        tables by a device-side counter; the kernels stay exactly as they are.)"""
-        i = self._step_idx
-        assert i < self._num_sched_steps, (
+    def _check_bounds(self) -> None:
+        """Host-side, before the kernels run: an out-of-range gather on device would
+        be a device-side assert (or worse, silently clamp) rather than this message."""
+        assert self._step_idx < self._num_sched_steps, (
             f"training ran past the end of the {self._num_sched_steps}-step schedule; "
             "build the param groups with the run's true step count")
-        for c, tab in zip(group["coeffs"], group["tabs"]):
-            c.fill_(tab[i])
 
     def _advance(self) -> None:
         # every group read row _step_idx during this step, so advance once, at the end
+        self._sched_t.add_(1)
         self._step_idx += 1
 
     # -- checkpointing --------------------------------------------------------
@@ -283,7 +313,7 @@ class MuonAdamW(_ScheduledOptimizer):
                 state["exp_avg_sq"] = torch.zeros_like(p)
 
             # Fused update: weight_decay -> momentum -> param_update
-            adamw_step_fused(p, p.grad, state["exp_avg"], state["exp_avg_sq"], group["coeffs"])
+            adamw_step_fused(p, p.grad, state["exp_avg"], state["exp_avg_sq"], group["tabs"], self._sched_t)
 
     def _step_muon(self, group: dict) -> None:
         """
@@ -322,7 +352,7 @@ class MuonAdamW(_ScheduledOptimizer):
             stacked_params,
             momentum_buffer,
             second_momentum_buffer,
-            group["coeffs"],
+            group["tabs"], self._sched_t,
             group["ns_steps"],
             red_dim,
         )
@@ -332,8 +362,8 @@ class MuonAdamW(_ScheduledOptimizer):
 
     @torch.no_grad()
     def step(self):
+        self._check_bounds()
         for group in self.param_groups:
-            self._load_coeffs(group)
             if group["kind"] == "adamw":
                 self._step_adamw(group)
             else:
@@ -459,7 +489,7 @@ class DistMuonAdamW(_ScheduledOptimizer):
                 state['exp_avg'] = torch.zeros_like(p_slice)
                 state['exp_avg_sq'] = torch.zeros_like(p_slice)
 
-            adamw_step_fused(p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'], group["coeffs"])
+            adamw_step_fused(p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'], group["tabs"], self._sched_t)
 
             # Large params need all_gather
             if not pinfo['is_small']:
@@ -497,7 +527,7 @@ class DistMuonAdamW(_ScheduledOptimizer):
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                group["coeffs"], group["ns_steps"], red_dim,
+                group["tabs"], self._sched_t, group["ns_steps"], red_dim,
             )
             updated_params[:num_owned].copy_(stacked_owned)
 
@@ -521,11 +551,11 @@ class DistMuonAdamW(_ScheduledOptimizer):
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        self._check_bounds()
 
         # Phase 1: launch all async reduce ops
         reduce_infos: list[dict] = []
         for group in self.param_groups:
-            self._load_coeffs(group)
             if group['kind'] == 'adamw':
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             else:
@@ -589,7 +619,7 @@ class Fp32MuonAdamW(_ScheduledOptimizer):
                 continue
             state = self.state[p]
             adamw_step_fused(state["master"], p.grad.float(),
-                             state["exp_avg"], state["exp_avg_sq"], group["coeffs"])
+                             state["exp_avg"], state["exp_avg_sq"], group["tabs"], self._sched_t)
             p.copy_(state["master"])   # bf16 writeback, same storage
 
     def _step_muon(self, group: dict) -> None:
@@ -603,15 +633,15 @@ class Fp32MuonAdamW(_ScheduledOptimizer):
         muon_step_fused(
             stacked_grads, state["master_stack"],
             state["momentum_buffer"], state["second_momentum_buffer"],
-            group["coeffs"], group["ns_steps"], red_dim,
+            group["tabs"], self._sched_t, group["ns_steps"], red_dim,
         )
         for p, m in zip(params, state["master_stack"].unbind(0)):
             p.copy_(m)                 # bf16 writeback, same storage
 
     @torch.no_grad()
     def step(self):
+        self._check_bounds()
         for group in self.param_groups:
-            self._load_coeffs(group)
             if group["kind"] == "adamw":
                 self._step_adamw(group)
             else:
@@ -703,7 +733,7 @@ class Fp32DistMuonAdamW(_ScheduledOptimizer):
                 rank_size = p.shape[0] // world_size
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size]
             adamw_step_fused(state["master"], pinfo["grad_slice"].float(),
-                             state["exp_avg"], state["exp_avg_sq"], group["coeffs"])
+                             state["exp_avg"], state["exp_avg_sq"], group["tabs"], self._sched_t)
             p_slice.copy_(state["master"])
             if not pinfo["is_small"]:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
@@ -724,7 +754,7 @@ class Fp32DistMuonAdamW(_ScheduledOptimizer):
             muon_step_fused(
                 info["grad_chunk"][:num_owned].float(), state["master_stack"],
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                group["coeffs"], group["ns_steps"], red_dim,
+                group["tabs"], self._sched_t, group["ns_steps"], red_dim,
             )
             updated[:num_owned].copy_(state["master_stack"])   # fp32 -> bf16
         if num_owned < chunk_size:
@@ -743,9 +773,9 @@ class Fp32DistMuonAdamW(_ScheduledOptimizer):
     @torch.no_grad()
     def step(self):
         rank, world_size = dist.get_rank(), dist.get_world_size()
+        self._check_bounds()
         reduce_infos = []
         for group in self.param_groups:
-            self._load_coeffs(group)
             if group["kind"] == "adamw":
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             else:

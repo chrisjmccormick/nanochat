@@ -18,15 +18,17 @@ lr/betas and doing the arithmetic in the kernel each step) buys three things:
 - The LR scale factors collapse into the tables at build time — 1/sqrt(dmodel)
   and sqrt(B/B_ref) for AdamW, sqrt(fan_out/fan_in) for Muon — instead of being
   applied in three different files.
-- Nothing about the schedule is left for the training loop to do per step, which
-  is what lets the whole optimizer step eventually become CUDA-graph capturable
-  (stage 2: the tables move to the device and are indexed by a device counter;
-  the kernels do not change).
+- Nothing about the schedule is left for the training loop to do per step. The
+  tables are device-resident and the optimizer's step counter is a device tensor,
+  so a step involves the host for nothing at all — no schedule arithmetic and no
+  H2D scalar copies — which is what makes the whole optimizer step capturable in
+  a CUDA graph.
 
 Usage: describe each scalar with a `Ramp` (or a bare float for a constant),
 collect them into `AdamWGroup`/`MuonGroup` specs, and hand those to
 `build_param_groups(specs, num_steps)` to get the param groups the optimizers in
-nanochat/optim.py consume.
+nanochat/optim.py consume. The tables land on the same device as each group's
+parameters, so build the groups AFTER the model is on the GPU.
 """
 
 import math
@@ -202,49 +204,49 @@ class MuonCoeffs(NamedTuple):
     lr_wd: Tensor               # lr * weight_decay   cautious decay
 
 
-def _tables(coeffs_cls, **fields):
-    """Package per-step numpy arrays as fp32 CPU tensors."""
-    return coeffs_cls(**{k: torch.tensor(v, dtype=torch.float32, device="cpu")
+def _tables(coeffs_cls, device, **fields):
+    """Package the per-step numpy arrays as fp32 tensors on `device`.
+
+    The tables live where the parameters live, so a step reads its coefficients
+    with a gather inside the fused kernel rather than a host-to-device copy — no
+    per-step H2D traffic, no host involvement, and the whole update is capturable
+    in a CUDA graph."""
+    return coeffs_cls(**{k: torch.tensor(v, dtype=torch.float32, device=device)
                          for k, v in fields.items()})
-
-
-def _scalars(coeffs_cls):
-    """The 0-D CPU tensors the optimizer refills each step and hands to the kernel.
-    Allocated once per group, mutated in place, so pointers stay stable."""
-    return coeffs_cls(**{f: torch.zeros((), dtype=torch.float32, device="cpu")
-                         for f in coeffs_cls._fields})
 
 
 # -----------------------------------------------------------------------------
 # Build
 
-def build_param_groups(specs: list, num_steps: int) -> list[dict]:
+def build_param_groups(specs: list, num_steps: int, device=None) -> list[dict]:
     """Turn schedule specs into the param groups nanochat/optim.py consumes.
 
-    Each returned group carries `tabs` (per-step coefficient tables, N rows) and
-    `coeffs` (the 0-D tensors the optimizer refills from `tabs` each step). It
-    carries no lr/betas/weight_decay: those exist only as folded coefficients.
+    Each returned group carries `tabs`: the per-step coefficient tables, N rows,
+    resident on `device` (default: wherever the group's parameters already live).
+    A group carries no lr/betas/weight_decay — those exist only as folded
+    coefficients, indexed each step by the optimizer's device-side step counter.
     """
     assert num_steps > 0, "the run's step count must be known before the optimizer is built"
     groups = []
     for spec in specs:
         assert len(spec.params) > 0, f"empty parameter group: {type(spec).__name__}"
+        dev = spec.params[0].device if device is None else device
         if isinstance(spec, AdamWGroup):
-            groups.append(_build_adamw(spec, num_steps))
+            groups.append(_build_adamw(spec, num_steps, dev))
         elif isinstance(spec, MuonGroup):
-            groups.append(_build_muon(spec, num_steps))
+            groups.append(_build_muon(spec, num_steps, dev))
         else:
             raise TypeError(f"expected AdamWGroup or MuonGroup, got {type(spec).__name__}")
     return groups
 
 
-def _build_adamw(spec: AdamWGroup, N: int) -> dict:
+def _build_adamw(spec: AdamWGroup, N: int, device) -> dict:
     lr = _as_table(spec.lr, N, "lr")
     beta1 = _as_table(spec.betas[0], N, "beta1")
     beta2 = _as_table(spec.betas[1], N, "beta2")
     wd = _as_table(spec.weight_decay, N, "weight_decay")
     tabs = _tables(
-        AdamWCoeffs,
+        AdamWCoeffs, device,
         wd_mul=1.0 - lr * wd,
         one_minus_beta1=1.0 - beta1,
         one_minus_beta2=1.0 - beta2,
@@ -252,11 +254,10 @@ def _build_adamw(spec: AdamWGroup, N: int) -> dict:
         step_size=lr / _bias_correction(beta1),
         eps=np.full(N, float(spec.eps)),
     )
-    return dict(kind="adamw", params=list(spec.params),
-                tabs=tabs, coeffs=_scalars(AdamWCoeffs), lr_table=lr)
+    return dict(kind="adamw", params=list(spec.params), tabs=tabs, lr_table=lr)
 
 
-def _build_muon(spec: MuonGroup, N: int) -> dict:
+def _build_muon(spec: MuonGroup, N: int, device) -> dict:
     params = list(spec.params)
     shape = params[0].shape
     assert all(p.shape == shape for p in params), \
@@ -268,7 +269,7 @@ def _build_muon(spec: MuonGroup, N: int) -> dict:
     beta2 = _as_table(spec.beta2, N, "beta2")
     wd = _as_table(spec.weight_decay, N, "weight_decay")
     tabs = _tables(
-        MuonCoeffs,
+        MuonCoeffs, device,
         momentum=momentum,
         one_minus_momentum=1.0 - momentum,
         one_minus_beta2=1.0 - beta2,
@@ -276,4 +277,4 @@ def _build_muon(spec: MuonGroup, N: int) -> dict:
         lr_wd=lr * wd,
     )
     return dict(kind="muon", params=params, ns_steps=spec.ns_steps,
-                tabs=tabs, coeffs=_scalars(MuonCoeffs), lr_table=lr)
+                tabs=tabs, lr_table=lr)
