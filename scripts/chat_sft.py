@@ -344,17 +344,6 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
-# Pre-compute the full run's schedules as device-resident tables (the python
-# functions above remain for logging only). The SFT schedule starts at index 0
-# even when the optimizer was warm-started from the pretrain checkpoint — the
-# warm-start load positions the counter at the pretrain step, so reset it here.
-# (The update count for AdamW bias correction keeps the pretrain continuity.)
-optimizer.set_schedules(
-    lr_mult=[get_lr_multiplier(it) for it in range(num_iterations)],
-    muon_momentum=[get_muon_momentum(it) for it in range(num_iterations)],
-)
-optimizer.set_sched_step(0)
-
 # -----------------------------------------------------------------------------
 # Training loop
 x, y, cu_seqlens = next(train_loader) # prefetch the very first batch of data
@@ -467,8 +456,13 @@ while True:
         else:
             loss.backward()
         x, y, cu_seqlens = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer (lr/momentum come from its pre-computed device tables)
-    lrm = get_lr_multiplier(step) # host mirror, for logging only
+    # step the optimizer
+    lrm = get_lr_multiplier(step)
+    muon_momentum = get_muon_momentum(step)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
     if scaler is not None:
         scaler.unscale_(optimizer)
         if is_ddp_initialized():

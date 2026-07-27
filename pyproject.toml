@@ -63,6 +63,9 @@ cpu = [
 ]
 gpu = [
     "torch==2.9.1",
+    # fast_engine deps: VMM KV pool (cuda.bindings) + load_inline C++ ext build
+    "cuda-python>=12.6",
+    "ninja>=1.11",
 ]
 
 [tool.uv]
