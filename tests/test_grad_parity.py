@@ -188,6 +188,37 @@ def test_grad_parity_fp32_sdpa_d12():
         gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA = saved
 
 
+@pytest.mark.skipif(DEVICE != "cuda", reason="compile tier needs a GPU")
+def test_compiled_forward_backward_matches_eager():
+    """The shipping config compiles forward_backward (fullgraph). The compiled
+    graph must (a) trace with zero breaks from a COLD start, and (b) reproduce
+    eager's grads. Run in fp32 + naive attention so inductor's reduction
+    reordering sits at ~1e-5 and anything structural (the compiled CE branch is
+    separate CODE from the eager in-place twin) shows up unmistakably."""
+    saved = (gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA)
+    try:
+        gpt_mod.COMPUTE_DTYPE = torch.float32
+        fa_mod._override_impl = "sdpa"
+        fa_mod.USE_FA = fa_mod._resolve_use_fa()
+        model = build_model(depth=4, model_dim=256, n_head=2, seq_len=512,
+                            window_pattern="SL", device="cuda", vocab=4096)
+        perturb(model)
+        idx, targets, cu = make_batch(4096, 2048, 512, "cuda")
+        init_grad_buffers(model, dtype=torch.float32)
+        loss_e = forward_backward(model, idx, targets, cu, loss_scale=1.0)
+        eager = {n: p.grad32.clone() for n, p in model.named_parameters()}
+        zero_grad32(model)
+        fb = torch.compile(forward_backward, dynamic=False, fullgraph=True)
+        loss_c = fb(model, idx, targets, cu, loss_scale=1.0)
+        assert abs(loss_c.item() - loss_e.item()) / abs(loss_e.item()) < 1e-6
+        for name, p in model.named_parameters():
+            r = rel_err(p.grad32, eager[name])
+            assert r < 1e-4, (name, r)
+    finally:
+        gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA = saved
+        torch._dynamo.reset()
+
+
 @pytest.mark.skipif(DEVICE != "cuda" or fa_mod.FA_VERSION != "fa3",
                     reason="integration tier needs the FA3 GPU path")
 def test_grad_parity_integration_d12():
