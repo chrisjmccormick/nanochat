@@ -25,13 +25,20 @@ Design ledger (see agent-ops nanochat/2026-07-28_0449pm_handwritten-fwd-bwd/PLAN
   loop; the returned loss is the plain (unscaled) mean CE for logging.
 """
 
+from typing import NamedTuple
+from types import SimpleNamespace
+
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch import Tensor
 
 # Read via the gpt module so the parity tests' COMPUTE_DTYPE monkeypatch (fp64
 # tier) applies to GPT.forward and this file in one place.
 from nanochat import gpt as gpt_mod
 from nanochat.flash_attention import flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd
+from nanochat.optim import polar_express_coeffs
+from nanochat.schedules import Ramp, MuonCoeffs, _as_table, _bias_correction, _tables
 
 
 # -----------------------------------------------------------------------------
@@ -264,3 +271,458 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     model.wte.grad32.index_add_(0, idx, d_emb.to(g32))
 
     return loss
+
+
+# =============================================================================
+# Explicit optimizer flow (no torch.optim, no param groups)
+#
+# State attaches to each Parameter: .grad32 (above), plus per-verb state
+# (.mantissa always; .momentum/.second_momentum for Muon; .exp_avg/.exp_avg_sq
+# for AdamW) — sharded params carry shard-size state. Policy (schedule tables,
+# per-bank multipliers, ns_steps) appears at call sites in the written-out
+# optimizer_step, not as attributes.
+#
+# Masters use the mantissa trick (Larry Dial via modded-nanogpt train_gpt.py):
+# the fp32 master's bit pattern is (live_bf16_bits << 16) | mantissa_uint16.
+# Update math runs in fp32 on the reconstructed master; the split back is a
+# TRUNCATION (load-bearing: round-to-nearest could carry into the top bits and
+# break the lossless live/mantissa pairing).
+# =============================================================================
+
+# The bit arithmetic runs in int32 (CUDA has no uint32 shifts as of torch 2.9);
+# int32's truncating .to(int16) and the <<16 discard of sign-extension bits make
+# it equivalent. Mantissa tensors are STORED uint16, viewed int16 for the math.
+
+def _master(live: Tensor, mantissa: Tensor) -> Tensor:
+    """Reconstruct the fp32 master from bf16 live bits + stashed mantissa."""
+    bits = (live.view(torch.int16).to(torch.int32) << 16) | \
+           (mantissa.view(torch.int16).to(torch.int32) & 0xFFFF)
+    return bits.view(torch.float32)
+
+
+def _writeback(master: Tensor, live: Tensor, mantissa: Tensor) -> None:
+    """Truncation split of the updated master back into live + mantissa."""
+    bits = master.view(torch.int32)
+    live.view(torch.int16).copy_((bits >> 16).to(torch.int16))
+    mantissa.view(torch.int16).copy_(bits.to(torch.int16))
+
+
+class AdamWTabs(NamedTuple):
+    """schedules.AdamWCoeffs minus the eps field — eps is never scheduled, so it
+    rides as a plain kernel argument instead of an (N,) table."""
+    wd_mul: Tensor           # 1 - lr*wd             decoupled weight decay
+    one_minus_beta1: Tensor  # 1 - beta1             exp_avg lerp weight
+    one_minus_beta2: Tensor  # 1 - beta2             exp_avg_sq lerp weight
+    rsqrt_bias2: Tensor      # 1/sqrt(bias2)         second-moment bias correction
+    step_size: Tensor        # lr / bias1            lr schedule x first-moment bias correction
+
+
+# -----------------------------------------------------------------------------
+# Fused update kernels (ported from nanochat/optim.py, two changes each:
+# mantissa reconstruct/writeback replaces the fp32 param read/write, and Muon
+# takes per-slice (K,1,1) lr/wd multipliers so bank merging later needs no
+# kernel change).
+
+@torch.compile(dynamic=False, fullgraph=True)
+def adamw_step_fused(
+    live: Tensor,        # bf16 live shard
+    mantissa: Tensor,    # uint16, same shape
+    grad: Tensor,        # fp32 gradient shard
+    exp_avg: Tensor,     # fp32 first moment
+    exp_avg_sq: Tensor,  # fp32 second moment
+    c: AdamWTabs,        # per-step coefficient tables, device-resident
+    t: Tensor,           # (1,) int64 device tensor - the schedule row to read
+    eps: float,
+) -> None:
+    """Fused AdamW step on the reconstructed master. Same folded-coefficient
+    scheme as optim.adamw_step_fused (see there for why the gather-by-t makes
+    the step host-free); moments are always fp32 here, so the lerp weights need
+    no dtype casts."""
+    p = _master(live, mantissa)
+    p.mul_(c.wd_mul[t])
+    exp_avg.lerp_(grad, c.one_minus_beta1[t])
+    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[t])
+    denom = exp_avg_sq.sqrt() * c.rsqrt_bias2[t] + eps
+    p.sub_(c.step_size[t] * (exp_avg / denom))
+    _writeback(p, live, mantissa)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused(
+    grad: Tensor,                   # (K, out, in) fp32 gradient shard — MUTATED (nesterov lerp)
+    live: Tensor,                   # (K, out, in) bf16 live shard
+    mantissa: Tensor,               # (K, out, in) uint16
+    momentum_buffer: Tensor,        # (K, out, in) fp32
+    second_momentum_buffer: Tensor, # (K, out, 1) or (K, 1, in) fp32 - factored second moment
+    c: MuonCoeffs,                  # per-step coefficient tables, device-resident (UNfolded lr)
+    t: Tensor,                      # (1,) int64 device tensor - the schedule row to read
+    ns_steps: int,                  # 5 - number of Polar Express iterations
+    red_dim: int,                   # -1 or -2 - reduction dimension for variance
+    lr_mul: Tensor,                 # (K, 1, 1) fp32 per-slice LR multiplier (aspect scale today)
+    wd_mul: Tensor,                 # (K, 1, 1) fp32 per-slice WD multiplier
+) -> None:
+    """Fused Muon step: momentum -> polar_express -> variance_reduction ->
+    cautious update on the reconstructed master. The sqrt(fan_out/fan_in)
+    aspect scale is NOT in `c` — it arrives through lr_mul/wd_mul, per slice."""
+    dtype = grad.dtype
+
+    # Nesterov momentum
+    momentum_buffer.lerp_(grad, c.one_minus_momentum[t].to(dtype))
+    g = grad.lerp_(momentum_buffer, c.momentum[t].to(dtype))
+
+    # Polar express
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1): # Tall matrix
+        for a, b, c_ns in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c_ns * (A @ A)
+            X = a * X + X @ B
+    else: # Wide matrix (original math)
+        for a, b, c_ns in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c_ns * (A @ A)
+            X = a * X + B @ X
+    g = X
+
+    # Variance reduction (NorMuon). The lerp weight stays fp32 — see the long
+    # dtype note in optim.muon_step_fused.
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype),
+                                 c.one_minus_beta2[t].to(second_momentum_buffer.dtype))
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + master update + truncation split back to live
+    p = _master(live, mantissa)
+    mask = (g * p) >= 0
+    lr = (c.lr[t] * lr_mul).to(g.dtype)
+    lr_wd = (c.lr_wd[t] * wd_mul).to(g.dtype)
+    p.sub_(lr * g + lr_wd * p * mask)
+    _writeback(p, live, mantissa)
+
+
+# -----------------------------------------------------------------------------
+# Schedules: pure policy bundles -> one namespace of named, device-resident
+# table sets. Folding math is schedules.py's, verbatim; the packaging differs
+# (no params in the specs, device passed explicitly, and the Muon aspect scale
+# deliberately NOT baked into the shared matrix table).
+
+def _adamw_tabs(lr, betas, weight_decay, num_steps, device) -> AdamWTabs:
+    N = num_steps
+    lr = _as_table(lr, N, "lr")
+    beta1 = _as_table(betas[0], N, "beta1")
+    beta2 = _as_table(betas[1], N, "beta2")
+    wd = _as_table(weight_decay, N, "weight_decay")
+    return _tables(
+        AdamWTabs, device,
+        wd_mul=1.0 - lr * wd,
+        one_minus_beta1=1.0 - beta1,
+        one_minus_beta2=1.0 - beta2,
+        rsqrt_bias2=1.0 / (_bias_correction(beta2) ** 0.5),
+        step_size=lr / _bias_correction(beta1),
+    )
+
+
+def _muon_tabs(lr, momentum, beta2, weight_decay, num_steps, device) -> MuonCoeffs:
+    N = num_steps
+    lr = _as_table(lr, N, "lr")   # canonical: NO per-shape fold (see bank_muls)
+    momentum = _as_table(momentum, N, "momentum")
+    beta2 = _as_table(beta2, N, "beta2")
+    wd = _as_table(weight_decay, N, "weight_decay")
+    return _tables(
+        MuonCoeffs, device,
+        momentum=momentum,
+        one_minus_momentum=1.0 - momentum,
+        one_minus_beta2=1.0 - beta2,
+        lr=lr,
+        lr_wd=lr * wd,
+    )
+
+
+def build_schedules(model_dim, num_iterations, device,
+                    embedding_lr=0.3, unembedding_lr=0.008, matrix_lr=0.02,
+                    scalar_lr=0.5, weight_decay=0.28, batch_lr_scale=1.0,
+                    warmup_steps=40, warmdown_ratio=0.65, final_lr_frac=0.05):
+    """Named table sets with EXACTLY the hyperparameters of the old base_train
+    spec block. `weight_decay` arrives already batch/horizon-scaled. Returns a
+    namespace: .matrix (shared MuonCoeffs) + one AdamWTabs per AdamW role,
+    .adamw_eps, and .num_steps."""
+    dmodel_lr_scale = (model_dim / 768) ** -0.5     # AdamW LRs tuned at d12's 768
+    adamw_lr_scale = batch_lr_scale * dmodel_lr_scale
+
+    # One LR shape for the whole run (linear warmup, constant, linear warmdown),
+    # scaled to each role's own peak. Muon momentum warms to 0.97 then cools to
+    # 0.90 during the LR warmdown; its weight decay cosine-decays to zero.
+    lrm = Ramp(peak=1.0, start=0.0, warmup_steps=warmup_steps,
+               end=final_lr_frac, cooldown_frac=warmdown_ratio)
+    muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=400,
+                         end=0.90, cooldown_frac=warmdown_ratio)
+    muon_wd = Ramp(peak=weight_decay, end=0.0, cooldown_frac=1.0, shape="cosine")
+
+    N, dev = num_iterations, device
+    return SimpleNamespace(
+        matrix       = _muon_tabs(lrm * (matrix_lr * batch_lr_scale), muon_momentum, 0.9, muon_wd, N, dev),
+        lm_head      = _adamw_tabs(lrm * (unembedding_lr * adamw_lr_scale),     (0.8, 0.96),  0.01,  N, dev),
+        wte          = _adamw_tabs(lrm * (embedding_lr * adamw_lr_scale),       (0.8, 0.995), 0.001, N, dev),
+        value_embeds = _adamw_tabs(lrm * (embedding_lr * adamw_lr_scale * 0.5), (0.8, 0.995), 0.01,  N, dev),
+        resid        = _adamw_tabs(lrm * (scalar_lr * batch_lr_scale * 0.01),   (0.8, 0.95),  0.05,  N, dev),
+        x0           = _adamw_tabs(lrm * (scalar_lr * batch_lr_scale),          (0.96, 0.95), 0.0,   N, dev),
+        smear        = _adamw_tabs(lrm * 0.2,                                   (0.8, 0.95),  0.0,   N, dev),
+        adamw_eps    = 1e-10,
+        lrm_table    = lrm.materialize(num_iterations),  # host-side copy, for logging only
+        num_steps    = N,
+    )
+
+
+def bank_muls(model, ns_steps=5):
+    """Per-bank Muon call-site policy: the (K,1,1) per-slice lr/wd multipliers
+    and NorMuon reduction dim. Today every slice of a bank is uniform, so each
+    multiplier is just the bank's sqrt(max(1, fan_out/fan_in)) aspect scale —
+    the Muon tall-matrix LR correction, kept OUT of the shared matrix table.
+    Merged banks later change these lines, not the kernels."""
+    def policy(bank):
+        aspect = max(1.0, bank.shape[-2] / bank.shape[-1]) ** 0.5
+        mul = torch.full((bank.shape[0], 1, 1), aspect, dtype=torch.float32, device=bank.device)
+        red_dim = -1 if bank.shape[-2] >= bank.shape[-1] else -2
+        return dict(lr_mul=mul, wd_mul=mul, ns_steps=ns_steps, red_dim=red_dim)
+    return {
+        "c_q":       policy(model.c_q),        # aspect 1.0, tall
+        "c_k":       policy(model.c_k),        # aspect 1.0, tall
+        "c_v":       policy(model.c_v),        # aspect 1.0, tall
+        "attn_proj": policy(model.attn_proj),  # aspect 1.0, tall
+        "mlp_fc":    policy(model.mlp_fc),     # aspect 2.0, tall
+        "mlp_proj":  policy(model.mlp_proj),   # aspect 1.0, wide
+        "ve_gate":   policy(model.ve_gate),    # aspect 1.0, wide
+    }
+
+
+# -----------------------------------------------------------------------------
+# Optimizer state: attach to Parameters, masters split in place.
+
+def _dist_info():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size(), dist.get_rank()
+    return 1, 0
+
+
+def _split_master(p):
+    """Split p into bf16 live (swapped into p.data in place — Parameter identity
+    preserved) + this rank's uint16 mantissa shard. Params initialized bf16
+    (the embeddings) upcast to a master with zero mantissa — already lossless."""
+    master = p.detach().float()
+    bits = master.view(torch.int32)
+    p.data = (bits >> 16).to(torch.int16).view(torch.bfloat16)
+    return bits.to(torch.int16).view(torch.uint16)
+
+
+def _muon_shard(p, world, rank):
+    """dim-0 chunk owned by this rank (zero-padded chunking: ceil(K/world))."""
+    K = p.shape[0]
+    chunk = -(-K // world)
+    start = rank * chunk
+    return slice(start, min(K, start + chunk))
+
+
+@torch.no_grad()
+def init_optimizer_state(model, ddp_rank=0, ddp_world_size=1):
+    """Attach everything the explicit step needs. Call AFTER the model is on its
+    device (never move it afterwards — state tensors don't follow .to())."""
+    world, rank = ddp_world_size, ddp_rank
+    init_grad_buffers(model)
+    # Muon sharded banks: shard-size fp32 momentum + factored second momentum
+    for p in (model.c_q, model.c_k, model.c_v, model.attn_proj, model.mlp_fc, model.mlp_proj):
+        mant = _split_master(p)
+        sl = _muon_shard(p, world, rank)
+        shard = p[sl]
+        p.mantissa = mant[sl].clone() if world > 1 else mant
+        p.momentum = torch.zeros_like(shard, dtype=torch.float32)
+        so = (shard.shape[0], p.shape[-2], 1) if p.shape[-2] >= p.shape[-1] else (shard.shape[0], 1, p.shape[-1])
+        p.second_momentum = torch.zeros(so, dtype=torch.float32, device=p.device)
+    # Muon replicated (tiny/ragged): full-size state, every rank updates it all
+    p = model.ve_gate
+    p.mantissa = _split_master(p)
+    p.momentum = torch.zeros_like(p, dtype=torch.float32)
+    p.second_momentum = torch.zeros(p.shape[0], 1, p.shape[-1], dtype=torch.float32, device=p.device)
+    # AdamW sharded (row-shard over dim 0 of the (rows, cols) view)
+    for p in (model.lm_head, model.wte, model.value_embeds):
+        mant = _split_master(p)
+        rows = p.data.view(-1, p.shape[-1])
+        assert rows.shape[0] % world == 0, f"AdamW row-sharding needs rows % world == 0 ({rows.shape[0]} % {world})"
+        rs = rows.shape[0] // world
+        sl = slice(rank * rs, (rank + 1) * rs)
+        p.mantissa = mant.view(-1, p.shape[-1])[sl].clone() if world > 1 else mant
+        state_shape = p.shape if world == 1 else rows[sl].shape  # world=1: kernel runs on the natural shape
+        p.exp_avg = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
+        p.exp_avg_sq = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
+    # AdamW replicated (scalars)
+    for p in (model.resid_lambdas, model.x0_lambdas, model.smear_gate,
+              model.smear_lambda, model.backout_lambda):
+        p.mantissa = _split_master(p)
+        p.exp_avg = torch.zeros_like(p, dtype=torch.float32)
+        p.exp_avg_sq = torch.zeros_like(p, dtype=torch.float32)
+
+
+def make_step_counter(device):
+    """THE schedule position: one (1,) int64 device tensor, owned by the trainer,
+    advanced on-device at the end of optimizer_step (host never syncs on it)."""
+    return torch.zeros(1, dtype=torch.int64, device=device)
+
+
+# -----------------------------------------------------------------------------
+# The four verbs. Each is reduce (phase 1, async launch) + update (phase 2,
+# wait -> owned-shard update -> async gather). world=1 short-circuits every
+# comm and the shard IS the whole tensor — same code path, degenerate.
+# NOTE: only exercised at world=1 on this box; world>1 is structured per the
+# plan but untested until an 8-GPU validation pass.
+
+def muon_sharded_reduce(p, world):
+    if world == 1:
+        return p.grad32
+    K = p.shape[0]
+    chunk = -(-K // world)
+    padded = torch.zeros(chunk * world, *p.shape[1:], dtype=torch.float32, device=p.device)
+    padded[:K].copy_(p.grad32)
+    shard = torch.empty(chunk, *p.shape[1:], dtype=torch.float32, device=p.device)
+    work = dist.reduce_scatter_tensor(shard, padded, op=dist.ReduceOp.AVG, async_op=True)
+    return (work, shard)
+
+
+def muon_sharded_update(p, red, tabs, mul, t, world, rank, gathers):
+    if world == 1:
+        muon_step_fused(red, p, p.mantissa, p.momentum, p.second_momentum,
+                        tabs, t, mul["ns_steps"], mul["red_dim"], mul["lr_mul"], mul["wd_mul"])
+        return
+    work, shard = red
+    work.wait()
+    sl = _muon_shard(p, world, rank)
+    owned = sl.stop - sl.start
+    if owned > 0:
+        muon_step_fused(shard[:owned], p[sl], p.mantissa[:owned], p.momentum[:owned],
+                        p.second_momentum[:owned], tabs, t, mul["ns_steps"], mul["red_dim"],
+                        mul["lr_mul"][sl], mul["wd_mul"][sl])
+    src = torch.zeros(shard.shape, dtype=p.dtype, device=p.device)  # zero-pad the ragged tail
+    if owned > 0:
+        src[:owned].copy_(p[sl])
+    buf = torch.empty(shard.shape[0] * world, *p.shape[1:], dtype=p.dtype, device=p.device)
+    work = dist.all_gather_into_tensor(buf, src, async_op=True)
+    gathers.append((work, buf, p, p.shape[0]))
+
+
+def muon_replicated_update(p, tabs, mul, t, world):
+    """all_reduce the grad, every rank runs the same full-size update."""
+    if world > 1:
+        dist.all_reduce(p.grad32, op=dist.ReduceOp.AVG)
+    muon_step_fused(p.grad32, p, p.mantissa, p.momentum, p.second_momentum,
+                    tabs, t, mul["ns_steps"], mul["red_dim"], mul["lr_mul"], mul["wd_mul"])
+
+
+def adamw_sharded_reduce(p, world):
+    if world == 1:
+        return p.grad32
+    g = p.grad32.view(-1, p.shape[-1])
+    rs = g.shape[0] // world
+    shard = torch.empty(rs, g.shape[-1], dtype=torch.float32, device=p.device)
+    work = dist.reduce_scatter_tensor(shard, g, op=dist.ReduceOp.AVG, async_op=True)
+    return (work, shard)
+
+
+def adamw_sharded_update(p, red, tabs, eps, t, world, rank, gathers):
+    if world == 1:
+        adamw_step_fused(p, p.mantissa, red, p.exp_avg, p.exp_avg_sq, tabs, t, eps)
+        return
+    work, shard = red
+    work.wait()
+    rows = p.data.view(-1, p.shape[-1])
+    rs = rows.shape[0] // world
+    live = rows[rank * rs:(rank + 1) * rs]
+    adamw_step_fused(live, p.mantissa, shard, p.exp_avg, p.exp_avg_sq, tabs, t, eps)
+    work = dist.all_gather_into_tensor(rows, live, async_op=True)
+    gathers.append((work, None, None, None))
+
+
+def adamw_replicated_update(p, tabs, eps, t, world):
+    if world > 1:
+        dist.all_reduce(p.grad32, op=dist.ReduceOp.AVG)
+    adamw_step_fused(p, p.mantissa, p.grad32, p.exp_avg, p.exp_avg_sq, tabs, t, eps)
+
+
+# -----------------------------------------------------------------------------
+# The written-out step.
+
+def optimizer_step(model, sched, muls, t):
+    """One explicit optimizer step, written out per named tensor. 3-phase: launch
+    every async reduce; then in launch order wait -> update owned shard -> launch
+    gather; then wait all gathers. Ends by advancing the device step counter.
+    Reads p.grad32 (Muon MUTATES it — nesterov lerp); caller zeroes afterwards."""
+    world, rank = _dist_info()
+    m, eps = model, sched.adamw_eps
+
+    # Phase 1: launch all gradient reductions (world=1: plain grad32 views)
+    r_cq = muon_sharded_reduce(m.c_q, world)
+    r_ck = muon_sharded_reduce(m.c_k, world)
+    r_cv = muon_sharded_reduce(m.c_v, world)
+    r_ap = muon_sharded_reduce(m.attn_proj, world)
+    r_fc = muon_sharded_reduce(m.mlp_fc, world)
+    r_mp = muon_sharded_reduce(m.mlp_proj, world)
+    r_lm = adamw_sharded_reduce(m.lm_head, world)
+    r_wt = adamw_sharded_reduce(m.wte, world)
+    r_ve = adamw_sharded_reduce(m.value_embeds, world)
+
+    # Phase 2: wait -> update -> launch gather, in launch order (earlier gathers
+    # overlap later updates). Replicated params ride along here, all_reduce inline.
+    gathers = []
+    muon_sharded_update(m.c_q, r_cq, sched.matrix, muls["c_q"], t, world, rank, gathers)
+    muon_sharded_update(m.c_k, r_ck, sched.matrix, muls["c_k"], t, world, rank, gathers)
+    muon_sharded_update(m.c_v, r_cv, sched.matrix, muls["c_v"], t, world, rank, gathers)
+    muon_sharded_update(m.attn_proj, r_ap, sched.matrix, muls["attn_proj"], t, world, rank, gathers)
+    muon_sharded_update(m.mlp_fc, r_fc, sched.matrix, muls["mlp_fc"], t, world, rank, gathers)
+    muon_sharded_update(m.mlp_proj, r_mp, sched.matrix, muls["mlp_proj"], t, world, rank, gathers)
+    muon_replicated_update(m.ve_gate, sched.matrix, muls["ve_gate"], t, world)
+    adamw_sharded_update(m.lm_head, r_lm, sched.lm_head, eps, t, world, rank, gathers)
+    adamw_sharded_update(m.wte, r_wt, sched.wte, eps, t, world, rank, gathers)
+    adamw_sharded_update(m.value_embeds, r_ve, sched.value_embeds, eps, t, world, rank, gathers)
+    adamw_replicated_update(m.resid_lambdas, sched.resid, eps, t, world)
+    adamw_replicated_update(m.x0_lambdas, sched.x0, eps, t, world)
+    adamw_replicated_update(m.smear_gate, sched.smear, eps, t, world)
+    adamw_replicated_update(m.smear_lambda, sched.smear, eps, t, world)
+    adamw_replicated_update(m.backout_lambda, sched.smear, eps, t, world)
+
+    # Phase 3: wait gathers, copy padded Muon banks back
+    for work, buf, p, K in gathers:
+        work.wait()
+        if p is not None:
+            p.copy_(buf[:K])
+
+    t.add_(1)  # advance the schedule on-device
+
+
+# -----------------------------------------------------------------------------
+# Optimizer checkpointing: walk named params, collect the known attribute names.
+# Saved per rank (state is shard-sized at world>1) via save_checkpoint's
+# existing rank plumbing. Old (torch.optim) states don't port; fresh runs only.
+
+# grad32 deliberately not saved: checkpoints happen after step+zero, so it's zeros
+_STATE_ATTRS = ("mantissa", "momentum", "second_momentum", "exp_avg", "exp_avg_sq")
+
+def optim_state_dict(model):
+    out = {}
+    for name, p in model.named_parameters():
+        for attr in _STATE_ATTRS:
+            if hasattr(p, attr):
+                out[f"{name}.{attr}"] = getattr(p, attr)
+    return out
+
+
+def load_optim_state(model, sd):
+    """Into an already init_optimizer_state()'d model (shapes must match)."""
+    for name, p in model.named_parameters():
+        for attr in _STATE_ATTRS:
+            if hasattr(p, attr):
+                getattr(p, attr).copy_(sd[f"{name}.{attr}"].to(p.device))
