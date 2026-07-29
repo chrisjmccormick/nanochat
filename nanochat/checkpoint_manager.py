@@ -50,6 +50,25 @@ def _remap_legacy_keys(model_data):
             remapped[k] = v  # scalars etc. keep their names
     return remapped
 
+_BANKED_ROLES = ("c_q", "c_k", "c_v", "attn_proj", "mlp_fc", "mlp_proj", "value_embeds", "ve_gate")
+_PER_LAYER_KEY = re.compile(rf"^({'|'.join(_BANKED_ROLES)})\.(\d+)$")
+
+def _stack_legacy_banks(model_data):
+    """Stack pre-bank per-layer keys (c_q.0 ... c_q.11, value_embeds.3, ...) into
+    the banked single-tensor layout. For value_embeds/ve_gate the numeric suffix
+    is the LAYER index; ascending layer order matches the model's ve_index slot
+    order. New-format (banked) checkpoints pass through untouched."""
+    if not any(_PER_LAYER_KEY.match(k) for k in model_data):
+        return model_data
+    log0("Stacking legacy per-layer checkpoint keys into parameter banks")
+    stacked = {k: v for k, v in model_data.items() if not _PER_LAYER_KEY.match(k)}
+    for role in _BANKED_ROLES:
+        keys = sorted((k for k in model_data if re.match(rf"^{role}\.\d+$", k)),
+                      key=lambda k: int(k.rsplit(".", 1)[1]))
+        if keys:
+            stacked[role] = torch.stack([model_data[k] for k in keys])
+    return stacked
+
 def _patch_missing_config_keys(model_config_kwargs):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were trained with full context (no sliding window)
@@ -123,7 +142,9 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     # Support checkpoints saved before the model flattening (e.g. the HF base ckpts)
+    # and before the parameter banking (per-layer keys -> stacked banks)
     model_data = _remap_legacy_keys(model_data)
+    model_data = _stack_legacy_banks(model_data)
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")

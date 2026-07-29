@@ -55,8 +55,6 @@ _fa2i = _fa2 if hasattr(_fa2, "flash_attn_varlen_func") else _fa2.flash_attn_int
 flash_attn_varlen_func = _fa2i.flash_attn_varlen_func
 _fa_kvcache_raw = _fa2i.flash_attn_with_kvcache
 
-from nanochat.gpt import linear
-
 PAGE = 256  # KV page size (tokens); FA2 paged KV requires a multiple of 256
 
 
@@ -124,7 +122,7 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     x = F.embedding(input_ids, model.wte)         # (B,1,C) bf16
     x = res_norm(x)
     x_pre = x[:, 0]                               # post-norm, PRE-smear
-    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[..., :24], model.smear_gate))
+    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(x[..., :24] @ model.smear_gate.to(x.dtype).mT)
     x = x + gate * prev_emb.unsqueeze(1)
 
     positions = cache_seqlens.to(torch.long)      # (B,)
@@ -137,13 +135,13 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
     for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
         xn = res_norm(x)
-        q = linear(xn, model.c_q[i]).view(B, 1, cfg.n_head, head_dim)
-        k = linear(xn, model.c_k[i]).view(B, 1, cfg.n_kv_head, head_dim)
-        v = linear(xn, model.c_v[i]).view(B, 1, cfg.n_kv_head, head_dim)
-        si = str(i)
-        if si in model.ve_gate:
-            ve = F.embedding(input_ids, model.value_embeds[si]).view(B, 1, cfg.n_kv_head, head_dim).to(x.dtype)
-            g = 3 * torch.sigmoid(linear(xn[..., :model.ve_gate_channels], model.ve_gate[si]))
+        q = (xn @ model.c_q[i].to(x.dtype).mT).view(B, 1, cfg.n_head, head_dim)
+        k = (xn @ model.c_k[i].to(x.dtype).mT).view(B, 1, cfg.n_kv_head, head_dim)
+        v = (xn @ model.c_v[i].to(x.dtype).mT).view(B, 1, cfg.n_kv_head, head_dim)
+        j = model.ve_index[i]
+        if j >= 0:
+            ve = F.embedding(input_ids, model.value_embeds[j]).view(B, 1, cfg.n_kv_head, head_dim).to(x.dtype)
+            g = 3 * torch.sigmoid(xn[..., :model.ve_gate_channels] @ model.ve_gate[j].to(x.dtype).mT)
             v = v + g.unsqueeze(-1) * ve
         # Rotary embeddings (relative positional encoding)
         q1, q2 = q[..., :half], q[..., half:]
@@ -153,15 +151,15 @@ def decode_body(model, input_ids, cache_seqlens, block_table, k_pool, v_pool, pr
         q, k = qk_norm(q) * 1.2, qk_norm(k) * 1.2
         wl, wr = model.window_sizes[i]
         y = fa_kvcache_paged(q, k_pool[i], v_pool[i], k, v, cache_seqlens, block_table, wl, wr)
-        x = x + linear(y.view(B, 1, -1), model.attn_proj[i])
-        x = x + linear(F.relu(linear(res_norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
+        x = x + y.view(B, 1, -1) @ model.attn_proj[i].to(x.dtype).mT
+        x = x + F.relu(res_norm(x) @ model.mlp_fc[i].to(x.dtype).mT).square() @ model.mlp_proj[i].to(x.dtype).mT
         if i == backout_layer:
             x_backout = x
     x = x - model.backout_lambda.to(x.dtype) * x_backout
     x = res_norm(x)
 
     softcap = 15
-    logits = linear(x[:, -1, :], model.lm_head)
+    logits = x[:, -1, :] @ model.lm_head.to(x.dtype).mT
     logits = logits[..., :cfg.vocab_size].float()
     logits = softcap * torch.tanh(logits / softcap)
     return logits, x_pre
@@ -188,7 +186,7 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     x = res_norm(x)
     x_pre = x
     x_prev = torch.cat([x[:1], x[:-1]], dim=0)
-    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(linear(x[:, :24], model.smear_gate))
+    gate = model.smear_lambda.to(x.dtype) * torch.sigmoid(x[:, :24] @ model.smear_gate.to(x.dtype).mT)
     x = x + (gate * notstart) * x_prev
 
     cos = model.cos[0, :, 0][pos].unsqueeze(1)   # (T,1,D/2), broadcasts over the head dim
@@ -198,13 +196,13 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
     for i in range(cfg.n_layer):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
         xn = res_norm(x)
-        q = linear(xn, model.c_q[i]).view(T, cfg.n_head, head_dim)
-        k = linear(xn, model.c_k[i]).view(T, cfg.n_kv_head, head_dim)
-        v = linear(xn, model.c_v[i]).view(T, cfg.n_kv_head, head_dim)
-        si = str(i)
-        if si in model.ve_gate:
-            ve = F.embedding(ids, model.value_embeds[si]).view(T, cfg.n_kv_head, head_dim).to(x.dtype)
-            g = 3 * torch.sigmoid(linear(xn[:, :model.ve_gate_channels], model.ve_gate[si]))
+        q = (xn @ model.c_q[i].to(x.dtype).mT).view(T, cfg.n_head, head_dim)
+        k = (xn @ model.c_k[i].to(x.dtype).mT).view(T, cfg.n_kv_head, head_dim)
+        v = (xn @ model.c_v[i].to(x.dtype).mT).view(T, cfg.n_kv_head, head_dim)
+        j = model.ve_index[i]
+        if j >= 0:
+            ve = F.embedding(ids, model.value_embeds[j]).view(T, cfg.n_kv_head, head_dim).to(x.dtype)
+            g = 3 * torch.sigmoid(xn[:, :model.ve_gate_channels] @ model.ve_gate[j].to(x.dtype).mT)
             v = v + g.unsqueeze(-1) * ve
         # Rotary embeddings (relative positional encoding)
         q1, q2 = q[..., :half], q[..., half:]
@@ -217,8 +215,8 @@ def prefill_body(model, ids, pos, cu_seqlens, slot_map, notstart, gather_idx, k_
         y = flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                                    max_seqlen_q=prefill_t, max_seqlen_k=prefill_t,
                                    causal=True, window_size=(wl, wr))
-        x = x + linear(y.reshape(T, -1), model.attn_proj[i])
-        x = x + linear(F.relu(linear(res_norm(x), model.mlp_fc[i])).square(), model.mlp_proj[i])
+        x = x + y.reshape(T, -1) @ model.attn_proj[i].to(x.dtype).mT
+        x = x + F.relu(res_norm(x) @ model.mlp_fc[i].to(x.dtype).mT).square() @ model.mlp_proj[i].to(x.dtype).mT
     # No backout / final norm / lm_head: prefill only produces KV + smear seeds.
     return x_pre[gather_idx]
 

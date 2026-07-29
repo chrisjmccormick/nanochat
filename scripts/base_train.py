@@ -165,21 +165,10 @@ if resuming:
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
-# FP8 training (this has to be done before torch.compile)
-
-# Route eligible matmuls in gpt.linear through torch._scaled_mm if --fp8 is set.
-# The flattened GPT has no Linear modules to swap; FP8 is a dispatch inside
-# nanochat.gpt.linear gated on the nanochat.fp8 module flag (see nanochat/fp8.py).
+# FP8 training: PARKED on the fwd-bwd branch. The old hook point (nanochat.gpt.linear)
+# no longer exists — fp8 returns as its own handwritten body (forward_backward_fp8).
 if args.fp8:
-    if device_type != "cuda" or torch.cuda.get_device_capability() < (8, 9):
-        print0("Warning: FP8 training requires an sm89+ CUDA GPU (H100/Ada), ignoring --fp8 flag")
-    else:
-        from nanochat.fp8 import enable_fp8_training, eligible
-        enable_fp8_training()
-        matmul_weights = model.matrix_parameters() + [model.lm_head]
-        num_fp8 = sum(1 for w in matmul_weights if eligible(w))
-        num_skipped = len(matmul_weights) - num_fp8
-        print0(f"✓ FP8 training enabled (tensorwise scaling) - {num_fp8}/{len(matmul_weights)} matmul weights eligible, skipped {num_skipped} (too small)")
+    raise NotImplementedError("--fp8 is parked on the fwd-bwd branch; it comes back as forward_backward_fp8")
 
 # -----------------------------------------------------------------------------
 # Compile the model
