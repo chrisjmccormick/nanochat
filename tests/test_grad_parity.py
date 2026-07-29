@@ -111,6 +111,16 @@ def test_rms_r_matches_aten():
         d = (y.double() - y_manual.double()).abs().max().item()
         scale = y.double().abs().max().item()
         assert d / scale < tol[dtype], f"rms r mismatch for {dtype}: {d/scale:.3e}"
+    # Pin the eps CHOICE where the candidates actually separate: at mean(x^2)
+    # ~1e-8, the kernel's divisor with fp32(-upcast) eps reconstructs y exactly,
+    # while bf16's own eps (7.8e-3) is ~100% off and eps=0 is ~250% off.
+    # (Verified against the CUDA kernel 2026-07-29; guards the _rms_fwd default.)
+    x = (torch.randn(1024, 128, dtype=torch.float64, device=DEVICE) * 1e-4).bfloat16()
+    y, r = _rms_fwd(x, 128)
+    y_manual = (x.float() * r).bfloat16()
+    d = (y.double() - y_manual.double()).abs().max().item()
+    scale = y.double().abs().max().item()
+    assert d / scale < 1e-2, f"rms eps choice no longer matches the kernel: {d/scale:.3e}"
 
 
 def test_grad_parity_exact_fp64(fp64_sdpa):

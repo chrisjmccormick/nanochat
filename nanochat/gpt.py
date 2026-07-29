@@ -148,22 +148,35 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.lm_head, mean=0.0, std=0.001)
 
         # Matrix banks: uniform init with bound = sqrt(3) * std (same standard deviation
-        # as normal), drawn over the whole bank in one call (iteration-order independent).
+        # as normal). The slices are drawn PER LAYER in the pre-bank iteration order,
+        # NOT as one whole-bank call: with the same seed this reproduces the old
+        # per-layer model's weights bit-for-bit, so training curves stay directly
+        # comparable across the flattening. (uniform_ on a contiguous slice view
+        # draws exactly what a standalone tensor of that shape would.)
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        torch.nn.init.uniform_(self.c_q, -s, s) # weights use Uniform to avoid outliers
-        torch.nn.init.uniform_(self.c_k, -s, s)
-        torch.nn.init.uniform_(self.c_v, -s, s)
-        torch.nn.init.zeros_(self.attn_proj) # projections are zero
-        torch.nn.init.uniform_(self.mlp_fc, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+        for i in range(n_layer):
+            torch.nn.init.uniform_(self.c_q[i], -s, s) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(self.c_k[i], -s, s)
+            torch.nn.init.uniform_(self.c_v[i], -s, s)
+            torch.nn.init.uniform_(self.mlp_fc[i], -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+        torch.nn.init.zeros_(self.attn_proj) # projections are zero (no RNG consumed)
         torch.nn.init.zeros_(self.mlp_proj)
 
-        # Value embeddings (init like c_v: uniform with same std) and their gates
-        torch.nn.init.uniform_(self.value_embeds, -s, s)
-        torch.nn.init.uniform_(self.ve_gate, 0.0, 0.02) # small positive so gates start slightly above neutral
+        # Value embeddings (init like c_v: uniform with same std) and their gates.
+        # Draw order follows the old ParameterDict's iteration: string keys in
+        # SORTED order ('1','11','3',...), not ascending layers — again so the
+        # same seed reproduces the pre-bank weights exactly.
+        for layer in sorted(self.ve_layers, key=str):
+            torch.nn.init.uniform_(self.value_embeds[self.ve_index[layer]], -s, s)
+        for layer in sorted(self.ve_layers, key=str):
+            torch.nn.init.uniform_(self.ve_gate[self.ve_index[layer]], 0.0, 0.02) # small positive so gates start slightly above neutral
 
-        # Per-layer scalars: stronger residual / more x0 blending at early layers
-        self.resid_lambdas.copy_(torch.linspace(1.15, 1.05, n_layer))
-        self.x0_lambdas.copy_(torch.linspace(0.20, 0.05, n_layer))
+        # Per-layer scalars (per-element Python-float math, matching the old init's rounding)
+        for i in range(n_layer):
+            # stronger residual at early layers, weaker at deep layers
+            self.resid_lambdas[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+            # earlier layers get more input embedding blending
+            self.x0_lambdas[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
         # Smear/backout scalars: zeros, matching what from-scratch runs have always
         # actually trained with. The pre-flattening __init__ nominally set
