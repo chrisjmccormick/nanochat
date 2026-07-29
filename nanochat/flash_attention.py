@@ -318,6 +318,25 @@ def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens, max_seqlen, window_size):
     return out, None
 
 
+_RAW_BWD_TAKES_BUFFERS = None  # probed lazily from the op schema (build-dependent)
+
+
+def _raw_bwd_takes_buffers():
+    """The two FA3 builds' raw backward ops differ: the sm80 community build's
+    schema takes pre-allocated dq/dk/dv buffers (grads come back through them),
+    the sm90 varunneal build's does not (C++ allocates and returns them).
+    Probe the actual op schema once so one call site serves both boxes."""
+    global _RAW_BWD_TAKES_BUFFERS
+    if _RAW_BWD_TAKES_BUFFERS is None:
+        try:
+            schema = _fa._flash_attn_backward._opoverload._schema
+            _RAW_BWD_TAKES_BUFFERS = any(a.name == "dq" for a in schema.arguments)
+        except AttributeError:
+            # last resort: the buffer-taking build is the sm80 one
+            _RAW_BWD_TAKES_BUFFERS = torch.cuda.get_device_capability()[0] == 8
+    return _RAW_BWD_TAKES_BUFFERS
+
+
 def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqlen,
                           window_size, deterministic=False):
     """Attention backward for flash_attn_varlen_fwd_lse: (dq, dk, dv), with
@@ -325,20 +344,34 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
     little speed for reproducible dq atomics — use it in parity runs."""
     if _use_raw_fa3(q):
         softmax_scale = q.shape[-1] ** (-0.5)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _fa._flash_attn_backward(
-            dout, q, k, v, out, softmax_lse,
-            cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
-            None, None,                 # seqused_q, seqused_k
-            max_seqlen, max_seqlen,
-            dq, dk, dv,
-            softmax_scale,
-            True,                       # is_causal
-            window_size[0], window_size[1],
-            0.0,                        # softcap
-            deterministic,
-            0,                          # sm_margin
-        )
+        if _raw_bwd_takes_buffers():
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+            _fa._flash_attn_backward(
+                dout, q, k, v, out, softmax_lse,
+                cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
+                None, None,                 # seqused_q, seqused_k
+                max_seqlen, max_seqlen,
+                dq, dk, dv,
+                softmax_scale,
+                True,                       # is_causal
+                window_size[0], window_size[1],
+                0.0,                        # softcap
+                deterministic,
+                0,                          # sm_margin
+            )
+        else:
+            dq, dk, dv, _ = _fa._flash_attn_backward(
+                dout, q, k, v, out, softmax_lse,
+                cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
+                None, None,                 # seqused_q, seqused_k
+                max_seqlen, max_seqlen,
+                softmax_scale,
+                True,                       # is_causal
+                window_size[0], window_size[1],
+                0.0,                        # softcap
+                deterministic,
+                0,                          # sm_margin
+            )
         return dq[..., :q.shape[-1]], dk[..., :k.shape[-1]], dv[..., :v.shape[-1]]
     # Naive path: recompute probabilities, standard attention backward.
     T, H, D = q.shape
