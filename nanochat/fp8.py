@@ -57,11 +57,22 @@ internally, calls _scaled_mm, and returns full-precision outputs. Marked
 to trace inside. Both this and torchao call the exact same cuBLAS _scaled_mm
 kernel — the GPU matmul is identical; only the "glue" ops (amax, scale, cast)
 sit outside Inductor's fusion reach here, and those are tiny next to the matmul.
+
+Two consumers, one recipe
+=========================
+The autograd path above (gpt.linear -> fp8_linear) is what tutorials/flat_train.py
+and scripts/base_train-flat.py still use. The fwd-bwd trainer has no linear() to
+hook: train_step.forward_backward_fp8 writes the three GEMMs out itself at every
+site, so it consumes the SECOND half of this file — the same tensorwise recipe
+(same amax, same float64 division, same e4m3/e5m2 split, same fast_accum policy)
+exposed as traceable pieces instead of one opaque autograd.Function.
 """
 
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
+from torch import Tensor
 
 from nanochat.common import COMPUTE_DTYPE
 
@@ -222,3 +233,110 @@ def fp8_linear(x, w):
     x_2d = x.reshape(-1, orig_shape[-1])
     output = _Float8Matmul.apply(x_2d, w)
     return output.reshape(*orig_shape[:-1], output.shape[-1])
+
+
+# =============================================================================
+# Primitives for the handwritten path (train_step.forward_backward_fp8)
+#
+# forward_backward_fp8 writes out the three GEMMs of each "linear" itself, at 21
+# sites, so it needs _Float8Matmul's pieces separately — and TRACEABLE (no
+# autograd.Function, no allow_in_graph), so inductor can fuse each amax/cast
+# into its neighbouring pointwise work. torch.compile is not optional for that
+# body: in eager every cast materializes an fp32 temp the size of its input.
+#
+# All three GEMMs are written in "NT" form,  C[M,N] = A[M,K] @ B[N,K].T, because
+# the cuBLAS FP8 kernels only accept operands whose CONTRACTION dim is contiguous
+# (equivalently: _scaled_mm wants mat1 row-major and mat2 column-major):
+#
+#   forward   y[T,out]   = x[T,in]    @ w[out,in].T     A=x   (K=in)   B=w   (K=in)
+#   dgrad     dx[T,in]   = dy[T,out]  @ wT[in,out].T    A=dy  (K=out)  B=wT  (K=out)
+#   wgrad     dw[out,in] = dyT[out,T] @ xT[in,T].T      A=dyT (K=T)    B=xT  (K=T)
+#
+# Read down the A/B columns: each tensor is needed in exactly two layouts — once
+# with its own last dim as K (row() below), once with its FIRST dim as K (col(),
+# a real transposing copy). Those copies are the tax tensorwise FP8 pays for the
+# backward pass; TransformerEngine calls the same thing a "transpose cache".
+# =============================================================================
+
+E4M3 = torch.float8_e4m3fn   # activations and weights: more mantissa bits
+E5M2 = torch.float8_e5m2     # gradients: wider exponent range
+
+
+class F8(NamedTuple):
+    """One quantized GEMM operand: fp8 data whose contraction dim is last and
+    contiguous, plus the inverse scale _scaled_mm multiplies back in."""
+    d: Tensor
+    inv: Tensor
+
+
+def tensor_scale(x, fp8_dtype):
+    """Tensorwise dynamic scale for x — one 0-dim fp32 device scalar, no host
+    sync. abs()/amax() run in x's own dtype: both are exact in any float format,
+    so this is bit-identical to _to_fp8's `.float().abs().max()` without
+    materializing an fp32 copy of x in eager. The division upcasts to float64
+    exactly like torchao's, which is what keeps compile and eager agreeing."""
+    amax = x.abs().amax()
+    return (torch.finfo(fp8_dtype).max / amax.double().clamp(min=EPS)).float()
+
+
+def slice_scales(bank, fp8_dtype):
+    """Per-slice scales for a (K, out, in) parameter bank as ONE batched
+    reduction -> (K,) fp32. Same granularity as the old per-layer Float8Linear
+    (one scale per matrix), but one kernel launch instead of K."""
+    amax = bank.abs().amax(dim=(-2, -1))
+    return (torch.finfo(fp8_dtype).max / amax.double().clamp(min=EPS)).float()
+
+
+def _cast(x, fp8_dtype, scale):
+    """Scale into FP8 range, saturate (the cast itself wraps, it does not
+    saturate), then narrow. _Float8Matmul's _to_fp8, minus the amax."""
+    fp8_max = torch.finfo(fp8_dtype).max
+    return (x.float() * scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+
+def row(x, fp8_dtype, scale) -> F8:
+    """Quantize x as it lies: the GEMM contracts over x's LAST dim."""
+    return F8(_cast(x, fp8_dtype, scale), scale.reciprocal())
+
+
+def col(x, fp8_dtype, scale) -> F8:
+    """Quantize x.T: the GEMM contracts over x's FIRST dim. The .t().contiguous()
+    is a real fp8 copy in eager; under inductor it fuses into the cast, making it
+    one transposing pass over x. (Casting the `x.mT` view instead does NOT work:
+    TensorIterator propagates the transposed strides, so the result comes back
+    K-strided and _scaled_mm rejects it.)"""
+    return F8(_cast(x, fp8_dtype, scale).t().contiguous(), scale.reciprocal())
+
+
+def mm(a: F8, b: F8, out_dtype, fast_accum=False):
+    """C[M,N] = a[M,K] @ b[N,K].T through the cuBLAS FP8 kernel. fast_accum keeps
+    the dot-product accumulation in lower precision — standard for the forward,
+    off in the backward, exactly as in _Float8Matmul above."""
+    # Cheap insurance, and it makes CPU tests representative: the CPU _scaled_mm
+    # accepts any layout, the CUDA one requires this.
+    assert a.d.stride(-1) == 1 and b.d.stride(-1) == 1, \
+        "FP8 GEMM operands must be K-contiguous — build them with row()/col()"
+    return torch._scaled_mm(a.d, b.d.t(), scale_a=a.inv, scale_b=b.inv,
+                            out_dtype=out_dtype, use_fast_accum=fast_accum)
+
+
+def check_eligible(model):
+    """forward_backward_fp8 quantizes a FIXED set of sites, so eligibility is a
+    precondition rather than a per-site dispatch (a mixed body would need a bf16
+    twin of every site, i.e. the thing the separate fp8 body exists to avoid).
+    Raises if any site can't run FP8 at this config. Returns a one-line summary."""
+    sites = [("c_q", model.c_q[0]), ("c_k", model.c_k[0]), ("c_v", model.c_v[0]),
+             ("attn_proj", model.attn_proj[0]), ("mlp_fc", model.mlp_fc[0]),
+             ("mlp_proj", model.mlp_proj[0]), ("lm_head", model.lm_head)]
+    bad = [f"{n}{tuple(w.shape)}" for n, w in sites if not eligible(w)]
+    if bad:
+        raise ValueError(
+            f"--fp8 needs every matrix bank + lm_head to be FP8-eligible (dims %16, "
+            f"min dim >= 128); ineligible at this config: {', '.join(bad)}")
+    V, Vp = model.config.vocab_size, model.padded_vocab_size
+    if V % 16 or Vp % 16:
+        raise ValueError(f"--fp8 needs vocab_size and padded_vocab_size divisible "
+                         f"by 16 (the lm_head backward contracts over V): {V}, {Vp}")
+    return (f"FP8: {len(sites)} matmul roles quantized per bank slice "
+            f"(e4m3 activations/weights, e5m2 grads, tensorwise); "
+            f"attention/norms/CE/embeddings stay {COMPUTE_DTYPE}")

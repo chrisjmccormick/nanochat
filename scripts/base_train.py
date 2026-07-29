@@ -26,9 +26,10 @@ import wandb
 import torch
 import torch.distributed as dist
 
+from nanochat import fp8
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.train_step import (forward_backward, init_optimizer_state, zero_grad32,
-                                 build_schedules, bank_muls, make_step_counter,
+from nanochat.train_step import (forward_backward, forward_backward_fp8, init_optimizer_state,
+                                 zero_grad32, build_schedules, bank_muls, make_step_counter,
                                  optimizer_step, optim_state_dict, load_optim_state)
 from nanochat.dataloader import tokenizing_distributed_data_loader_varlen
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
@@ -49,7 +50,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--compile-fwdbwd", action="store_true", help="torch.compile the handwritten forward_backward (run eager first; this is the perf pass)")
 parser.add_argument("--cudagraphs", action="store_true", help="PARKED on the fwd-bwd branch")
-parser.add_argument("--fp8", action="store_true", help="PARKED on the fwd-bwd branch")
+parser.add_argument("--fp8", action="store_true", help="run the matrix-bank + lm_head GEMMs in FP8 (requires sm89+ and --compile-fwdbwd)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -168,11 +169,8 @@ if resuming:
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
-# Parked flags. FP8's old hook point (nanochat.gpt.linear) no longer exists — it
-# returns as its own handwritten body (forward_backward_fp8). Cudagraphs made
-# sense wrapping autograd; they come back (if at all) around forward_backward.
-if args.fp8:
-    raise NotImplementedError("--fp8 is parked on the fwd-bwd branch; it comes back as forward_backward_fp8")
+# Cudagraphs stays parked: it made sense wrapping autograd; it comes back (if at
+# all) around forward_backward.
 if args.cudagraphs:
     raise NotImplementedError("--cudagraphs is parked on the fwd-bwd branch")
 
@@ -180,15 +178,26 @@ if args.cudagraphs:
 assert device_type == "cuda" and COMPUTE_DTYPE == torch.bfloat16, \
     "the fwd-bwd trainer requires CUDA + bf16 (mantissa-paired masters)"
 
+# FP8: swap in the fp8 twin of the handwritten body (the old hook point,
+# nanochat.gpt.linear, no longer exists — the GEMMs are written out now).
+# Evals are unaffected: they run GPT.forward, which never had an fp8 path here.
+if args.fp8:
+    if torch.cuda.get_device_capability() < (8, 9):
+        raise NotImplementedError(f"--fp8 requires an sm89+ GPU (H100/Ada), this is sm{''.join(map(str, torch.cuda.get_device_capability()))}")
+    if not args.compile_fwdbwd:
+        raise NotImplementedError("--fp8 requires --compile-fwdbwd: the quantize/cast glue only pays "
+                                  "off fused into its neighbours (eager materializes an fp32 temp per cast)")
+    print0(f"✓ {fp8.check_eligible(model)}")
+
 # -----------------------------------------------------------------------------
 # The model is NOT wrapped in torch.compile: training runs the handwritten
 # forward_backward (optionally compiled itself), and eval uses eager forward().
 orig_model = model
-train_step_fn = forward_backward
+train_step_fn = forward_backward_fp8 if args.fp8 else forward_backward
 if args.compile_fwdbwd:
     # fullgraph so any graph break errors loudly instead of silently fragmenting
     # fusion (the FA3 raw ops have fake impls, so a full trace is achievable)
-    train_step_fn = torch.compile(forward_backward, dynamic=False, fullgraph=True)
+    train_step_fn = torch.compile(train_step_fn, dynamic=False, fullgraph=True)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
