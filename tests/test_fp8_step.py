@@ -23,6 +23,7 @@ Run: python -m pytest tests/test_fp8_step.py -v -s
 """
 import os
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -56,6 +57,21 @@ pytestmark = pytest.mark.skipif(
 
 def cos_sim(a, b):
     return F.cosine_similarity(a.double().flatten(), b.double().flatten(), dim=0).item()
+
+
+@contextmanager
+def compute_dtype(dtype):
+    """Run at a chosen COMPUTE_DTYPE with the SDPA/naive attention. Models must
+    be BUILT inside it (init_weights casts the embeddings). On CPU this is what
+    already happens, so the CPU tier and the GPU tier measure the same thing."""
+    saved = (gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA)
+    gpt_mod.COMPUTE_DTYPE = dtype
+    fa_mod._override_impl = "sdpa"
+    fa_mod.USE_FA = fa_mod._resolve_use_fa()
+    try:
+        yield
+    finally:
+        gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA = saved
 
 
 # -----------------------------------------------------------------------------
@@ -172,19 +188,25 @@ def test_fp8_vs_bf16_forward_backward():
     params (resid/x0/backout lambdas) sit on cancellation-heavy sums and are
     bounded loosely here, exactly as in the bf16 integration tier.
 
-    Observed (CPU, fp32 COMPUTE_DTYPE, so this is FP8's error alone): loss 3e-6,
-    matrix banks 8-12e-2 with cosine 0.993-0.997, embeddings ~3e-2. That ~10%
-    per-step gradient noise is what tensorwise FP8 costs — e5m2's 2 mantissa bits
-    dominate it — and it is the same noise the old fp8_linear path trained
-    through; the run, not this test, is what judges whether it converges."""
-    model = _tiny_model()
-    idx, targets, cu = make_batch(256, 256, 128, DEVICE)
-    init_grad_buffers(model, dtype=torch.float32)   # fp32 everywhere: isolate FP8's own error
+    Deliberately run at fp32 COMPUTE_DTYPE so this measures FP8's error ALONE.
+    In bf16 the comparison is meaningless for the scalar params: measured against
+    an fp32 reference, the bf16 body's own x0_lambdas gradient is already 2.9e-1
+    off and the fp8 body's is 1.5e-1 — i.e. FP8 lands CLOSER, which is what pure
+    noise looks like (agent-ops diag_fp8_noise.log).
 
-    loss_ref = forward_backward(model, idx, targets, cu, loss_scale=1.0)
-    ref = {n: p.grad32.clone() for n, p in model.named_parameters()}
-    zero_grad32(model)
-    loss_8 = forward_backward_fp8(model, idx, targets, cu, loss_scale=1.0)
+    Observed: loss 3e-6, matrix banks 8-12e-2 with cosine 0.993-0.997,
+    embeddings ~3e-2. That ~10% per-step gradient noise is what tensorwise FP8
+    costs — e5m2's 2 mantissa bits dominate it — and it is the same noise the old
+    fp8_linear path trained through; the run, not this test, judges convergence."""
+    with compute_dtype(torch.float32):
+        model = _tiny_model()
+        idx, targets, cu = make_batch(256, 256, 128, DEVICE)
+        init_grad_buffers(model, dtype=torch.float32)
+
+        loss_ref = forward_backward(model, idx, targets, cu, loss_scale=1.0)
+        ref = {n: p.grad32.clone() for n, p in model.named_parameters()}
+        zero_grad32(model)
+        loss_8 = forward_backward_fp8(model, idx, targets, cu, loss_scale=1.0)
 
     d_loss = abs(loss_8.item() - loss_ref.item()) / abs(loss_ref.item())
     print(f"\n  loss bf16 {loss_ref.item():.6f} | fp8 {loss_8.item():.6f} (rel {d_loss:.2e})")
@@ -243,35 +265,57 @@ def test_fp8_traces_fullgraph():
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="compile tier needs a GPU")
-def test_compiled_fp8_matches_eager():
-    """The shipping config is --fp8 --compile-fwdbwd (fullgraph). The compiled
-    body must trace with zero breaks from a COLD start and reproduce eager's
-    grads: the fp8 GEMMs are the same cuBLAS calls either way, so what is being
-    checked is that inductor's fusion of the cast/amax glue — and the separate
-    compiled CE branch — change nothing beyond reduction-order noise. fp32
-    COMPUTE_DTYPE keeps that noise at ~1e-5 so anything structural is obvious."""
-    saved = (gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA)
+def test_compiled_fp8_is_the_same_body():
+    """The shipping config is --fp8 --compile-fwdbwd (fullgraph), so the compiled
+    body must trace from a COLD start and be the same computation.
+
+    "Compiled == eager to 1e-4" — the bf16 body's tier — is the WRONG assertion
+    here. An e4m3 bucket is 1/8 wide, so any roundoff-level difference between
+    the two modes flips a few elements across a boundary and comes back
+    amplified: measured at this config, compiled-vs-eager is 1.5e-2 for the bf16
+    body and 5-9e-2 for the fp8 body — the same ~6x FP8 applies to everything it
+    is handed (agent-ops diag_fp8_noise.log). Asserting tightness there would
+    just be asserting that roundoff doesn't exist.
+
+    What must hold instead, and does:
+      - the compiled body is deterministic run to run (only the embedding
+        scatters move, on atomics, at ~1e-8);
+      - the loss agrees closely — the forward GEMMs are the same cuBLAS calls;
+      - the fp8-vs-bf16 error profile is the SAME in both modes: compiled fp8
+        differs from compiled bf16 exactly as eager fp8 differs from eager bf16
+        (measured within ~1%). That is the structural check — a layout or fusion
+        bug in the compiled path moves it, amplification cannot."""
     try:
-        gpt_mod.COMPUTE_DTYPE = torch.float32
-        fa_mod._override_impl = "sdpa"
-        fa_mod.USE_FA = fa_mod._resolve_use_fa()
-        model = build_model(depth=4, model_dim=256, n_head=2, seq_len=512,
-                            window_pattern="SL", device="cuda", vocab=4096)
-        perturb(model)
-        idx, targets, cu = make_batch(4096, 2048, 512, "cuda")
-        init_grad_buffers(model, dtype=torch.float32)
-        loss_e = forward_backward_fp8(model, idx, targets, cu, loss_scale=1.0)
-        eager = {n: p.grad32.clone() for n, p in model.named_parameters()}
-        zero_grad32(model)
-        fb = torch.compile(forward_backward_fp8, dynamic=False, fullgraph=True)
-        loss_c = fb(model, idx, targets, cu, loss_scale=1.0)
-        assert abs(loss_c.item() - loss_e.item()) / abs(loss_e.item()) < 1e-5
-        for name, p in model.named_parameters():
-            r = rel_err(p.grad32, eager[name])
-            print(f"  {name:16s} rel_err {r:.3e}")
-            assert r < 1e-3, (name, r)
+        with compute_dtype(torch.bfloat16):   # the shipping dtype
+            model = build_model(depth=4, model_dim=256, n_head=2, seq_len=512,
+                                window_pattern="SL", device="cuda", vocab=4096)
+            perturb(model)
+            idx, targets, cu = make_batch(4096, 2048, 512, "cuda")
+            init_grad_buffers(model, dtype=torch.float32)
+
+            def grads(fn):
+                zero_grad32(model)
+                loss = fn(model, idx, targets, cu, loss_scale=1.0)
+                return loss.item(), {n: p.grad32.clone() for n, p in model.named_parameters()}
+
+            c_bf16 = torch.compile(forward_backward, dynamic=False, fullgraph=True)
+            c_fp8 = torch.compile(forward_backward_fp8, dynamic=False, fullgraph=True)
+            _, e_b = grads(forward_backward)
+            loss_e, e_8 = grads(forward_backward_fp8)
+            _, k_b = grads(c_bf16)
+            loss_c, k_8 = grads(c_fp8)
+            _, k_8_again = grads(c_fp8)
+
+        assert abs(loss_c - loss_e) / abs(loss_e) < 2e-3, (loss_e, loss_c)
+        scalar_roles = {"resid_lambdas", "x0_lambdas", "smear_lambda", "backout_lambda"}
+        for name, _ in model.named_parameters():
+            rerun = rel_err(k_8_again[name], k_8[name])
+            r_e, r_c = rel_err(e_8[name], e_b[name]), rel_err(k_8[name], k_b[name])
+            print(f"  {name:16s} fp8/bf16 eager {r_e:.3e} compiled {r_c:.3e} | rerun {rerun:.1e}")
+            assert rerun < 1e-7, (name, rerun)
+            if name not in scalar_roles:   # scalars are noise-on-noise; see the fp32 tier
+                assert abs(r_c - r_e) <= 0.25 * max(r_e, 1e-3), (name, r_e, r_c)
     finally:
-        gpt_mod.COMPUTE_DTYPE, fa_mod._override_impl, fa_mod.USE_FA = saved
         torch._dynamo.reset()
 
 
