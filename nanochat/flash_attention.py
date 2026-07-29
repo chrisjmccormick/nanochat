@@ -240,6 +240,124 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
 
 # =============================================================================
+# Raw forward/backward ops for the handwritten training step (train_step.py)
+#
+# FA3's build registers _flash_attn_forward/_flash_attn_backward as torch.library
+# ops (with fake impls, so torch.compile can trace them). We call them directly —
+# no autograd Function in between. The calling convention below mirrors
+# FlashAttnVarlenFunc in flash_attn_interface.py exactly (explicit softmax_scale,
+# positional backward args, defensive head-dim slice) so the raw path is
+# bit-identical to what autograd runs through forward().
+# =============================================================================
+
+def _use_raw_fa3(q):
+    return USE_FA and FA_VERSION == 'fa3' and q.dtype == torch.bfloat16
+
+
+def _causal_window_mask(S, window_size, device):
+    """(S, S) bool mask: True = attend. Causal, plus left sliding window."""
+    row = torch.arange(S, device=device).unsqueeze(1)
+    col = torch.arange(S, device=device).unsqueeze(0)
+    mask = col <= row
+    window = window_size[0]
+    if 0 <= window < S:
+        mask = mask & ((row - col) <= window)
+    return mask
+
+
+def _naive_batched(q, k, v, max_seqlen):
+    """Reshape packed (T, H, D) to (B, H, S, D) with GQA head replication —
+    the same NO-doc-isolation semantics as _sdpa_varlen_attention."""
+    T, H, D = q.shape
+    Hk = k.shape[1]
+    B, S = T // max_seqlen, max_seqlen
+    qb = q.view(B, S, H, D).transpose(1, 2)
+    kb = k.view(B, S, Hk, D).transpose(1, 2)
+    vb = v.view(B, S, Hk, D).transpose(1, 2)
+    if Hk != H:
+        rep = H // Hk
+        kb = kb.repeat_interleave(rep, dim=1)
+        vb = vb.repeat_interleave(rep, dim=1)
+    return qb, kb, vb
+
+
+def _naive_probs(q, k, max_seqlen, window_size):
+    scale = q.shape[-1] ** (-0.5)
+    scores = (q @ k.mT) * scale
+    mask = _causal_window_mask(max_seqlen, window_size, q.device)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return torch.softmax(scores, dim=-1)
+
+
+def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens, max_seqlen, window_size):
+    """Attention forward that also returns what the handwritten backward needs.
+
+    FA3 path: the raw kernel, returning (out, softmax_lse) with lse (H, T) fp32.
+    Fallback (no FA, or non-bf16 e.g. the fp64 parity tier): a naive
+    materialized-scores implementation matching _sdpa_varlen_attention's
+    semantics ((B, S) reshape, causal + left window, NO doc isolation) whose
+    backward is _naive below; it returns lse=None (the naive backward
+    recomputes probabilities instead). O(S^2) memory — tests only."""
+    if _use_raw_fa3(q):
+        softmax_scale = q.shape[-1] ** (-0.5)
+        out, softmax_lse, *_ = _fa._flash_attn_forward(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale, causal=True,
+            window_size_left=window_size[0], window_size_right=window_size[1])
+        return out, softmax_lse
+    T, H, D = q.shape
+    qb, kb, vb = _naive_batched(q, k, v, max_seqlen)
+    p = _naive_probs(qb, kb, max_seqlen, window_size)
+    out = (p @ vb).transpose(1, 2).reshape(T, H, D)
+    return out, None
+
+
+def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqlen,
+                          window_size, deterministic=False):
+    """Attention backward for flash_attn_varlen_fwd_lse: (dq, dk, dv), with
+    dk/dv in kv-head shape (GQA reduced inside). deterministic=True trades a
+    little speed for reproducible dq atomics — use it in parity runs."""
+    if _use_raw_fa3(q):
+        softmax_scale = q.shape[-1] ** (-0.5)
+        dq, dk, dv, _ = _fa._flash_attn_backward(
+            dout, q, k, v, out, softmax_lse,
+            cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
+            None, None,                 # seqused_q, seqused_k
+            max_seqlen, max_seqlen,
+            softmax_scale,
+            True,                       # is_causal
+            window_size[0], window_size[1],
+            0.0,                        # softcap
+            deterministic,
+            0,                          # sm_margin
+        )
+        return dq[..., :q.shape[-1]], dk[..., :k.shape[-1]], dv[..., :v.shape[-1]]
+    # Naive path: recompute probabilities, standard attention backward.
+    T, H, D = q.shape
+    Hk = k.shape[1]
+    B, S = T // max_seqlen, max_seqlen
+    scale = D ** (-0.5)
+    qb, kb, vb = _naive_batched(q, k, v, max_seqlen)
+    p = _naive_probs(qb, kb, max_seqlen, window_size)
+    dob = dout.view(B, S, H, D).transpose(1, 2)
+    dv_h = p.mT @ dob
+    dp = dob @ vb.mT
+    ds = p * (dp - (dp * p).sum(dim=-1, keepdim=True))
+    dq = (ds @ kb) * scale
+    dk_h = (ds.mT @ qb) * scale
+    if Hk != H:
+        rep = H // Hk
+        dk_h = dk_h.view(B, Hk, rep, S, D).sum(dim=2)
+        dv_h = dv_h.view(B, Hk, rep, S, D).sum(dim=2)
+    dq = dq.transpose(1, 2).reshape(T, H, D)
+    dk = dk_h.transpose(1, 2).reshape(T, Hk, D)
+    dv = dv_h.transpose(1, 2).reshape(T, Hk, D)
+    return dq, dk, dv
+
+
+# =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3/FA2)
 # =============================================================================
 from types import SimpleNamespace
