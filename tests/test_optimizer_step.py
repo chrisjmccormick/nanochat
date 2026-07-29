@@ -23,12 +23,16 @@ from nanochat.optim import MuonAdamW  # noqa: E402
 from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups  # noqa: E402
 from nanochat import train_step as ts  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer kernels are CUDA")
+# Scoped per test rather than module-wide: the fused kernels need CUDA, but the
+# shape agreement between the allocator and the kernel is pure bookkeeping and
+# must be checkable anywhere (it is what broke d24).
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="optimizer kernels are CUDA")
 
 DEV = "cuda"
 N_STEPS = 1000   # schedule length (Muon momentum's 400-step warmup must fit); we run 3
 
 
+@needs_cuda
 def test_mantissa_invariants():
     x = torch.randn(4096, device=DEV) * torch.logspace(-20, 20, 4096, device=DEV)
     p = torch.nn.Parameter(x.clone())
@@ -147,6 +151,7 @@ def _run_step_parity(compiled):
     return worst
 
 
+@needs_cuda
 def test_step_parity_math_eager():
     """Both flows run their ORIGINAL eager math on identical grads: the new
     mantissa-master step must reproduce the old fp32-live step essentially
@@ -154,6 +159,7 @@ def test_step_parity_math_eager():
     assert _run_step_parity(compiled=False) < 1e-6
 
 
+@needs_cuda
 def test_step_parity_compiled():
     """Same comparison through the shipped torch.compile kernels. Inductor
     rounds each graph's bf16 polar-express region differently (the OLD compiled
@@ -163,6 +169,7 @@ def test_step_parity_compiled():
     assert _run_step_parity(compiled=True) < 5e-2
 
 
+@needs_cuda
 def test_schedule_tables_match_old_builder():
     h = _hyper()
     sched = ts.build_schedules(model_dim=64, num_iterations=N_STEPS, device=DEV, **h)
@@ -196,6 +203,48 @@ def test_schedule_tables_match_old_builder():
     aspect = max(1.0, 8 / 4) ** 0.5
     assert torch.allclose(old_tall.lr, sched.matrix.lr * aspect, rtol=1e-6, atol=0)
     assert torch.allclose(old_tall.lr_wd, sched.matrix.lr_wd * aspect, rtol=1e-6, atol=0)
+
+
+def test_second_moment_shape_matches_red_dim_every_depth():
+    """NorMuon's factored second moment is (K, out, 1) for a tall bank and
+    (K, 1, in) for a wide one, so the buffer init_optimizer_state ALLOCATES has
+    to follow the same rule the kernel REDUCES by. It didn't for ve_gate, which
+    hardcoded the wide shape: ve_gate slices are (n_kv_head, 12), wide at d12/d20
+    but square at d24 and tall at d26, so d24+ died in muon_step_fused's lerp_
+    with "output with shape [12, 1, 12] doesn't match the broadcast shape
+    (12, 12, 12)" — the first thing ever to run this trainer above d12.
+
+    Checked here on shapes alone, across every depth in play, because the bug is
+    a shape disagreement and needs no GPU, no compile and no step to expose."""
+    from nanochat.train_step import red_dim, second_moment_shape
+
+    class FakeBank:
+        def __init__(self, shape): self.shape = shape
+
+    for depth in (12, 20, 24, 26, 32):
+        model_dim = ((depth * 64 + 127) // 128) * 128
+        n_kv_head = model_dim // 128
+        n_ve = (depth + 1) // 2
+        banks = {
+            "c_q":       FakeBank((depth, model_dim, model_dim)),
+            "mlp_fc":    FakeBank((depth, 4 * model_dim, model_dim)),
+            "mlp_proj":  FakeBank((depth, model_dim, 4 * model_dim)),
+            "ve_gate":   FakeBank((n_ve, n_kv_head, 12)),
+        }
+        for name, bank in banks.items():
+            k = bank.shape[0]
+            got = second_moment_shape(bank, k)
+            rd = red_dim(bank)
+            # the reduced dim must be the one that collapses to 1
+            assert got[rd] == 1, (depth, name, got, rd)
+            # and the OTHER matrix dim must be preserved in full
+            other = -1 if rd == -2 else -2
+            assert got[other] == bank.shape[other], (depth, name, got, rd)
+            assert got[0] == k, (depth, name, got)
+    # the specific case that broke: d24's ve_gate is square, and a square bank
+    # takes the tall branch (>=), so the buffer must be (K, out, 1)
+    assert red_dim(FakeBank((12, 12, 12))) == -1
+    assert second_moment_shape(FakeBank((12, 12, 12)), 12) == (12, 12, 1)
 
 
 if __name__ == "__main__":

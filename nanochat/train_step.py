@@ -845,6 +845,21 @@ def build_schedules(model_dim, num_iterations, device,
     )
 
 
+def red_dim(bank):
+    """NorMuon's variance-reduction dim for a bank: tall -> -1, wide -> -2.
+    THE single source of truth — the factored second-moment buffer's shape is
+    determined by this choice, so init_optimizer_state and bank_muls must agree
+    or the kernel's lerp_ writes a (K, out, 1) update into a (K, 1, in) buffer.
+    They agreed by luck until d24: ve_gate is (n_kv_head, 12), which is wide at
+    d12/d20 but square at d24 and tall at d26."""
+    return -1 if bank.shape[-2] >= bank.shape[-1] else -2
+
+
+def second_moment_shape(bank, k):
+    """Shape of the factored second moment for `k` slices of `bank`."""
+    return (k, bank.shape[-2], 1) if red_dim(bank) == -1 else (k, 1, bank.shape[-1])
+
+
 def bank_muls(model, ns_steps=5):
     """Per-bank Muon call-site policy: the (K,1,1) per-slice lr/wd multipliers
     and NorMuon reduction dim. Today every slice of a bank is uniform, so each
@@ -854,8 +869,7 @@ def bank_muls(model, ns_steps=5):
     def policy(bank):
         aspect = max(1.0, bank.shape[-2] / bank.shape[-1]) ** 0.5
         mul = torch.full((bank.shape[0], 1, 1), aspect, dtype=torch.float32, device=bank.device)
-        red_dim = -1 if bank.shape[-2] >= bank.shape[-1] else -2
-        return dict(lr_mul=mul, wd_mul=mul, ns_steps=ns_steps, red_dim=red_dim)
+        return dict(lr_mul=mul, wd_mul=mul, ns_steps=ns_steps, red_dim=red_dim(bank))
     return {
         "c_q":       policy(model.c_q),        # aspect 1.0, tall
         "c_k":       policy(model.c_k),        # aspect 1.0, tall
@@ -907,13 +921,14 @@ def init_optimizer_state(model, ddp_rank=0, ddp_world_size=1):
         shard = p[sl]
         p.mantissa = mant[sl].clone() if world > 1 else mant
         p.momentum = torch.zeros_like(shard, dtype=torch.float32)
-        so = (shard.shape[0], p.shape[-2], 1) if p.shape[-2] >= p.shape[-1] else (shard.shape[0], 1, p.shape[-1])
-        p.second_momentum = torch.zeros(so, dtype=torch.float32, device=p.device)
+        p.second_momentum = torch.zeros(second_moment_shape(p, shard.shape[0]),
+                                        dtype=torch.float32, device=p.device)
     # Muon replicated (tiny/ragged): full-size state, every rank updates it all
     p = model.ve_gate
     p.mantissa = _split_master(p)
     p.momentum = torch.zeros_like(p, dtype=torch.float32)
-    p.second_momentum = torch.zeros(p.shape[0], 1, p.shape[-1], dtype=torch.float32, device=p.device)
+    p.second_momentum = torch.zeros(second_moment_shape(p, p.shape[0]),
+                                    dtype=torch.float32, device=p.device)
     # AdamW sharded (row-shard over dim 0 of the (rows, cols) view)
     for p in (model.lm_head, model.wte, model.value_embeds):
         mant = _split_master(p)
