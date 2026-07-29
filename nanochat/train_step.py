@@ -213,8 +213,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     #    the buffer; 16 unrolled subgraphs block fusion), so let the compiler
     #    do the memory planning and fusion it's good at.
     softcap = 15.0
-    logits = xf @ model.lm_head.to(dt).mT        # (T, Vp) compute-dtype
-    buf_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
+    buf_dtype = torch.float64 if dt == torch.float64 else torch.float32
     valid = targets >= 0
     n_valid = valid.sum()
     if torch.compiler.is_compiling():
@@ -222,6 +221,13 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         # eager twin below: t is an explicit CSE target (materialize once, no
         # tanh recompute in the dz pass), and the onehot is a broadcast compare
         # (a scatter_add here forces an extra full pass over the buffer).
+        # (An in-graph row-chunked fwd+bwd was tried 2026-07-29 and reverted:
+        # with no dependencies between chunks, inductor schedules their buffers
+        # to coexist — no memory saved, 0.6% slower. Real chunking needs a
+        # graph BOUNDARY per chunk: a separately-compiled chunk fn in a Python
+        # loop, worth building only when a config is actually memory-bound.)
+        lm = model.lm_head.to(dt)
+        logits = xf @ lm.mT                      # (T, Vp) compute-dtype
         t = torch.tanh(logits[..., :V].to(buf_dtype) / softcap)
         cap = softcap * t
         vmask = valid.to(buf_dtype)
@@ -233,9 +239,15 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         lse = (ssum.log() + m).squeeze(1)
         loss = ((lse - cap_y) * vmask).sum() / n_valid.to(buf_dtype)
         onehot = torch.arange(V, device=targets.device).unsqueeze(0) == y_safe
-        buf = (e / ssum - onehot.to(buf_dtype)) * (1.0 - t * t) \
-            * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)
+        dz = ((e / ssum - onehot.to(buf_dtype)) * (1.0 - t * t)
+              * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)).to(dt)
+        del logits
+        g_lm = (dz.mT @ xf).to(g32)              # padded rows get no grad, as in autograd
+        (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
+        dxf = dz @ lm[:V]
+        del dz
     else:
+        logits = xf @ model.lm_head.to(dt).mT    # (T, Vp) compute-dtype
         buf = logits[..., :V].to(buf_dtype)      # THE big fp32 buffer; bf16 logits freed below
         buf.div_(softcap).tanh_().mul_(softcap)  # buf = cap = 15*tanh(z/15)
         # Softcap keeps cap in [-15, 15], so softmax probs are bounded below by
@@ -257,7 +269,14 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
             c.scatter_add_(1, y_safe, (-vc).unsqueeze(1))  # - onehot on valid rows
             c.mul_(f).mul_(vc.unsqueeze(1) * scale)  # softcap chain, ignore-mask, 1/n_valid, loss_scale
         loss = loss_sum / n_valid.to(buf_dtype)
-    del logits
+        del logits
+        dz = buf.to(dt)                          # mirror autograd's cast back through .float()
+        del buf
+        lm = model.lm_head.to(dt)
+        g_lm = (dz.mT @ xf).to(g32)              # padded rows get no grad, as in autograd
+        (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
+        dxf = dz @ lm[:V]
+        del dz
 
     # ==== backward half ====
     # Bank gradients are COLLECTED per layer and landed as one full-bank add
@@ -266,13 +285,6 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     # while a full-tensor add on a graph input stays genuinely in place.
     g_cq = []; g_ck = []; g_cv = []; g_ap = []; g_fc = []; g_mp = []
     g_resid = []; g_x0 = []; g_ve = {}; g_veg = {}
-    dz = buf.to(dt)                              # mirror autograd's cast back through .float()
-    del buf
-    lm = model.lm_head.to(dt)
-    g_lm = (dz.mT @ xf).to(g32)                  # padded rows get no grad, as in autograd
-    (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
-    dxf = dz @ lm[:V]
-    del dz
 
     d_pre = _rms_bwd(dxf, xf, r_f)
     model.backout_lambda.grad32.add_(-(d_pre * x_backout).sum(dtype=g32))
@@ -368,7 +380,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
 
 @torch.no_grad()
 def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
-                         deterministic_attention=False, loss_chunk=8192):
+                         deterministic_attention=False, loss_chunk=8192, w8=None):
     """forward_backward's FP8 twin — the 6th duplicated body, and deliberately
     line-parallel with the bf16 one above (keep them that way: diff them when
     either changes). The ONLY difference is that the six matrix banks' and
@@ -414,17 +426,14 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
     assert T <= model.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {model.cos.size(1)}"
     cos, sin = model.cos[0, :T], model.sin[0, :T]  # (T, 1, half)
 
-    # Weight scales, one batched per-slice amax per bank (the naive form is 73
-    # separate launches). The live weights are frozen across the step's
-    # micro-batches, so this block is the obvious later hoist out of the
-    # micro-batch loop — it is a fraction of a percent of the step today.
-    s_wq = fp8.slice_scales(model.c_q, E4M3)
-    s_wk = fp8.slice_scales(model.c_k, E4M3)
-    s_wv = fp8.slice_scales(model.c_v, E4M3)
-    s_ap = fp8.slice_scales(model.attn_proj, E4M3)
-    s_fc = fp8.slice_scales(model.mlp_fc, E4M3)
-    s_mp = fp8.slice_scales(model.mlp_proj, E4M3)
-    s_lm = fp8.tensor_scale(model.lm_head, E4M3)   # the padded bank; reused for the [:V] backward slice
+    # Weights arrive pre-quantized in both layouts via `w8` (fp8.quantize_weights),
+    # built ONCE per optimizer step by the trainer — the live weights are frozen
+    # across a step's micro-batches, so per-micro-batch weight casts are pure
+    # waste. The fallback keeps the body self-contained for single-call use.
+    if w8 is None:
+        w8 = fp8.quantize_weights(model)
+    w_cq, w_ck, w_cv = w8["c_q"], w8["c_k"], w8["c_v"]
+    w_ap, w_fc, w_mp, w_lm = w8["attn_proj"], w8["mlp_fc"], w8["mlp_proj"], w8["lm_head"]
 
     # ==== forward half (mirrors forward_backward — keep them visibly line-parallel) ====
     x = F.embedding(idx, model.wte)
@@ -445,9 +454,9 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         xn, r_xn = _rms_fwd(b, D)
         s_xn = fp8.tensor_scale(xn, E4M3)        # ONE amax + ONE cast for q/k/v
         xnq = fp8.row(xn, E4M3, s_xn)
-        q = fp8.mm(xnq, fp8.row(model.c_q[i], E4M3, s_wq[i]), dt, fast_accum=True).view(T, nh, hd)
-        k = fp8.mm(xnq, fp8.row(model.c_k[i], E4M3, s_wk[i]), dt, fast_accum=True).view(T, nkv, hd)
-        v = fp8.mm(xnq, fp8.row(model.c_v[i], E4M3, s_wv[i]), dt, fast_accum=True).view(T, nkv, hd)
+        q = fp8.mm(xnq, fp8.F8(w_cq.row[i], w_cq.s[i].reciprocal()), dt, fast_accum=True).view(T, nh, hd)
+        k = fp8.mm(xnq, fp8.F8(w_ck.row[i], w_ck.s[i].reciprocal()), dt, fast_accum=True).view(T, nkv, hd)
+        v = fp8.mm(xnq, fp8.F8(w_cv.row[i], w_cv.s[i].reciprocal()), dt, fast_accum=True).view(T, nkv, hd)
         j = model.ve_index[i]
         if j >= 0:
             ve = F.embedding(idx, model.value_embeds[j]).view(T, nkv, hd).to(dt)
@@ -465,13 +474,13 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         y = y.contiguous()
         yv = y.view(T, -1)
         s_y = fp8.tensor_scale(yv, E4M3)
-        x1 = b + fp8.mm(fp8.row(yv, E4M3, s_y), fp8.row(model.attn_proj[i], E4M3, s_ap[i]), dt, fast_accum=True)
+        x1 = b + fp8.mm(fp8.row(yv, E4M3, s_y), fp8.F8(w_ap.row[i], w_ap.s[i].reciprocal()), dt, fast_accum=True)
         xm, _ = _rms_fwd(x1, D)                  # xm recomputed in backward from stashed x1
         s_xm = fp8.tensor_scale(xm, E4M3)
-        a = F.relu(fp8.mm(fp8.row(xm, E4M3, s_xm), fp8.row(model.mlp_fc[i], E4M3, s_fc[i]), dt, fast_accum=True))
+        a = F.relu(fp8.mm(fp8.row(xm, E4M3, s_xm), fp8.F8(w_fc.row[i], w_fc.s[i].reciprocal()), dt, fast_accum=True))
         a2 = a.square()                          # recomputed in backward; its scale rides in the stash
         s_a2 = fp8.tensor_scale(a2, E4M3)
-        x = x1 + fp8.mm(fp8.row(a2, E4M3, s_a2), fp8.row(model.mlp_proj[i], E4M3, s_mp[i]), dt, fast_accum=True)
+        x = x1 + fp8.mm(fp8.row(a2, E4M3, s_a2), fp8.F8(w_mp.row[i], w_mp.s[i].reciprocal()), dt, fast_accum=True)
         if i == backout_layer:
             x_backout = x
         stash.append(dict(x_in=x_in, xn=xn, r_xn=r_xn, qf=qf, kf=kf, r_q=r_q, r_k=r_k,
@@ -492,8 +501,7 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
     #    the buffer; 16 unrolled subgraphs block fusion), so let the compiler
     #    do the memory planning and fusion it's good at.
     softcap = 15.0
-    logits = fp8.mm(fp8.row(xf, E4M3, s_xf), fp8.row(model.lm_head, E4M3, s_lm), dt, fast_accum=True)
-    buf_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
+    buf_dtype = torch.float64 if dt == torch.float64 else torch.float32
     valid = targets >= 0
     n_valid = valid.sum()
     if torch.compiler.is_compiling():
@@ -501,6 +509,10 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         # eager twin below: t is an explicit CSE target (materialize once, no
         # tanh recompute in the dz pass), and the onehot is a broadcast compare
         # (a scatter_add here forces an extra full pass over the buffer).
+        # (An in-graph row-chunked fwd+bwd was tried 2026-07-29 and reverted —
+        # see the bf16 body's note.)
+        inv_lm = w_lm.s.reciprocal()
+        logits = fp8.mm(fp8.row(xf, E4M3, s_xf), fp8.F8(w_lm.row, inv_lm), dt, fast_accum=True)
         t = torch.tanh(logits[..., :V].to(buf_dtype) / softcap)
         cap = softcap * t
         vmask = valid.to(buf_dtype)
@@ -512,9 +524,18 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         lse = (ssum.log() + m).squeeze(1)
         loss = ((lse - cap_y) * vmask).sum() / n_valid.to(buf_dtype)
         onehot = torch.arange(V, device=targets.device).unsqueeze(0) == y_safe
-        buf = (e / ssum - onehot.to(buf_dtype)) * (1.0 - t * t) \
-            * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)
+        dz = ((e / ssum - onehot.to(buf_dtype)) * (1.0 - t * t)
+              * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)).to(dt)
+        del logits
+        s_dz = fp8.tensor_scale(dz, E5M2)
+        # The (T, V) grad is the biggest tensor in the step: cast one layout,
+        # consume it, drop it, then the other — never both fp8 copies alive at once.
+        g_lm = fp8.mm(fp8.col(dz, E5M2, s_dz), fp8.col(xf, E4M3, s_xf), dt).to(g32)  # padded rows get no grad
+        (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
+        dxf = fp8.mm(fp8.row(dz, E5M2, s_dz), fp8.F8(w_lm.colT[:, :V], inv_lm), dt)
+        del dz
     else:
+        logits = fp8.mm(fp8.row(xf, E4M3, s_xf), fp8.F8(w_lm.row, w_lm.s.reciprocal()), dt, fast_accum=True)
         buf = logits[..., :V].to(buf_dtype)      # THE big fp32 buffer; bf16 logits freed below
         buf.div_(softcap).tanh_().mul_(softcap)  # buf = cap = 15*tanh(z/15)
         # Softcap keeps cap in [-15, 15], so softmax probs are bounded below by
@@ -536,7 +557,16 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
             c.scatter_add_(1, y_safe, (-vc).unsqueeze(1))  # - onehot on valid rows
             c.mul_(f).mul_(vc.unsqueeze(1) * scale)  # softcap chain, ignore-mask, 1/n_valid, loss_scale
         loss = loss_sum / n_valid.to(buf_dtype)
-    del logits
+        del logits
+        dz = buf.to(dt)                          # mirror autograd's cast back through .float()
+        del buf
+        s_dz = fp8.tensor_scale(dz, E5M2)
+        # The (T, V) grad is the biggest tensor in the step: cast one layout,
+        # consume it, drop it, then the other — never both fp8 copies alive at once.
+        g_lm = fp8.mm(fp8.col(dz, E5M2, s_dz), fp8.col(xf, E4M3, s_xf), dt).to(g32)  # padded rows get no grad
+        (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
+        dxf = fp8.mm(fp8.row(dz, E5M2, s_dz), fp8.F8(w_lm.colT[:, :V], w_lm.s.reciprocal()), dt)
+        del dz
 
     # ==== backward half ====
     # Bank gradients are COLLECTED per layer and landed as one full-bank add
@@ -544,15 +574,6 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
     # inside the compiled bodies.
     g_cq = []; g_ck = []; g_cv = []; g_ap = []; g_fc = []; g_mp = []
     g_resid = []; g_x0 = []; g_ve = {}; g_veg = {}
-    dz = buf.to(dt)                              # mirror autograd's cast back through .float()
-    del buf
-    s_dz = fp8.tensor_scale(dz, E5M2)
-    # The (T, V) grad is the biggest tensor in the step: cast one layout, consume
-    # it, drop it, then the other — never both fp8 copies alive at once.
-    g_lm = fp8.mm(fp8.col(dz, E5M2, s_dz), fp8.col(xf, E4M3, s_xf), dt).to(g32)  # padded rows get no grad
-    (model.lm_head.grad32 if V == Vp else model.lm_head.grad32[:V]).add_(g_lm)
-    dxf = fp8.mm(fp8.row(dz, E5M2, s_dz), fp8.col(model.lm_head[:V], E4M3, s_lm), dt)
-    del dz
 
     d_pre = _rms_bwd(dxf, xf, r_f)
     model.backout_lambda.grad32.add_(-(d_pre * x_backout).sum(dtype=g32))
@@ -566,19 +587,19 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         # --- MLP backward (relu^2: dh = 2*a*du, self-masking since a = relu(h)) ---
         x1, a = st["x1"], st["a"]
         s_ds = fp8.tensor_scale(d_stream, E5M2)
-        d_u = fp8.mm(fp8.row(d_stream, E5M2, s_ds), fp8.col(model.mlp_proj[i], E4M3, s_mp[i]), dt)
+        d_u = fp8.mm(fp8.row(d_stream, E5M2, s_ds), fp8.F8(w_mp.colT[i], w_mp.s[i].reciprocal()), dt)
         g_mp.append(fp8.mm(fp8.col(d_stream, E5M2, s_ds), fp8.col(a.square(), E4M3, st["s_a2"]), dt))
         d_h = 2.0 * a * d_u
         xm, r_xm = _rms_fwd(x1, D)               # cheap recompute (bitwise: same input)
         s_dh = fp8.tensor_scale(d_h, E5M2)
         g_fc.append(fp8.mm(fp8.col(d_h, E5M2, s_dh), fp8.col(xm, E4M3, st["s_xm"]), dt))
-        d_xm = fp8.mm(fp8.row(d_h, E5M2, s_dh), fp8.col(model.mlp_fc[i], E4M3, s_fc[i]), dt)
+        d_xm = fp8.mm(fp8.row(d_h, E5M2, s_dh), fp8.F8(w_fc.colT[i], w_fc.s[i].reciprocal()), dt)
         d_x1 = d_stream + _rms_bwd(d_xm, xm, r_xm)
         # --- attention backward ---
         xn, y = st["xn"], st["y"]
         s_dx1 = fp8.tensor_scale(d_x1, E5M2)
         g_ap.append(fp8.mm(fp8.col(d_x1, E5M2, s_dx1), fp8.col(y.view(T, -1), E4M3, st["s_y"]), dt))
-        d_y = fp8.mm(fp8.row(d_x1, E5M2, s_dx1), fp8.col(model.attn_proj[i], E4M3, s_ap[i]), dt).view(T, nh, hd)
+        d_y = fp8.mm(fp8.row(d_x1, E5M2, s_dx1), fp8.F8(w_ap.colT[i], w_ap.s[i].reciprocal()), dt).view(T, nh, hd)
         dqf, dkf, dv = flash_attn_varlen_bwd(
             d_y, st["qf"], st["kf"], st["v"], y, st["lse"], cu_seqlens, max_seq_len,
             model.window_sizes[i], deterministic=deterministic_attention)
@@ -616,9 +637,9 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         g_cq.append(fp8.mm(fp8.col(d_q0, E5M2, s_dq), xnt, dt))
         g_ck.append(fp8.mm(fp8.col(d_k0, E5M2, s_dk), xnt, dt))
         g_cv.append(fp8.mm(fp8.col(d_v0, E5M2, s_dv), xnt, dt))
-        d_xn = fp8.mm(fp8.row(d_q0, E5M2, s_dq), fp8.col(model.c_q[i], E4M3, s_wq[i]), dt) \
-             + fp8.mm(fp8.row(d_k0, E5M2, s_dk), fp8.col(model.c_k[i], E4M3, s_wk[i]), dt) \
-             + fp8.mm(fp8.row(d_v0, E5M2, s_dv), fp8.col(model.c_v[i], E4M3, s_wv[i]), dt)
+        d_xn = fp8.mm(fp8.row(d_q0, E5M2, s_dq), fp8.F8(w_cq.colT[i], w_cq.s[i].reciprocal()), dt) \
+             + fp8.mm(fp8.row(d_k0, E5M2, s_dk), fp8.F8(w_ck.colT[i], w_ck.s[i].reciprocal()), dt) \
+             + fp8.mm(fp8.row(d_v0, E5M2, s_dv), fp8.F8(w_cv.colT[i], w_cv.s[i].reciprocal()), dt)
         if d_xn_ve is not None:
             d_xn[:, :gch] += d_xn_ve
         d_b = d_x1 + _rms_bwd(d_xn, xn, st["r_xn"])

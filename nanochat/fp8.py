@@ -308,6 +308,45 @@ def col(x, fp8_dtype, scale) -> F8:
     return F8(_cast(x, fp8_dtype, scale).t().contiguous(), scale.reciprocal())
 
 
+class BankF8(NamedTuple):
+    """A weight bank quantized in BOTH GEMM layouts, sharing one scale set:
+    row[i] is slice i as it lies (the forward's B operand), colT[i] is slice i
+    transposed-contiguous (the dgrad's B operand). Built once per optimizer
+    step — the live weights are frozen across a step's micro-batches, so
+    re-quantizing them inside every micro-batch is pure waste. `s` is the
+    FORWARD scale vector; take s[i].reciprocal() at the use site (passing a
+    bare select view as a _scaled_mm scale breaks inductor's lowering)."""
+    row: Tensor   # (K, out, in) fp8   [or (out, in) for a 2D weight]
+    colT: Tensor  # (K, in, out) fp8   [or (in, out)]
+    s: Tensor     # (K,) fp32 forward scales  [or 0-dim]
+
+
+def quantize_bank(bank, fp8_dtype=E4M3):
+    """(K, out, in) parameter bank -> BankF8. Same per-slice scales and cast
+    values as slice_scales + per-slice row()/col() — bit-identical, batched."""
+    s = slice_scales(bank, fp8_dtype)
+    fp8_max = torch.finfo(fp8_dtype).max
+    d = (bank.float() * s.view(-1, 1, 1)).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    return BankF8(d, d.transpose(-2, -1).contiguous(), s)
+
+
+def quantize_weight_2d(w, fp8_dtype=E4M3):
+    """2D weight (the lm_head) -> BankF8, tensorwise scale."""
+    s = tensor_scale(w, fp8_dtype)
+    d = _cast(w, fp8_dtype, s)
+    return BankF8(d, d.t().contiguous(), s)
+
+
+def quantize_weights(model):
+    """Every weight role forward_backward_fp8 quantizes, in both layouts.
+    Call once per optimizer step and pass the result to the body via `w8`
+    (compile this call — eager materializes fp32 temps per bank)."""
+    q = {name: quantize_bank(getattr(model, name))
+         for name in ("c_q", "c_v", "c_k", "attn_proj", "mlp_fc", "mlp_proj")}
+    q["lm_head"] = quantize_weight_2d(model.lm_head)
+    return q
+
+
 def mm(a: F8, b: F8, out_dtype, fast_accum=False):
     """C[M,N] = a[M,K] @ b[N,K].T through the cuBLAS FP8 kernel. fast_accum keeps
     the dot-product accumulation in lower precision — standard for the forward,

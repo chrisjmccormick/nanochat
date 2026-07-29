@@ -198,6 +198,10 @@ if args.compile_fwdbwd:
     # fullgraph so any graph break errors loudly instead of silently fragmenting
     # fusion (the FA3 raw ops have fake impls, so a full trace is achievable)
     train_step_fn = torch.compile(train_step_fn, dynamic=False, fullgraph=True)
+# fp8: weights are frozen across a step's micro-batches, so quantize them once
+# per step (both GEMM layouts) instead of inside every micro-batch
+quantize_weights_fn = torch.compile(fp8.quantize_weights, dynamic=False, fullgraph=True) \
+    if args.fp8 else None
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -437,9 +441,10 @@ while True:
     # .grad32, then the written-out explicit optimizer step (train_step.py)
     synchronize()
     t0 = time.time()
+    extra = {"w8": quantize_weights_fn(orig_model)} if quantize_weights_fn is not None else {}
     for micro_step in range(grad_accum_steps):
         # loss_scale replaces the loss/grad_accum division of the autograd loop
-        train_loss = train_step_fn(orig_model, x, y, cu_seqlens, loss_scale=1.0 / grad_accum_steps)
+        train_loss = train_step_fn(orig_model, x, y, cu_seqlens, loss_scale=1.0 / grad_accum_steps, **extra)
         x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     optimizer_step(orig_model, sched, muls, sched_t) # schedules pre-computed; advances sched_t on-device
     zero_grad32(orig_model)
