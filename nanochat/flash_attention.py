@@ -51,7 +51,11 @@ def _load_flash_attention():
         if major == 8:
             try:
                 _k = get_kernel('kernels-community/flash-attn3')
-                _fa3 = _k if hasattr(_k, 'flash_attn_varlen_func') else _k.flash_attn_interface
+                # Raw _flash_attn_forward/_backward live in flash_attn_interface;
+                # the top-level re-exports varlen/kvcache but not the raw ops.
+                _fa3 = getattr(_k, 'flash_attn_interface', _k)
+                if not hasattr(_fa3, 'flash_attn_varlen_func'):
+                    _fa3 = _k if hasattr(_k, 'flash_attn_varlen_func') else _k.flash_attn_interface
                 return _fa3, 'fa3'
             except Exception:
                 pass
@@ -321,11 +325,13 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
     little speed for reproducible dq atomics — use it in parity runs."""
     if _use_raw_fa3(q):
         softmax_scale = q.shape[-1] ** (-0.5)
-        dq, dk, dv, _ = _fa._flash_attn_backward(
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _fa._flash_attn_backward(
             dout, q, k, v, out, softmax_lse,
             cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
             None, None,                 # seqused_q, seqused_k
             max_seqlen, max_seqlen,
+            dq, dk, dv,
             softmax_scale,
             True,                       # is_causal
             window_size[0], window_size[1],
