@@ -88,6 +88,17 @@ def _rms_bwd(dy, y, r):
     return dx.to(dy.dtype)
 
 
+def _rms_bwd_scaled(dy, ys, r, s):
+    """Backward through ys = s * rms_norm(x), given the SCALED output ys — which
+    is exactly what the attention kernel consumed, so it stashes directly with
+    no recompute pass. Substituting y = ys/s into _rms_bwd's form:
+    dx = r*(s*dy - ys*mean(ys*dy)/s). Exact algebra (fp64 tier verifies)."""
+    acc = dy.dtype if dy.dtype in (torch.float32, torch.float64) else torch.float32
+    yf, dyf = ys.to(acc), dy.to(acc)
+    dx = r * (s * dyf - yf * ((yf * dyf).mean(dim=-1, keepdim=True) / s))
+    return dx.to(dy.dtype)
+
+
 # -----------------------------------------------------------------------------
 # forward_backward
 
@@ -104,6 +115,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     D = cfg.n_embd
     half = hd // 2
     V = cfg.vocab_size
+    Vp = model.padded_vocab_size
     max_seq_len = cfg.sequence_len
     dt = gpt_mod.COMPUTE_DTYPE
     g32 = model.c_q.grad32.dtype       # matrix/scalar grad dtype (fp32; fp64 in the exact tier)
@@ -143,10 +155,10 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         k1, k2 = k[..., :half], k[..., half:]
         q = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1)
         k = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1)
-        qn, r_q = _rms_fwd(q, hd)                # stash PRE-1.2 so the norm bwd is exact;
-        kn, r_k = _rms_fwd(k, hd)                # qf/kf recomputed bitwise in backward
-        qf = qn * 1.2
-        kf = kn * 1.2
+        qn, r_q = _rms_fwd(q, hd)
+        kn, r_k = _rms_fwd(k, hd)
+        qf = qn * 1.2                            # stash the SCALED q/k (the kernel's inputs);
+        kf = kn * 1.2                            # backward folds the 1.2 via _rms_bwd_scaled
         y, lse = flash_attn_varlen_fwd_lse(qf, kf, v, cu_seqlens, max_seq_len, model.window_sizes[i])
         y = y.contiguous()
         x1 = b + y.view(T, -1) @ model.attn_proj[i].to(dt).mT
@@ -155,7 +167,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         x = x1 + a.square() @ model.mlp_proj[i].to(dt).mT
         if i == backout_layer:
             x_backout = x
-        stash.append(dict(x_in=x_in, xn=xn, r_xn=r_xn, qn=qn, kn=kn, r_q=r_q, r_k=r_k,
+        stash.append(dict(x_in=x_in, xn=xn, r_xn=r_xn, qf=qf, kf=kf, r_q=r_q, r_k=r_k,
                           v=v, y=y, lse=lse, x1=x1, a=a))
 
     x_pre = x - model.backout_lambda.to(dt) * x_backout
@@ -175,7 +187,12 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     valid = targets >= 0
     n_valid = valid.sum()
     if torch.compiler.is_compiling():
-        cap = softcap * torch.tanh(logits[..., :V].to(buf_dtype) / softcap)
+        # Written for inductor's fusion, not for readability of the in-place
+        # eager twin below: t is an explicit CSE target (materialize once, no
+        # tanh recompute in the dz pass), and the onehot is a broadcast compare
+        # (a scatter_add here forces an extra full pass over the buffer).
+        t = torch.tanh(logits[..., :V].to(buf_dtype) / softcap)
+        cap = softcap * t
         vmask = valid.to(buf_dtype)
         y_safe = targets.clamp_min(0).unsqueeze(1)
         cap_y = cap.gather(1, y_safe).squeeze(1)
@@ -184,9 +201,9 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         ssum = e.sum(dim=1, keepdim=True)
         lse = (ssum.log() + m).squeeze(1)
         loss = ((lse - cap_y) * vmask).sum() / n_valid.to(buf_dtype)
-        dcap = (e / ssum).scatter_add(1, y_safe, (-vmask).unsqueeze(1))
-        f = 1.0 - (cap / softcap).square()       # 1 - tanh^2(z/15)
-        buf = dcap * f * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)
+        onehot = torch.arange(V, device=targets.device).unsqueeze(0) == y_safe
+        buf = (e / ssum - onehot.to(buf_dtype)) * (1.0 - t * t) \
+            * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)
     else:
         buf = logits[..., :V].to(buf_dtype)      # THE big fp32 buffer; bf16 logits freed below
         buf.div_(softcap).tanh_().mul_(softcap)  # buf = cap = 15*tanh(z/15)
@@ -241,15 +258,12 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         xn, y = st["xn"], st["y"]
         model.attn_proj.grad32[i].add_((d_x1.mT @ y.view(T, -1)).to(g32))
         d_y = (d_x1 @ model.attn_proj[i].to(dt)).view(T, nh, hd)
-        qf = st["qn"] * 1.2                      # bitwise identical to forward's kernel inputs
-        kf = st["kn"] * 1.2
         dqf, dkf, dv = flash_attn_varlen_bwd(
-            d_y, qf, kf, st["v"], y, st["lse"], cu_seqlens, max_seq_len,
+            d_y, st["qf"], st["kf"], st["v"], y, st["lse"], cu_seqlens, max_seq_len,
             model.window_sizes[i], deterministic=deterministic_attention)
-        d_qn = 1.2 * dqf
-        d_kn = 1.2 * dkf
-        d_qr = _rms_bwd(d_qn, st["qn"], st["r_q"])   # per-(token, head) norm, dim = head_dim
-        d_kr = _rms_bwd(d_kn, st["kn"], st["r_k"])
+        # per-(token, head) norm backward with the 1.2 scale folded in
+        d_qr = _rms_bwd_scaled(dqf, st["qf"], st["r_q"], 1.2)
+        d_kr = _rms_bwd_scaled(dkf, st["kf"], st["r_k"], 1.2)
         # rotary backward = rotation by -theta (transpose of the forward rotation)
         dq1, dq2 = d_qr[..., :half], d_qr[..., half:]
         d_q0 = torch.cat([dq1 * cos - dq2 * sin, dq1 * sin + dq2 * cos], dim=-1)
@@ -265,7 +279,10 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
             d_zg = d_g * (3 * sg * (1 - sg))
             model.ve_gate.grad32[j].add_((d_zg.mT @ xn[..., :gch]).to(g32))
             d_ve = (dv * (3 * sg).unsqueeze(-1)).reshape(T, nkv * hd)
-            model.value_embeds.grad32[j].index_add_(0, idx, d_ve.to(gemb))
+            # embedding_dense_backward (autograd's own lowering) beats raw
+            # index_add_ atomics ~2x at these shapes — see the GH200 trace hunt
+            model.value_embeds.grad32[j].add_(
+                torch.ops.aten.embedding_dense_backward(d_ve.to(gemb), idx, Vp, -1, False))
             d_xn_ve = d_zg @ model.ve_gate[j].to(dt)
         # dv passes through the VE add unchanged: v = v0 + g*ve
         d_q0 = d_q0.view(T, nh * hd)
@@ -299,7 +316,8 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     d_xe[1:, :24] += d_zs @ model.smear_gate.to(dt)
     # --- embedding norm + token embedding scatter ---
     d_emb = _rms_bwd(d_xe, xe, r_e)
-    model.wte.grad32.index_add_(0, idx, d_emb.to(gemb))
+    model.wte.grad32.add_(
+        torch.ops.aten.embedding_dense_backward(d_emb.to(gemb), idx, Vp, -1, False))
 
     return loss
 
