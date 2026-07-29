@@ -130,7 +130,8 @@ def _run_step_parity(compiled):
     assert t.item() == 3
     worst = 0.0
     for name, p in model.named_parameters():
-        rec = ts._master(p.data, p.mantissa)
+        # scalar params are fp32-LIVE (no mantissa pair) — compare directly
+        rec = ts._master(p.data, p.mantissa) if hasattr(p, "mantissa") else p.detach().float()
         if name in banks or name == "value_embeds":
             refv = torch.stack([q.detach() for q in pl[name if name in banks else "value_embeds"]])
         else:
@@ -138,9 +139,10 @@ def _run_step_parity(compiled):
         r = ((rec.double() - refv.double()).norm() / refv.double().norm()).item()
         worst = max(worst, r)
         print(f"  {name:16s} master rel_err {r:.3e}")
-        # live/mantissa pairing stays lossless after real steps
-        assert torch.equal(p.data.view(torch.int16),
-                           (rec.view(torch.int32) >> 16).to(torch.int16)), name
+        if hasattr(p, "mantissa"):
+            # live/mantissa pairing stays lossless after real steps
+            assert torch.equal(p.data.view(torch.int16),
+                               (rec.view(torch.int32) >> 16).to(torch.int16)), name
     print(f"  worst {worst:.3e}")
     return worst
 

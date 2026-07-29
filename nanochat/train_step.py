@@ -373,6 +373,29 @@ class AdamWTabs(NamedTuple):
 # kernel change).
 
 @torch.compile(dynamic=False, fullgraph=True)
+def adamw_step_fused_fp32(
+    p: Tensor,           # fp32 param, updated IN PLACE (live == master)
+    grad: Tensor,
+    exp_avg: Tensor,
+    exp_avg_sq: Tensor,
+    c: AdamWTabs,
+    t: Tensor,
+    eps: float,
+) -> None:
+    """AdamW for the fp32-LIVE scalar params (resid/x0 lambdas, smear, backout
+    — ~30 floats, replicated). They are exempt from the bf16-live/mantissa
+    scheme: the baseline never cast them in forward, and bf16-rounding those
+    per-layer residual-stream multipliers cost +0.016 val bpb early in training
+    (diagnosed 2026-07-29, agent-ops diag_fp32_masters logs)."""
+    grad = grad.to(exp_avg.dtype)
+    p.mul_(c.wd_mul[t])
+    exp_avg.lerp_(grad, c.one_minus_beta1[t])
+    exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[t])
+    denom = exp_avg_sq.sqrt() * c.rsqrt_bias2[t] + eps
+    p.sub_(c.step_size[t] * (exp_avg / denom))
+
+
+@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     live: Tensor,        # bf16 live shard
     mantissa: Tensor,    # uint16, same shape
@@ -614,10 +637,13 @@ def init_optimizer_state(model, ddp_rank=0, ddp_world_size=1):
         state_shape = p.shape if world == 1 else rows[sl].shape  # world=1: kernel runs on the natural shape
         p.exp_avg = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
         p.exp_avg_sq = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
-    # AdamW replicated (scalars)
+    # AdamW replicated (scalars) — fp32-LIVE, no mantissa split (see
+    # adamw_step_fused_fp32). The upcast covers resuming a checkpoint written
+    # while these were briefly bf16-live.
     for p in (model.resid_lambdas, model.x0_lambdas, model.smear_gate,
               model.smear_lambda, model.backout_lambda):
-        p.mantissa = _split_master(p)
+        if p.data.dtype != torch.float32:
+            p.data = p.data.float()
         p.exp_avg = torch.zeros_like(p, dtype=torch.float32)
         p.exp_avg_sq = torch.zeros_like(p, dtype=torch.float32)
 
@@ -704,17 +730,21 @@ def adamw_sharded_update(p, red, tabs, eps, t, world, rank, gathers):
 def adamw_replicated_update(p, tabs, eps, t, world):
     if world > 1:
         dist.all_reduce(p.grad32, op=dist.ReduceOp.AVG)
-    adamw_step_fused(p, p.mantissa, p.grad32, p.exp_avg, p.exp_avg_sq, tabs, t, eps)
+    assert p.dtype == torch.float32, "replicated scalars are fp32-live"
+    adamw_step_fused_fp32(p, p.grad32, p.exp_avg, p.exp_avg_sq, tabs, t, eps)
 
 
 # -----------------------------------------------------------------------------
 # The written-out step.
 
+@torch.no_grad()
 def optimizer_step(model, sched, muls, t):
     """One explicit optimizer step, written out per named tensor. 3-phase: launch
     every async reduce; then in launch order wait -> update owned shard -> launch
     gather; then wait all gathers. Ends by advancing the device step counter.
-    Reads p.grad32 (Muon MUTATES it — nesterov lerp); caller zeroes afterwards."""
+    Reads p.grad32 (Muon MUTATES it — nesterov lerp); caller zeroes afterwards.
+    no_grad is load-bearing for the fp32 scalar kernel's in-place leaf updates
+    (the mantissa kernels only dodge autograd's leaf check via their int views)."""
     world, rank = _dist_info()
     m, eps = model, sched.adamw_eps
 
