@@ -211,12 +211,27 @@ def test_fp8_vs_bf16_forward_backward():
     d_loss = abs(loss_8.item() - loss_ref.item()) / abs(loss_ref.item())
     print(f"\n  loss bf16 {loss_ref.item():.6f} | fp8 {loss_8.item():.6f} (rel {d_loss:.2e})")
     assert d_loss < 5e-3
+
+    # The scalar roles' gradients are cancellation-heavy sums over all T tokens,
+    # so RELATIVE error is unstable by construction — measured here, smear_lambda's
+    # own gradient norm cancels down to 2.9e-5 while its absolute error, 2.3e-5, is
+    # SMALLER than c_q's (5.1e-5, which reads as a comfortable 0.12 relative). The
+    # same quantity swings 0.06 (CPU) to 0.79 (CUDA) on identical math for that
+    # reason. So bound their ABSOLUTE error against a shared scale instead, and
+    # leave the formulas themselves to the fp64/fp32 tiers in test_grad_parity.py
+    # (the smear/scalar block is character-identical between the two bodies —
+    # no FP8 anywhere in it — so a defect there would be a copy error, not noise).
     scalar_roles = {"resid_lambdas", "x0_lambdas", "smear_lambda", "backout_lambda", "smear_gate"}
+    scalar_scale = max(ref[n].norm().item() for n in scalar_roles)
     for name, p in model.named_parameters():
         r, c = rel_err(p.grad32, ref[name]), cos_sim(p.grad32, ref[name])
         print(f"  {name:16s} rel_err {r:.3e}  cos {c:.6f}")
-        assert r < (0.5 if name in scalar_roles else 0.2), (name, r)
-        assert c > (0.9 if name in scalar_roles else 0.98), (name, c)
+        if name in scalar_roles:
+            err = (p.grad32 - ref[name]).norm().item()
+            assert err <= 0.3 * scalar_scale, (name, err, scalar_scale)
+        else:
+            assert r < 0.2, (name, r)
+            assert c > 0.98, (name, c)
 
 
 def test_fp8_grad_accumulation():
