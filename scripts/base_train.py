@@ -186,7 +186,9 @@ assert device_type == "cuda" and COMPUTE_DTYPE == torch.bfloat16, \
 orig_model = model
 train_step_fn = forward_backward
 if args.compile_fwdbwd:
-    train_step_fn = torch.compile(forward_backward, dynamic=False)
+    # fullgraph so any graph break errors loudly instead of silently fragmenting
+    # fusion (the FA3 raw ops have fake impls, so a full trace is achievable)
+    train_step_fn = torch.compile(forward_backward, dynamic=False, fullgraph=True)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.

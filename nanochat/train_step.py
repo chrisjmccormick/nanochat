@@ -151,34 +151,55 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     x_pre = x - model.backout_lambda.to(dt) * x_backout
     xf, r_f = _rms_fwd(x_pre, D)
 
-    # lm_head + softcap + CE loss + dlogits, IN PLACE on the one (T, V) buffer.
+    # lm_head + softcap + CE loss + dlogits. Two implementations of the same
+    # math, split by mode:
+    #  - eager: IN PLACE on the one (T, V) fp32 buffer, row-chunked so temps
+    #    stay chunk-sized (no second full-size fp32 tensor);
+    #  - compiled: a plain out-of-place version — under inductor the in-place
+    #    chunk loop inverts into a liability (functionalization re-materializes
+    #    the buffer; 16 unrolled subgraphs block fusion), so let the compiler
+    #    do the memory planning and fusion it's good at.
     softcap = 15.0
     logits = xf @ model.lm_head.to(dt).mT        # (T, Vp) compute-dtype
     buf_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
-    buf = logits[..., :V].to(buf_dtype)          # THE big fp32 buffer; bf16 logits freed below
-    del logits
     valid = targets >= 0
     n_valid = valid.sum()
-    buf.div_(softcap).tanh_().mul_(softcap)      # buf = cap = 15*tanh(z/15)
-    # Softcap keeps cap in [-15, 15], so softmax probs are bounded below by
-    # ~exp(-30)/V — no underflow anywhere in the in-place chain that follows.
-    loss_sum = torch.zeros((), dtype=buf_dtype, device=buf.device)
-    scale = loss_scale / n_valid.to(buf_dtype)   # 0-dim device tensor; no host sync
-    for r0 in range(0, T, loss_chunk):
-        c = buf[r0:r0 + loss_chunk]              # in-place view; temps are chunk-sized
-        vc = valid[r0:r0 + loss_chunk].to(buf_dtype)
-        y_safe = targets[r0:r0 + loss_chunk].clamp_min(0).unsqueeze(1)
-        cap_y = c.gather(1, y_safe).squeeze(1)
-        m = c.amax(dim=1, keepdim=True)
-        c.sub_(m).exp_()                         # c = exp(cap - m)
-        ssum = c.sum(dim=1, keepdim=True)
-        loss_sum += ((ssum.log() + m).squeeze(1) - cap_y).mul_(vc).sum()
-        f = c.log().add_(m)                      # f = cap, recovered exactly
-        f.div_(softcap).square_().neg_().add_(1.0)   # f = 1 - tanh^2(z/15)
-        c.div_(ssum)                             # c = softmax(cap)
-        c.scatter_add_(1, y_safe, (-vc).unsqueeze(1))  # - onehot on valid rows
-        c.mul_(f).mul_(vc.unsqueeze(1) * scale)  # softcap chain, ignore-mask, 1/n_valid, loss_scale
-    loss = loss_sum / n_valid.to(buf_dtype)
+    if torch.compiler.is_compiling():
+        cap = softcap * torch.tanh(logits[..., :V].to(buf_dtype) / softcap)
+        vmask = valid.to(buf_dtype)
+        y_safe = targets.clamp_min(0).unsqueeze(1)
+        cap_y = cap.gather(1, y_safe).squeeze(1)
+        m = cap.amax(dim=1, keepdim=True)
+        e = (cap - m).exp()
+        ssum = e.sum(dim=1, keepdim=True)
+        lse = (ssum.log() + m).squeeze(1)
+        loss = ((lse - cap_y) * vmask).sum() / n_valid.to(buf_dtype)
+        dcap = (e / ssum).scatter_add(1, y_safe, (-vmask).unsqueeze(1))
+        f = 1.0 - (cap / softcap).square()       # 1 - tanh^2(z/15)
+        buf = dcap * f * (vmask * (loss_scale / n_valid.to(buf_dtype))).unsqueeze(1)
+    else:
+        buf = logits[..., :V].to(buf_dtype)      # THE big fp32 buffer; bf16 logits freed below
+        buf.div_(softcap).tanh_().mul_(softcap)  # buf = cap = 15*tanh(z/15)
+        # Softcap keeps cap in [-15, 15], so softmax probs are bounded below by
+        # ~exp(-30)/V — no underflow anywhere in the in-place chain that follows.
+        loss_sum = torch.zeros((), dtype=buf_dtype, device=buf.device)
+        scale = loss_scale / n_valid.to(buf_dtype)   # 0-dim device tensor; no host sync
+        for r0 in range(0, T, loss_chunk):
+            c = buf[r0:r0 + loss_chunk]          # in-place view; temps are chunk-sized
+            vc = valid[r0:r0 + loss_chunk].to(buf_dtype)
+            y_safe = targets[r0:r0 + loss_chunk].clamp_min(0).unsqueeze(1)
+            cap_y = c.gather(1, y_safe).squeeze(1)
+            m = c.amax(dim=1, keepdim=True)
+            c.sub_(m).exp_()                     # c = exp(cap - m)
+            ssum = c.sum(dim=1, keepdim=True)
+            loss_sum += ((ssum.log() + m).squeeze(1) - cap_y).mul_(vc).sum()
+            f = c.log().add_(m)                  # f = cap, recovered exactly
+            f.div_(softcap).square_().neg_().add_(1.0)   # f = 1 - tanh^2(z/15)
+            c.div_(ssum)                         # c = softmax(cap)
+            c.scatter_add_(1, y_safe, (-vc).unsqueeze(1))  # - onehot on valid rows
+            c.mul_(f).mul_(vc.unsqueeze(1) * scale)  # softcap chain, ignore-mask, 1/n_valid, loss_scale
+        loss = loss_sum / n_valid.to(buf_dtype)
+    del logits
 
     # ==== backward half ====
     dz = buf.to(dt)                              # mirror autograd's cast back through .float()
