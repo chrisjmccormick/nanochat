@@ -7,8 +7,10 @@ or distributed as:
 
 torchrun --nproc_per_node=8 -m scripts.base_train
 
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+fwd-bwd branch: training runs the handwritten forward_backward + explicit
+optimizer flow (nanochat/train_step.py) — no autograd, no torch.optim. CUDA +
+bf16 only (the masters are bf16-live + mantissa pairs); the CPU/MPS path of the
+autograd trainer is gone on this branch.
 """
 
 import os
@@ -25,13 +27,13 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.optim import MuonAdamW, DistMuonAdamW
-from nanochat.schedules import Ramp, AdamWGroup, MuonGroup, build_param_groups
+from nanochat.train_step import (forward_backward, init_optimizer_state, zero_grad32,
+                                 build_schedules, bank_muls, make_step_counter,
+                                 optimizer_step, optim_state_dict, load_optim_state)
 from nanochat.dataloader import tokenizing_distributed_data_loader_varlen
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.fp8 import disable_fp8
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA, FA_VERSION
@@ -45,8 +47,9 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-parser.add_argument("--cudagraphs", action="store_true", help="compile with mode='reduce-overhead' (CUDA graph capture of fwd/bwd)")
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+/sm89 GPU; tensorwise scaling)")
+parser.add_argument("--compile-fwdbwd", action="store_true", help="torch.compile the handwritten forward_backward (run eager first; this is the perf pass)")
+parser.add_argument("--cudagraphs", action="store_true", help="PARKED on the fwd-bwd branch")
+parser.add_argument("--fp8", action="store_true", help="PARKED on the fwd-bwd branch")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -165,16 +168,25 @@ if resuming:
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
-# FP8 training: PARKED on the fwd-bwd branch. The old hook point (nanochat.gpt.linear)
-# no longer exists — fp8 returns as its own handwritten body (forward_backward_fp8).
+# Parked flags. FP8's old hook point (nanochat.gpt.linear) no longer exists — it
+# returns as its own handwritten body (forward_backward_fp8). Cudagraphs made
+# sense wrapping autograd; they come back (if at all) around forward_backward.
 if args.fp8:
     raise NotImplementedError("--fp8 is parked on the fwd-bwd branch; it comes back as forward_backward_fp8")
+if args.cudagraphs:
+    raise NotImplementedError("--cudagraphs is parked on the fwd-bwd branch")
+
+# The explicit trainer is bf16-only (mantissa masters pair with bf16 live params)
+assert device_type == "cuda" and COMPUTE_DTYPE == torch.bfloat16, \
+    "the fwd-bwd trainer requires CUDA + bf16 (mantissa-paired masters)"
 
 # -----------------------------------------------------------------------------
-# Compile the model
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False, fullgraph=True, mode="reduce-overhead" if args.cudagraphs else None) # the inputs to model will never change shape so dynamic=False is safe
+# The model is NOT wrapped in torch.compile: training runs the handwritten
+# forward_backward (optionally compiled itself), and eval uses eager forward().
+orig_model = model
+train_step_fn = forward_backward
+if args.compile_fwdbwd:
+    train_step_fn = torch.compile(forward_backward, dynamic=False)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -260,70 +272,30 @@ print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-#
-# Parameter groups and their schedules are both defined here: every LR, beta and
-# weight decay for every one of the num_iterations steps is pre-computed into
-# per-step update coefficients (see nanochat/schedules.py). The optimizer holds no
-# hyperparameters of its own and the training loop sets nothing per step.
+# Initialize the explicit optimizer flow (nanochat/train_step.py — no torch.optim,
+# no param groups). Every LR, beta and weight decay for every step is pre-computed
+# into named per-step coefficient tables; per-Parameter state (masters as
+# bf16-live + mantissa pairs, moments, grad32 buffers) attaches in place. After
+# init_optimizer_state the whole model is bf16-live; never move it again.
 
-# Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
-dmodel_lr_scale = (model_config.n_embd / 768) ** -0.5
-print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_config.n_embd}/768) = {dmodel_lr_scale:.6f}")
-adamw_lr_scale = batch_lr_scale * dmodel_lr_scale
-
-# One LR shape for the whole run (linear warmup, constant, linear warmdown), scaled
-# below to each group's own peak LR.
-lrm = Ramp(peak=1.0, start=0.0, warmup_steps=args.warmup_steps,
-           end=args.final_lr_frac, cooldown_frac=args.warmdown_ratio)
-# Muon's momentum warms up to 0.97 and comes back down to 0.90 during the LR
-# warmdown; its weight decay cosine-decays to zero over the whole run.
-muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=400,
-                     end=0.90, cooldown_frac=args.warmdown_ratio)
-muon_wd = Ramp(peak=weight_decay_scaled, end=0.0, cooldown_frac=1.0, shape="cosine")
-
-pl = orig_model.named_parameter_lists()
-specs = [
-    # AdamW groups (embeddings, lm_head, scalars). Note the scalars take the batch
-    # LR scaling but not the 1/√dmodel one, and smear is a fixed LR entirely.
-    AdamWGroup(pl['lm_head'],      lr=lrm * (args.unembedding_lr * adamw_lr_scale),       betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
-    AdamWGroup(pl['wte'],          lr=lrm * (args.embedding_lr * adamw_lr_scale),         betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-    AdamWGroup(pl['value_embeds'], lr=lrm * (args.embedding_lr * adamw_lr_scale * 0.5),   betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-    AdamWGroup(pl['resid'],        lr=lrm * (args.scalar_lr * batch_lr_scale * 0.01),     betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
-    AdamWGroup(pl['x0'],           lr=lrm * (args.scalar_lr * batch_lr_scale),            betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-    AdamWGroup(pl['smear'],        lr=lrm * 0.2,                                          betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.0),
-]
-# Muon groups (matrix params, grouped by shape for stacking)
-for shape in sorted({p.shape for p in pl['matrix']}):
-    specs.append(MuonGroup([p for p in pl['matrix'] if p.shape == shape],
-                           lr=lrm * (args.matrix_lr * batch_lr_scale),
-                           momentum=muon_momentum, beta2=0.9,
-                           weight_decay=muon_wd, ns_steps=5))
-
-Factory = DistMuonAdamW if ddp else MuonAdamW
-optimizer = Factory(build_param_groups(specs, num_steps=num_iterations))
-lrm_table = lrm.materialize(num_iterations) # host-side copy, for logging only (no device sync)
+print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_config.n_embd}/768) = {(model_config.n_embd / 768) ** -0.5:.6f}")
+sched = build_schedules(
+    model_dim=model_config.n_embd, num_iterations=num_iterations, device=device,
+    embedding_lr=args.embedding_lr, unembedding_lr=args.unembedding_lr,
+    matrix_lr=args.matrix_lr, scalar_lr=args.scalar_lr,
+    weight_decay=weight_decay_scaled, batch_lr_scale=batch_lr_scale,
+    warmup_steps=args.warmup_steps, warmdown_ratio=args.warmdown_ratio,
+    final_lr_frac=args.final_lr_frac,
+)
+muls = bank_muls(orig_model)
+sched_t = make_step_counter(device)   # THE schedule position, advanced on-device by optimizer_step
+init_optimizer_state(orig_model, ddp_rank, ddp_world_size)
+lrm_table = sched.lrm_table # host-side copy, for logging only (no device sync)
 
 if resuming:
-    optimizer.load_state_dict(optimizer_data)
+    load_optim_state(orig_model, optimizer_data)
+    sched_t.fill_(args.resume_from_step)
     del optimizer_data
-
-# -----------------------------------------------------------------------------
-# Under cudagraph trees ("reduce-overhead"), backward's param-grad outputs live in
-# the capture pool and are overwritten by the next replay. If .grad is None,
-# AccumulateGrad adopts that doomed pool storage as .grad and the next micro-step's
-# backward reads garbage (hard error). Materialize grads once and keep them
-# (zero_grad(set_to_none=False) below) so accumulation targets stable buffers.
-if args.cudagraphs:
-    for p in orig_model.parameters():
-        if p.requires_grad:
-            p.grad = torch.zeros_like(p)
-
-# -----------------------------------------------------------------------------
-# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-if scaler is not None:
-    print0("GradScaler enabled for fp16 training")
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -372,8 +344,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8():
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -391,8 +362,7 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with disable_fp8():
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -418,8 +388,7 @@ while True:
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8():
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
 
@@ -428,8 +397,8 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            orig_model.state_dict(), # model parameters (bf16 live)
+            optim_state_dict(orig_model), # per-rank optimizer state (mantissa/moments)
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -453,33 +422,16 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
+    # single training step: handwritten forward+backward accumulating into
+    # .grad32, then the written-out explicit optimizer step (train_step.py)
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, cu_seqlens, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # loss_scale replaces the loss/grad_accum division of the autograd loop
+        train_loss = train_step_fn(orig_model, x, y, cu_seqlens, loss_scale=1.0 / grad_accum_steps)
         x, y, cu_seqlens, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer (its schedules are pre-computed, so there is nothing to set here)
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
-    model.zero_grad(set_to_none=not args.cudagraphs)
+    optimizer_step(orig_model, sched, muls, sched_t) # schedules pre-computed; advances sched_t on-device
+    zero_grad32(orig_model)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()

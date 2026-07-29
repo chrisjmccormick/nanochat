@@ -462,7 +462,10 @@ def build_schedules(model_dim, num_iterations, device,
     # 0.90 during the LR warmdown; its weight decay cosine-decays to zero.
     lrm = Ramp(peak=1.0, start=0.0, warmup_steps=warmup_steps,
                end=final_lr_frac, cooldown_frac=warmdown_ratio)
-    muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=400,
+    # momentum warmup is 400 steps at any real horizon; the clamp only lets
+    # short smoke/debug runs build a valid schedule (identical for N >= ~1150)
+    mom_warmup = min(400, int(num_iterations * (1 - warmdown_ratio)))
+    muon_momentum = Ramp(peak=0.97, start=0.85, warmup_steps=mom_warmup,
                          end=0.90, cooldown_frac=warmdown_ratio)
     muon_wd = Ramp(peak=weight_decay, end=0.0, cooldown_frac=1.0, shape="cosine")
 
