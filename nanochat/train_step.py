@@ -44,11 +44,20 @@ from nanochat.schedules import Ramp, MuonCoeffs, _as_table, _bias_correction, _t
 # -----------------------------------------------------------------------------
 # grad32 buffers
 
-def init_grad_buffers(model, dtype=torch.float32):
+def init_grad_buffers(model, dtype=None):
     """Attach a full-size, zeroed `.grad32` to every parameter. Call once, after
-    the model is on its device; zero with zero_grad32() between steps."""
+    the model is on its device; zero with zero_grad32() between steps.
+
+    Default (dtype=None): fp32 everywhere EXCEPT the token/value embeddings,
+    which accumulate in bf16 — they are the two biggest tensors in the model
+    and fp32 grads double their scatter traffic and (world>1) comm bytes; bf16
+    there matches the autograd baseline's numerics (bf16 params -> bf16 .grad).
+    An explicit dtype overrides everything (the fp64 parity tier)."""
+    embeddings = (model.wte, model.value_embeds)
     for p in model.parameters():
-        p.grad32 = torch.zeros(p.shape, dtype=dtype, device=p.device)
+        d = dtype if dtype is not None else \
+            (torch.bfloat16 if any(p is e for e in embeddings) else torch.float32)
+        p.grad32 = torch.zeros(p.shape, dtype=d, device=p.device)
 
 
 def zero_grad32(model):
@@ -97,7 +106,8 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     V = cfg.vocab_size
     max_seq_len = cfg.sequence_len
     dt = gpt_mod.COMPUTE_DTYPE
-    g32 = model.wte.grad32.dtype
+    g32 = model.c_q.grad32.dtype       # matrix/scalar grad dtype (fp32; fp64 in the exact tier)
+    gemb = model.wte.grad32.dtype      # embedding grad dtype (bf16 by default — see init_grad_buffers)
     gch = model.ve_gate_channels
 
     assert T > 1, "Training forward pass should have T > 1"
@@ -255,7 +265,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
             d_zg = d_g * (3 * sg * (1 - sg))
             model.ve_gate.grad32[j].add_((d_zg.mT @ xn[..., :gch]).to(g32))
             d_ve = (dv * (3 * sg).unsqueeze(-1)).reshape(T, nkv * hd)
-            model.value_embeds.grad32[j].index_add_(0, idx, d_ve.to(g32))
+            model.value_embeds.grad32[j].index_add_(0, idx, d_ve.to(gemb))
             d_xn_ve = d_zg @ model.ve_gate[j].to(dt)
         # dv passes through the VE add unchanged: v = v0 + g*ve
         d_q0 = d_q0.view(T, nh * hd)
@@ -289,7 +299,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
     d_xe[1:, :24] += d_zs @ model.smear_gate.to(dt)
     # --- embedding norm + token embedding scatter ---
     d_emb = _rms_bwd(d_xe, xe, r_e)
-    model.wte.grad32.index_add_(0, idx, d_emb.to(g32))
+    model.wte.grad32.index_add_(0, idx, d_emb.to(gemb))
 
     return loss
 
@@ -360,6 +370,7 @@ def adamw_step_fused(
     the step host-free); moments are always fp32 here, so the lerp weights need
     no dtype casts."""
     p = _master(live, mantissa)
+    grad = grad.to(exp_avg.dtype)  # embeddings hand in bf16 grads; moment math stays fp32
     p.mul_(c.wd_mul[t])
     exp_avg.lerp_(grad, c.one_minus_beta1[t])
     exp_avg_sq.lerp_(grad.square(), c.one_minus_beta2[t])
@@ -652,7 +663,8 @@ def adamw_sharded_reduce(p, world):
         return p.grad32
     g = p.grad32.view(-1, p.shape[-1])
     rs = g.shape[0] // world
-    shard = torch.empty(rs, g.shape[-1], dtype=torch.float32, device=p.device)
+    # comms run in the grad buffer's dtype: bf16 for the embeddings, fp32 else
+    shard = torch.empty(rs, g.shape[-1], dtype=p.grad32.dtype, device=p.device)
     work = dist.reduce_scatter_tensor(shard, g, op=dist.ReduceOp.AVG, async_op=True)
     return (work, shard)
 

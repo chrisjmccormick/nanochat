@@ -112,10 +112,12 @@ def _run_step_parity(compiled):
                 bank_grad = getattr(model, role).grad32
                 for i, q in enumerate(pl[role]):
                     q.grad = bank_grad[i].clone()
+            # .float(): the embedding grad buffers are bf16 now; the fp32-live
+            # reference gets the same VALUES upcast (the kernel upcasts too)
             for i, q in enumerate(pl["value_embeds"]):
-                q.grad = model.value_embeds.grad32[i].clone()
+                q.grad = model.value_embeds.grad32[i].clone().float()
             for name in singles:
-                ref[name].grad = getattr(model, name).grad32.clone()
+                ref[name].grad = getattr(model, name).grad32.clone().float()
 
             old.step()
             ts.optimizer_step(model, sched, muls, t)  # NOTE: mutates grad32 (nesterov lerp)

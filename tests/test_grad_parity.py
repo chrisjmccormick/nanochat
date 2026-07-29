@@ -175,7 +175,9 @@ def test_grad_parity_fp32_sdpa_d12():
         idx, targets, cu = make_batch(32768, 8192, 2048, "cuda")
         loss_ref = model(idx, cu, targets)
         loss_ref.backward()
-        init_grad_buffers(model)
+        # explicit fp32 buffers: this tier is the precise guard, and under the
+        # fp32 COMPUTE_DTYPE patch the autograd reference grads are fp32 too
+        init_grad_buffers(model, dtype=torch.float32)
         loss = forward_backward(model, idx, targets, cu, loss_scale=1.0)
         assert abs(loss.item() - loss_ref.item()) / abs(loss_ref.item()) < 1e-6
         for name, p in model.named_parameters():
