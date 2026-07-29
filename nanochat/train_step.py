@@ -62,6 +62,13 @@ def init_grad_buffers(model, dtype=None):
         d = dtype if dtype is not None else \
             (torch.bfloat16 if any(p is e for e in embeddings) else torch.float32)
         p.grad32 = torch.zeros(p.shape, dtype=d, device=p.device)
+        if p.ndim == 3:
+            # Per-slice VIEWS for the banked params. The bodies accumulate
+            # through these, never through `grad32[i]`: an in-graph bank slice
+            # functionalizes into a whole-bank select_scatter copy (10-20x the
+            # slice add at speedrun bank sizes), while views created OUTSIDE
+            # the graph arrive as inputs and mutate genuinely in place.
+            p.grad32_slices = list(p.grad32.unbind(0))
 
 
 def zero_grad32(model):
@@ -106,28 +113,15 @@ def _rms_bwd_scaled(dy, ys, r, s):
 # -----------------------------------------------------------------------------
 # landing bank gradients
 
-def _land_bank_grads(model, *, g_cq, g_ck, g_cv, g_ap, g_fc, g_mp,
-                     g_resid, g_x0, g_ve, g_veg):
-    """Land the per-layer gradient pieces the backward loop collected (in
-    REVERSED layer order) as one full-tensor add per bank. Slice accumulation
-    (`bank.grad32[i].add_`) must not appear inside the compiled bodies:
-    functionalization rewrites it into a whole-bank select_scatter copy,
-    10-20x the cost of the slice add at speedrun bank sizes. add_ promotes the
-    bf16/compute-dtype pieces to the buffer dtype, same numerics as the old
-    per-slice `.to(g32)`."""
-    model.c_q.grad32.add_(torch.stack(g_cq[::-1]))
-    model.c_k.grad32.add_(torch.stack(g_ck[::-1]))
-    model.c_v.grad32.add_(torch.stack(g_cv[::-1]))
-    model.attn_proj.grad32.add_(torch.stack(g_ap[::-1]))
-    model.mlp_fc.grad32.add_(torch.stack(g_fc[::-1]))
-    model.mlp_proj.grad32.add_(torch.stack(g_mp[::-1]))
+def _land_scalar_grads(model, g_resid, g_x0):
+    """Land the per-layer resid/x0 scalar sums (collected in REVERSED layer
+    order) as one stacked add each. Matrix/VE/gate banks don't come through
+    here any more — their wgrads add directly into `grad32_slices[i]`, the
+    per-slice views init_grad_buffers creates OUTSIDE the graph (an in-graph
+    `bank.grad32[i].add_` functionalizes into a whole-bank select_scatter
+    copy; a pre-made view input mutates in place)."""
     model.resid_lambdas.grad32.add_(torch.stack(g_resid[::-1]))
     model.x0_lambdas.grad32.add_(torch.stack(g_x0[::-1]))
-    def merged(d, k):  # one slice per table; repeats (table shared by layers) summed
-        assert sorted(d) == list(range(k)), f"VE tables seen {sorted(d)}, bank has {k}"
-        return torch.stack([d[j][0] if len(d[j]) == 1 else sum(d[j]) for j in range(k)])
-    model.value_embeds.grad32.add_(merged(g_ve, model.value_embeds.grad32.shape[0]))
-    model.ve_gate.grad32.add_(merged(g_veg, model.ve_gate.grad32.shape[0]))
 
 
 # -----------------------------------------------------------------------------
@@ -279,12 +273,9 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         del dz
 
     # ==== backward half ====
-    # Bank gradients are COLLECTED per layer and landed as one full-bank add
-    # after the loop: an in-graph `bank[i].add_` functionalizes into a
-    # whole-bank select_scatter copy (10-20x the slice add at d24 bank sizes),
-    # while a full-tensor add on a graph input stays genuinely in place.
-    g_cq = []; g_ck = []; g_cv = []; g_ap = []; g_fc = []; g_mp = []
-    g_resid = []; g_x0 = []; g_ve = {}; g_veg = {}
+    # Bank wgrads add directly into grad32_slices views; only the per-layer
+    # scalar sums are collected and landed stacked (_land_scalar_grads).
+    g_resid = []; g_x0 = []
 
     d_pre = _rms_bwd(dxf, xf, r_f)
     model.backout_lambda.grad32.add_(-(d_pre * x_backout).sum(dtype=g32))
@@ -298,15 +289,15 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         # --- MLP backward (relu^2: dh = 2*a*du, self-masking since a = relu(h)) ---
         x1, a = st["x1"], st["a"]
         d_u = d_stream @ model.mlp_proj[i].to(dt)
-        g_mp.append(d_stream.mT @ a.square())
+        model.mlp_proj.grad32_slices[i].add_(d_stream.mT @ a.square())
         d_h = 2.0 * a * d_u
         xm, r_xm = _rms_fwd(x1, D)               # cheap recompute (bitwise: same input)
-        g_fc.append(d_h.mT @ xm)
+        model.mlp_fc.grad32_slices[i].add_(d_h.mT @ xm)
         d_xm = d_h @ model.mlp_fc[i].to(dt)
         d_x1 = d_stream + _rms_bwd(d_xm, xm, r_xm)
         # --- attention backward ---
         xn, y = st["xn"], st["y"]
-        g_ap.append(d_x1.mT @ y.view(T, -1))
+        model.attn_proj.grad32_slices[i].add_(d_x1.mT @ y.view(T, -1))
         d_y = (d_x1 @ model.attn_proj[i].to(dt)).view(T, nh, hd)
         dqf, dkf, dv = flash_attn_varlen_bwd(
             d_y, st["qf"], st["kf"], st["v"], y, st["lse"], cu_seqlens, max_seq_len,
@@ -327,20 +318,20 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
             sg = torch.sigmoid(xn[..., :gch] @ model.ve_gate[j].to(dt).mT)
             d_g = (dv * ve).sum(dim=-1)          # (T, n_kv_head)
             d_zg = d_g * (3 * sg * (1 - sg))
-            g_veg.setdefault(j, []).append(d_zg.mT @ xn[..., :gch])
+            model.ve_gate.grad32_slices[j].add_(d_zg.mT @ xn[..., :gch])
             d_ve = (dv * (3 * sg).unsqueeze(-1)).reshape(T, nkv * hd)
             # embedding_dense_backward (autograd's own lowering) beats raw
             # index_add_ atomics ~2x at these shapes — see the GH200 trace hunt
-            g_ve.setdefault(j, []).append(
+            model.value_embeds.grad32_slices[j].add_(
                 torch.ops.aten.embedding_dense_backward(d_ve.to(gemb), idx, Vp, -1, False))
             d_xn_ve = d_zg @ model.ve_gate[j].to(dt)
         # dv passes through the VE add unchanged: v = v0 + g*ve
         d_q0 = d_q0.view(T, nh * hd)
         d_k0 = d_k0.view(T, nkv * hd)
         d_v0 = dv.reshape(T, nkv * hd)
-        g_cq.append(d_q0.mT @ xn)
-        g_ck.append(d_k0.mT @ xn)
-        g_cv.append(d_v0.mT @ xn)
+        model.c_q.grad32_slices[i].add_(d_q0.mT @ xn)
+        model.c_k.grad32_slices[i].add_(d_k0.mT @ xn)
+        model.c_v.grad32_slices[i].add_(d_v0.mT @ xn)
         d_xn = d_q0 @ model.c_q[i].to(dt) + d_k0 @ model.c_k[i].to(dt) + d_v0 @ model.c_v[i].to(dt)
         if d_xn_ve is not None:
             d_xn[:, :gch] += d_xn_ve
@@ -352,8 +343,7 @@ def forward_backward(model, idx, targets, cu_seqlens, loss_scale=1.0,
         d_stream = model.resid_lambdas[i] * d_b
         stash[i] = None                          # free this layer's stash as we go
 
-    _land_bank_grads(model, g_cq=g_cq, g_ck=g_ck, g_cv=g_cv, g_ap=g_ap, g_fc=g_fc,
-                     g_mp=g_mp, g_resid=g_resid, g_x0=g_x0, g_ve=g_ve, g_veg=g_veg)
+    _land_scalar_grads(model, g_resid, g_x0)
 
     # d_stream is now the grad through layer 0's input, which IS x0 (same tensor)
     d_xs = d_x0 + d_stream                       # grad wrt the smeared embedding
@@ -569,11 +559,9 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         del dz
 
     # ==== backward half ====
-    # Bank gradients are COLLECTED per layer and landed as one full-bank add
-    # after the loop — see _land_bank_grads for why slice adds are forbidden
-    # inside the compiled bodies.
-    g_cq = []; g_ck = []; g_cv = []; g_ap = []; g_fc = []; g_mp = []
-    g_resid = []; g_x0 = []; g_ve = {}; g_veg = {}
+    # Bank wgrads add directly into grad32_slices views; only the per-layer
+    # scalar sums are collected and landed stacked (_land_scalar_grads).
+    g_resid = []; g_x0 = []
 
     d_pre = _rms_bwd(dxf, xf, r_f)
     model.backout_lambda.grad32.add_(-(d_pre * x_backout).sum(dtype=g32))
@@ -588,17 +576,17 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         x1, a = st["x1"], st["a"]
         s_ds = fp8.tensor_scale(d_stream, E5M2)
         d_u = fp8.mm(fp8.row(d_stream, E5M2, s_ds), fp8.F8(w_mp.colT[i], w_mp.s[i].reciprocal()), dt)
-        g_mp.append(fp8.mm(fp8.col(d_stream, E5M2, s_ds), fp8.col(a.square(), E4M3, st["s_a2"]), dt))
+        model.mlp_proj.grad32_slices[i].add_(fp8.mm(fp8.col(d_stream, E5M2, s_ds), fp8.col(a.square(), E4M3, st["s_a2"]), dt))
         d_h = 2.0 * a * d_u
         xm, r_xm = _rms_fwd(x1, D)               # cheap recompute (bitwise: same input)
         s_dh = fp8.tensor_scale(d_h, E5M2)
-        g_fc.append(fp8.mm(fp8.col(d_h, E5M2, s_dh), fp8.col(xm, E4M3, st["s_xm"]), dt))
+        model.mlp_fc.grad32_slices[i].add_(fp8.mm(fp8.col(d_h, E5M2, s_dh), fp8.col(xm, E4M3, st["s_xm"]), dt))
         d_xm = fp8.mm(fp8.row(d_h, E5M2, s_dh), fp8.F8(w_fc.colT[i], w_fc.s[i].reciprocal()), dt)
         d_x1 = d_stream + _rms_bwd(d_xm, xm, r_xm)
         # --- attention backward ---
         xn, y = st["xn"], st["y"]
         s_dx1 = fp8.tensor_scale(d_x1, E5M2)
-        g_ap.append(fp8.mm(fp8.col(d_x1, E5M2, s_dx1), fp8.col(y.view(T, -1), E4M3, st["s_y"]), dt))
+        model.attn_proj.grad32_slices[i].add_(fp8.mm(fp8.col(d_x1, E5M2, s_dx1), fp8.col(y.view(T, -1), E4M3, st["s_y"]), dt))
         d_y = fp8.mm(fp8.row(d_x1, E5M2, s_dx1), fp8.F8(w_ap.colT[i], w_ap.s[i].reciprocal()), dt).view(T, nh, hd)
         dqf, dkf, dv = flash_attn_varlen_bwd(
             d_y, st["qf"], st["kf"], st["v"], y, st["lse"], cu_seqlens, max_seq_len,
@@ -619,11 +607,11 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
             sg = torch.sigmoid(xn[..., :gch] @ model.ve_gate[j].to(dt).mT)
             d_g = (dv * ve).sum(dim=-1)          # (T, n_kv_head)
             d_zg = d_g * (3 * sg * (1 - sg))
-            g_veg.setdefault(j, []).append(d_zg.mT @ xn[..., :gch])
+            model.ve_gate.grad32_slices[j].add_(d_zg.mT @ xn[..., :gch])
             d_ve = (dv * (3 * sg).unsqueeze(-1)).reshape(T, nkv * hd)
             # embedding_dense_backward (autograd's own lowering) beats raw
             # index_add_ atomics ~2x at these shapes — see the GH200 trace hunt
-            g_ve.setdefault(j, []).append(
+            model.value_embeds.grad32_slices[j].add_(
                 torch.ops.aten.embedding_dense_backward(d_ve.to(gemb), idx, Vp, -1, False))
             d_xn_ve = d_zg @ model.ve_gate[j].to(dt)
         # dv passes through the VE add unchanged: v = v0 + g*ve
@@ -634,9 +622,9 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         s_dq = fp8.tensor_scale(d_q0, E5M2)
         s_dk = fp8.tensor_scale(d_k0, E5M2)
         s_dv = fp8.tensor_scale(d_v0, E5M2)
-        g_cq.append(fp8.mm(fp8.col(d_q0, E5M2, s_dq), xnt, dt))
-        g_ck.append(fp8.mm(fp8.col(d_k0, E5M2, s_dk), xnt, dt))
-        g_cv.append(fp8.mm(fp8.col(d_v0, E5M2, s_dv), xnt, dt))
+        model.c_q.grad32_slices[i].add_(fp8.mm(fp8.col(d_q0, E5M2, s_dq), xnt, dt))
+        model.c_k.grad32_slices[i].add_(fp8.mm(fp8.col(d_k0, E5M2, s_dk), xnt, dt))
+        model.c_v.grad32_slices[i].add_(fp8.mm(fp8.col(d_v0, E5M2, s_dv), xnt, dt))
         d_xn = fp8.mm(fp8.row(d_q0, E5M2, s_dq), fp8.F8(w_cq.colT[i], w_cq.s[i].reciprocal()), dt) \
              + fp8.mm(fp8.row(d_k0, E5M2, s_dk), fp8.F8(w_ck.colT[i], w_ck.s[i].reciprocal()), dt) \
              + fp8.mm(fp8.row(d_v0, E5M2, s_dv), fp8.F8(w_cv.colT[i], w_cv.s[i].reciprocal()), dt)
@@ -650,8 +638,7 @@ def forward_backward_fp8(model, idx, targets, cu_seqlens, loss_scale=1.0,
         d_stream = model.resid_lambdas[i] * d_b
         stash[i] = None                          # free this layer's stash as we go
 
-    _land_bank_grads(model, g_cq=g_cq, g_ck=g_ck, g_cv=g_cv, g_ap=g_ap, g_fc=g_fc,
-                     g_mp=g_mp, g_resid=g_resid, g_x0=g_x0, g_ve=g_ve, g_veg=g_veg)
+    _land_scalar_grads(model, g_resid, g_x0)
 
     # d_stream is now the grad through layer 0's input, which IS x0 (same tensor)
     d_xs = d_x0 + d_stream                       # grad wrt the smeared embedding
