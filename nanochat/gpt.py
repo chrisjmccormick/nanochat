@@ -54,150 +54,321 @@ def has_ve(layer_idx, n_layer):
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
+def compute_window_sizes(config):
+    """
+    Compute per-layer window sizes for sliding window attention.
+
+    Returns list of (left, right) tuples for FA3's window_size parameter:
+    - left: how many tokens before current position to attend to (-1 = unlimited)
+    - right: how many tokens after current position to attend to (0 for causal)
+
+    Pattern string is tiled across layers. Final layer always gets L (full context).
+    Characters: L=long (full context), S=short (quarter context)
+    """
+    pattern = config.window_pattern.upper()
+    assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+    long_window = config.sequence_len
+    short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+    char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+    window_sizes = [char_to_window[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+    window_sizes[-1] = (long_window, 0)  # final layer always gets full context
+    return window_sizes
+
+
+@dataclass
+class Dims:
+    """Every axis in the model, named. Built once from the config; the allocation
+    block in GPT.__init__ spells each shape with these names rather than
+    recomputing products inline.
+
+    This is the single source of truth for "which axis is this?", which is what
+    the optimizer's shard axis and NorMuon reduction axis key off (see
+    train_step.init_optimizer_state). Those used to be re-derived from the
+    tensor's own proportions -- `red_dim` returned -1 or -2 based on
+    `shape[-2] >= shape[-1]` -- which agreed with the intended axis by luck
+    until d24, where ve_gate's (n_kv_head, gate_ch) flips from wide to square
+    to tall as depth grows. Naming the axis at creation removes the guess.
+    """
+    layer: int        # transformer layers
+    d_model: int      # residual stream width (config.n_embd)
+    n_head: int       # query heads
+    n_kv_head: int    # key/value heads (GQA)
+    head_dim: int     # width of one head
+    q: int            # n_head * head_dim     -- fused query width
+    kv: int           # n_kv_head * head_dim  -- fused key/value width
+    mlp: int          # 4 * d_model           -- MLP hidden width
+    vocab: int        # PADDED vocab (what every tensor is actually sized to)
+    vocab_used: int   # real vocab; rows in [vocab_used, vocab) never get gradient
+    ve_slot: int      # value-embedding bank slots (one per VE layer)
+    gate_ch: int      # channels the VE gate reads off the normed stream
+    smear_ch: int     # channels the smear gate reads off the embedding
+
+    @staticmethod
+    def from_config(config, pad_vocab_size_to=64):
+        head_dim = config.n_embd // config.n_head
+        assert config.n_embd % config.n_head == 0
+        assert config.n_kv_head <= config.n_head and config.n_head % config.n_kv_head == 0
+        # Pad vocab for efficiency (DDP, tensor cores). Outputs are cropped in forward().
+        padded = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        return Dims(
+            layer=config.n_layer,
+            d_model=config.n_embd,
+            n_head=config.n_head,
+            n_kv_head=config.n_kv_head,
+            head_dim=head_dim,
+            q=config.n_head * head_dim,
+            kv=config.n_kv_head * head_dim,
+            mlp=4 * config.n_embd,
+            vocab=padded,
+            vocab_used=config.vocab_size,
+            ve_slot=len([i for i in range(config.n_layer) if has_ve(i, config.n_layer)]),
+            gate_ch=12,
+            smear_ch=24,
+        )
+
+
+def scaling_param_counts(config, pad_vocab_size_to=64):
+    """Parameter counts as pure config arithmetic -- no model, no allocation.
+
+    base_train needs these BEFORE it can size anything (the training horizon,
+    batch size and LR scaling all derive from the parameter count, and the d12
+    reference point needs a count for a model that is never built). It used to
+    get them by constructing a throwaway GPT on the meta device and summing
+    `p.numel()`; the numbers were always this arithmetic wearing a costume.
+
+    GPT.num_scaling_params() calls this and then asserts it against the real
+    allocated tensors, so the two can't drift.
+
+    Different papers use different conventions -- Kaplan et al. excluded
+    embedding parameters, Chinchilla included all -- so each group is returned
+    separately and the caller picks.
+    Ref: https://arxiv.org/abs/2203.15556 (Chinchilla)
+    Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al.)
+    """
+    d = Dims.from_config(config, pad_vocab_size_to)
+    wte = d.vocab * d.d_model
+    lm_head = d.vocab * d.d_model
+    value_embeds = d.ve_slot * d.vocab * d.kv
+    transformer_matrices = (
+        d.layer * d.q * d.d_model            # c_q
+        + d.layer * d.kv * d.d_model         # c_k
+        + d.layer * d.kv * d.d_model         # c_v
+        + d.layer * d.d_model * d.q          # attn_proj
+        + d.layer * d.mlp * d.d_model        # mlp_fc
+        + d.layer * d.d_model * d.mlp        # mlp_proj
+        + d.ve_slot * d.n_kv_head * d.gate_ch  # ve_gate
+    )
+    scalars = (
+        d.layer                # resid_lambdas
+        + d.layer              # x0_lambdas
+        + 1 * d.smear_ch       # smear_gate
+        + 1                    # smear_lambda
+        + 1                    # backout_lambda
+    )
+    return {
+        'wte': wte,
+        'value_embeds': value_embeds,
+        'lm_head': lm_head,
+        'transformer_matrices': transformer_matrices,
+        'scalars': scalars,
+        'total': wte + value_embeds + lm_head + transformer_matrices + scalars,
+    }
+
+
+def estimate_flops(config, pad_vocab_size_to=64):
+    """
+    Return the estimated FLOPs per token for the model (forward + backward).
+    Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
+    Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
+    On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
+    With sliding windows, effective_seq_len varies per layer (capped by window size).
+    Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
+    This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
+    - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
+    - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+    """
+    counts = scaling_param_counts(config, pad_vocab_size_to)
+    # Only matmul weights count: embeddings are a lookup, scalars are elementwise.
+    matmul_params = counts['transformer_matrices'] + counts['lm_head']
+    h, q, t = config.n_head, config.n_embd // config.n_head, config.sequence_len
+    attn_flops = 0
+    for window, _right in compute_window_sizes(config):
+        effective_seq = t if window < 0 else min(window, t)
+        attn_flops += 12 * h * q * effective_seq
+    return 6 * matmul_params + attn_flops
+
+
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=64):
-        """
-        NOTE a major footgun: this __init__ function runs in meta device context (!!)
-        Therefore, any calculations inside here are shapes and dtypes only, no actual data.
-        => We actually initialize all data (parameters, buffers, etc.) in init_weights() instead.
+    def __init__(self, config, device=None, pad_vocab_size_to=64):
+        """Allocate every tensor in the model, ON `device`, at its final dtype.
+
+        There is no meta-device phase and no `.to(device)`: `device` is threaded
+        into the allocation itself. The old three-step dance (build on meta ->
+        to_empty(device) -> init_weights) existed only because nn.Module's
+        default construction site is the CPU; it cost a host-RAM copy of the
+        whole model, a PCIe transfer, and an unenforceable rule that __init__
+        must not touch data. That rule got violated silently: backout_lambda and
+        smear_gate were nominally initialized here, never ran under meta, and
+        every tuned baseline actually trained from to_empty()'s zeroed storage.
+
+        Contents are UNINITIALIZED. Fill them exactly once, with either:
+          - init_weights()                       fresh run
+          - checkpoint_manager.load_model_state  resume / inference
+
+        Dtypes are the ones each tensor ends the setup at, so nothing is ever
+        re-cast in place afterwards:
+          - wte / value_embeds : COMPUTE_DTYPE. The two biggest tensors; the
+            optimizer tolerates reduced-precision embeddings. (The parity tests
+            monkeypatch COMPUTE_DTYPE to fp64/fp32 -- reading it here is what
+            makes those tiers work.)
+          - every other matmul weight : fp32 here, converted to the bf16-live +
+            uint16-mantissa master pair by train_step.init_optimizer_state.
+            Inference never calls that, so for inference these stay fp32 and
+            load_model_state assigns whatever dtype the checkpoint holds.
+          - the five scalars : fp32-live permanently, no mantissa pair (bf16
+            rounding of the residual multipliers cost +0.016 val bpb).
         """
         super().__init__()
         self.config = config
-        n_layer, n_embd = config.n_layer, config.n_embd
-        self.head_dim = n_embd // config.n_head
-        assert n_embd % config.n_head == 0
-        assert config.n_kv_head <= config.n_head and config.n_head % config.n_kv_head == 0
-        q_dim = config.n_head * self.head_dim
-        kv_dim = config.n_kv_head * self.head_dim
-        # Compute per-layer window sizes for sliding window attention
-        # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
-        self.window_sizes = self._compute_window_sizes(config)
-        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
-        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
-        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
-        if padded_vocab_size != config.vocab_size:
-            print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
-        self.padded_vocab_size = padded_vocab_size
+        d = Dims.from_config(config, pad_vocab_size_to)
+        self.dims = d
+        self.pad_vocab_size_to = pad_vocab_size_to  # so the count helpers can re-derive Dims
+        # Kept as attributes because every forward body reads them off the model.
+        self.head_dim = d.head_dim
+        self.padded_vocab_size = d.vocab
+        self.ve_gate_channels = d.gate_ch
+        if d.vocab != config.vocab_size:
+            print0(f"Padding vocab_size from {config.vocab_size} to {d.vocab} for efficiency")
+        # window_size is (left, right): (-1, 0) full context, (N, 0) sliding window
+        self.window_sizes = compute_window_sizes(config)
+        # Value embeddings (ResFormer-style) live on alternating layers, last always
+        # included. Banked over just the VE layers; ve_index maps layer -> bank slot
+        # (-1 = no VE on this layer) and is read by every forward body.
+        self.ve_layers = [i for i in range(d.layer) if has_ve(i, d.layer)]
+        self.ve_index = [self.ve_layers.index(i) if i in self.ve_layers else -1 for i in range(d.layer)]
 
-        # --- All parameters, owned directly by this module (no submodules) ---
-        # Token embedding and unembedding (used via F.embedding / raw matmul)
-        self.wte = nn.Parameter(torch.empty(padded_vocab_size, n_embd))
-        self.lm_head = nn.Parameter(torch.empty(padded_vocab_size, n_embd))
-        # Per-layer attention and MLP weights as banks: layer index on dim 0, each
-        # slice in the (out_features, in_features) convention of F.linear.
-        self.c_q = nn.Parameter(torch.empty(n_layer, q_dim, n_embd))
-        self.c_k = nn.Parameter(torch.empty(n_layer, kv_dim, n_embd))
-        self.c_v = nn.Parameter(torch.empty(n_layer, kv_dim, n_embd))
-        self.attn_proj = nn.Parameter(torch.empty(n_layer, n_embd, q_dim))
-        self.mlp_fc = nn.Parameter(torch.empty(n_layer, 4 * n_embd, n_embd))
-        self.mlp_proj = nn.Parameter(torch.empty(n_layer, n_embd, 4 * n_embd))
-        # Value embeddings (ResFormer-style) + their input-dependent gates: alternating
-        # layers, last always included. Banked over just the VE layers; ve_index maps
-        # layer index -> bank slot (-1 = layer has no VE), used by every forward body.
-        self.ve_gate_channels = 12
-        self.ve_layers = [i for i in range(n_layer) if has_ve(i, n_layer)]
-        self.ve_index = [self.ve_layers.index(i) if i in self.ve_layers else -1 for i in range(n_layer)]
-        n_ve = len(self.ve_layers)
-        self.value_embeds = nn.Parameter(torch.empty(n_ve, padded_vocab_size, kv_dim))
-        self.ve_gate = nn.Parameter(torch.empty(n_ve, config.n_kv_head, self.ve_gate_channels))
-        # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas: scales the residual stream at each layer
-        # x0_lambdas: blends initial embedding back in at each layer
-        # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.empty(n_layer))
-        self.x0_lambdas = nn.Parameter(torch.empty(n_layer))
-        # Smear: mix previous token's embedding into current token (cheap bigram-like info)
-        self.smear_gate = nn.Parameter(torch.empty(1, 24))
-        self.smear_lambda = nn.Parameter(torch.empty(1))
-        # Backout: subtract cached mid-layer residual before final norm to remove low-level features
-        self.backout_lambda = nn.Parameter(torch.empty(1))
+        # fp16 is the one COMPUTE_DTYPE that cannot hold the embeddings: GradScaler
+        # cannot unscale fp16 gradients, so they stay fp32 there. Read at call time,
+        # not import time, so the parity tests' COMPUTE_DTYPE monkeypatch applies.
+        embed_dtype = torch.float32 if COMPUTE_DTYPE == torch.float16 else COMPUTE_DTYPE
 
-        # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
-        # Rotary embeddings are small in memory, so we over-compute generously. With varlen
-        # training the full micro-batch is one sequence (T = batch_size * seq_len), so we need
-        # enough headroom for that. 64X covers batch sizes up to 64, and the assert in forward
-        # will catch if we ever exceed.
+        # --- Parameters. All owned directly by this module (no submodules), so
+        # each name below is also its checkpoint key. Banks stack the layer index
+        # on dim 0; each slice keeps F.linear's (out_features, in_features)
+        # convention and is consumed as `x @ w.mT`.
+        #
+        # Written out one tensor per line, deliberately: the shape, the dtype and
+        # therefore the memory cost of every tensor in the model is readable in
+        # one place, and the axis names say which dimension is which for the
+        # sharding and reduction declarations in init_optimizer_state.
+
+        # Token embedding and unembedding (untied). F.embedding / raw matmul.
+        self.wte     = nn.Parameter(torch.empty(d.vocab, d.d_model, dtype=embed_dtype, device=device))
+        self.lm_head = nn.Parameter(torch.empty(d.vocab, d.d_model, dtype=torch.float32, device=device))
+
+        # Attention weight banks.
+        self.c_q       = nn.Parameter(torch.empty(d.layer, d.q,       d.d_model, dtype=torch.float32, device=device))
+        self.c_k       = nn.Parameter(torch.empty(d.layer, d.kv,      d.d_model, dtype=torch.float32, device=device))
+        self.c_v       = nn.Parameter(torch.empty(d.layer, d.kv,      d.d_model, dtype=torch.float32, device=device))
+        self.attn_proj = nn.Parameter(torch.empty(d.layer, d.d_model, d.q,       dtype=torch.float32, device=device))
+
+        # MLP weight banks (relu^2, 4x expansion).
+        self.mlp_fc    = nn.Parameter(torch.empty(d.layer, d.mlp,     d.d_model, dtype=torch.float32, device=device))
+        self.mlp_proj  = nn.Parameter(torch.empty(d.layer, d.d_model, d.mlp,     dtype=torch.float32, device=device))
+
+        # Value embeddings + their input-dependent gates, banked over VE slots.
+        self.value_embeds = nn.Parameter(torch.empty(d.ve_slot, d.vocab,    d.kv,      dtype=embed_dtype, device=device))
+        self.ve_gate      = nn.Parameter(torch.empty(d.ve_slot, d.n_kv_head, d.gate_ch, dtype=torch.float32, device=device))
+
+        # Per-layer learnable scalars (modded-nanogpt style). Separate parameters
+        # so each can take its own optimizer treatment.
+        self.resid_lambdas  = nn.Parameter(torch.empty(d.layer, dtype=torch.float32, device=device))  # residual stream scale
+        self.x0_lambdas     = nn.Parameter(torch.empty(d.layer, dtype=torch.float32, device=device))  # blend x0 back in
+        self.smear_gate     = nn.Parameter(torch.empty(1, d.smear_ch, dtype=torch.float32, device=device))  # prev-token mix gate
+        self.smear_lambda   = nn.Parameter(torch.empty(1, dtype=torch.float32, device=device))
+        self.backout_lambda = nn.Parameter(torch.empty(1, dtype=torch.float32, device=device))
+
+        # --- Buffers. Rotary embeddings are cheap, so over-compute generously:
+        # with varlen training the whole micro-batch is one sequence
+        # (T = batch_size * seq_len), and 64X covers batch sizes up to 64. The
+        # assert in forward() catches it if we ever exceed.
+        # These are computed for real right here. Under the old meta path they
+        # were fake meta tensors that init_weights had to recompute, which is why
+        # the inference loader called init_weights purely to get them.
         self.rotary_seq_len = config.sequence_len * 64
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
-        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, d.head_dim, device=device)
+        self.register_buffer("cos", cos, persistent=False)  # persistent=False => not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
-        """
-        Initialize the full model in this one function for maximum clarity.
+        """Fill every parameter __init__ allocated. Fresh-run path only; resume
+        and inference call checkpoint_manager.load_model_state instead of this.
 
         wte (embedding):     normal, std=0.8
         lm_head:             normal, std=0.001
-        c_q, c_k, c_v:       uniform, std=1/sqrt(n_embd)   (whole bank)
+        c_q, c_k, c_v:       uniform, std=1/sqrt(d_model)   (whole bank)
         attn_proj:           zeros
-        mlp_fc:              uniform, std=0.4/sqrt(n_embd) (whole bank)
+        mlp_fc:              uniform, std=0.4/sqrt(d_model) (whole bank)
         mlp_proj:            zeros
-        value_embeds:        uniform, std=1/sqrt(n_embd)   (whole bank)
+        value_embeds:        uniform, std=1/sqrt(d_model)   (whole bank)
         ve_gate:             uniform in [0, 0.02] (slightly above neutral)
         resid_lambdas:       1.15 -> 1.05 linear decay over depth
         x0_lambdas:          0.20 -> 0.05 linear decay over depth
         smear_gate:          zeros
         smear_lambda:        zeros (smear disabled at init)
         backout_lambda:      zeros (backout disabled at init)
-        """
-        n_layer, n_embd = self.config.n_layer, self.config.n_embd
 
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.wte, mean=0.0, std=0.8)
+        DRAW ORDER: banks are drawn whole, in the order written below. The
+        previous version drew matrix slices per-layer interleaved, and
+        value_embeds/ve_gate in sorted-by-STRING layer order ('1','11','3',...),
+        so that a given seed reproduced the pre-flattening and pre-banking
+        models bit-for-bit. Those models no longer exist, so the contortion is
+        gone. Consequence: a given seed now produces different weights than it
+        did before this commit, and tuned baselines need re-running.
+        """
+        d = self.dims
+        dev = self.wte.device
+
+        # Embedding and unembedding. wte may be narrower than fp32 (COMPUTE_DTYPE),
+        # so draw in fp32 and let copy_ round -- drawing straight into bf16 would
+        # quantize the distribution rather than the samples.
+        self.wte.copy_(torch.empty(d.vocab, d.d_model, dtype=torch.float32, device=dev).normal_(mean=0.0, std=0.8))
         torch.nn.init.normal_(self.lm_head, mean=0.0, std=0.001)
 
-        # Matrix banks: uniform init with bound = sqrt(3) * std (same standard deviation
-        # as normal). The slices are drawn PER LAYER in the pre-bank iteration order,
-        # NOT as one whole-bank call: with the same seed this reproduces the old
-        # per-layer model's weights bit-for-bit, so training curves stay directly
-        # comparable across the flattening. (uniform_ on a contiguous slice view
-        # draws exactly what a standalone tensor of that shape would.)
-        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for i in range(n_layer):
-            torch.nn.init.uniform_(self.c_q[i], -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(self.c_k[i], -s, s)
-            torch.nn.init.uniform_(self.c_v[i], -s, s)
-            torch.nn.init.uniform_(self.mlp_fc[i], -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-        torch.nn.init.zeros_(self.attn_proj) # projections are zero (no RNG consumed)
+        # Matrix banks: uniform with bound = sqrt(3) * std, which gives Uniform the
+        # same standard deviation as the equivalent Normal while avoiding outliers.
+        s = 3**0.5 * d.d_model**-0.5
+        torch.nn.init.uniform_(self.c_q, -s, s)
+        torch.nn.init.uniform_(self.c_k, -s, s)
+        torch.nn.init.uniform_(self.c_v, -s, s)
+        torch.nn.init.zeros_(self.attn_proj)                      # projections start at zero
+        torch.nn.init.uniform_(self.mlp_fc, -s * 0.4, s * 0.4)    # 0.4x init scale for c_fc
         torch.nn.init.zeros_(self.mlp_proj)
 
-        # Value embeddings (init like c_v: uniform with same std) and their gates.
-        # Draw order follows the old ParameterDict's iteration: string keys in
-        # SORTED order ('1','11','3',...), not ascending layers — again so the
-        # same seed reproduces the pre-bank weights exactly.
-        for layer in sorted(self.ve_layers, key=str):
-            torch.nn.init.uniform_(self.value_embeds[self.ve_index[layer]], -s, s)
-        for layer in sorted(self.ve_layers, key=str):
-            torch.nn.init.uniform_(self.ve_gate[self.ve_index[layer]], 0.0, 0.02) # small positive so gates start slightly above neutral
+        # Value embeddings (same std as c_v) and their gates. value_embeds is
+        # COMPUTE_DTYPE, so it takes the same fp32-draw-then-round path as wte.
+        self.value_embeds.copy_(
+            torch.empty(d.ve_slot, d.vocab, d.kv, dtype=torch.float32, device=dev).uniform_(-s, s))
+        torch.nn.init.uniform_(self.ve_gate, 0.0, 0.02)           # start slightly above neutral
 
-        # Per-layer scalars (per-element Python-float math, matching the old init's rounding)
-        for i in range(n_layer):
-            # stronger residual at early layers, weaker at deep layers
-            self.resid_lambdas[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-            # earlier layers get more input embedding blending
-            self.x0_lambdas[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        # Per-layer scalars: linear decay over depth. Stronger residual and more
+        # input-embedding blending at early layers, both tapering with depth.
+        self.resid_lambdas.copy_(torch.linspace(1.15, 1.05, d.layer, dtype=torch.float32, device=dev))
+        self.x0_lambdas.copy_(torch.linspace(0.20, 0.05, d.layer, dtype=torch.float32, device=dev))
 
-        # Smear/backout scalars: zeros, matching what from-scratch runs have always
-        # actually trained with. The pre-flattening __init__ nominally set
-        # backout_lambda=0.2 and a kaiming smear_gate, but on the standard
-        # meta-device build path those inits never executed — to_empty() left
-        # freshly-allocated (driver-zeroed) storage, so the tuned baselines all
-        # started from zeros. Now it's explicit rather than luck.
+        # Smear/backout start disabled. This matches what from-scratch runs have
+        # always actually trained with: the pre-flattening __init__ nominally set
+        # backout_lambda=0.2 and a kaiming smear_gate, but under meta those inits
+        # never executed and to_empty() left zeroed storage, so every tuned
+        # baseline started from zeros. Now it is explicit rather than luck.
         torch.nn.init.zeros_(self.smear_gate)
         torch.nn.init.zeros_(self.smear_lambda)
         torch.nn.init.zeros_(self.backout_lambda)
 
-        # Rotary embeddings
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.head_dim)
-        self.cos, self.sin = cos, sin
-
-        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
-        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
-        # because GradScaler cannot unscale fp16 gradients.
-        if COMPUTE_DTYPE != torch.float16:
-            self.wte.data = self.wte.data.to(COMPUTE_DTYPE)
-            self.value_embeds.data = self.value_embeds.data.to(COMPUTE_DTYPE)
+        # Rotary embeddings are NOT touched here -- __init__ computed them for
+        # real. (The inference loader used to call this whole function purely to
+        # get them, because under meta they came out as fake tensors.)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -216,35 +387,6 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
-    def _compute_window_sizes(self, config):
-        """
-        Compute per-layer window sizes for sliding window attention.
-
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after current position to attend to (0 for causal)
-
-        Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
-        """
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Map characters to window sizes
-        long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
-        char_to_window = {
-            "L": (long_window, 0),
-            "S": (short_window, 0),
-        }
-        # Tile pattern across layers
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
     def get_device(self):
         return self.wte.device
 
@@ -254,60 +396,21 @@ class GPT(nn.Module):
         return [self.c_q, self.c_k, self.c_v, self.attn_proj, self.mlp_fc, self.mlp_proj, self.ve_gate]
 
     def estimate_flops(self):
-        """
-        Return the estimated FLOPs per token for the model (forward + backward).
-        Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
-        Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
-        """
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        nparams_exclude = (self.wte.numel() + self.value_embeds.numel() +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
-        return num_flops_per_token
+        """FLOPs per token (forward + backward) for this model's config. See the
+        module-level estimate_flops() -- this is the bound-to-an-instance form."""
+        return estimate_flops(self.config, self.pad_vocab_size_to)
 
     def num_scaling_params(self):
-        """
-        Return detailed parameter counts for scaling law analysis.
-        Different papers use different conventions:
-        - Kaplan et al. excluded embedding parameters
-        - Chinchilla included all parameters
-        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
-        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
-
-        Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
-        """
-        # Count each group separately (mirrors the roles in named_parameter_lists)
-        wte = self.wte.numel()
-        value_embeds = self.value_embeds.numel()
-        lm_head = self.lm_head.numel()
-        transformer_matrices = sum(p.numel() for p in self.matrix_parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        return {
-            'wte': wte,
-            'value_embeds': value_embeds,
-            'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices,
-            'scalars': scalars,
-            'total': total,
-        }
+        """Parameter counts by group, for scaling-law analysis. Computed from the
+        config by the module-level scaling_param_counts(), then checked against
+        the tensors actually allocated -- that assert is the whole reason the
+        config arithmetic is trustworthy enough for base_train to size a run
+        before any model exists."""
+        counts = scaling_param_counts(self.config, self.pad_vocab_size_to)
+        allocated = sum(p.numel() for p in self.parameters())
+        assert counts['total'] == allocated, \
+            f"config param math says {counts['total']:,} but {allocated:,} were allocated"
+        return counts
 
     def named_parameter_lists(self):
         """The model's parameters bucketed by the role that decides how each is
@@ -523,6 +626,72 @@ class GPT(nn.Module):
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
         return logits
+
+# -----------------------------------------------------------------------------
+# Checkpoint state: the model half, written out one line per tensor.
+# -----------------------------------------------------------------------------
+
+def model_state(model):
+    """The model's weights as a flat {name: tensor} dict -- the model half of a
+    checkpoint, and the manifest that load_model_state fills.
+
+    Written out rather than taken from nn.Module.state_dict(). The keys are
+    IDENTICAL to what state_dict() produced (GPT owns every parameter directly,
+    so its keys were already just these attribute names, and cos/sin are
+    persistent=False buffers that state_dict excluded too), so the on-disk
+    format is unchanged and existing checkpoints keep loading. What changes is
+    that "which tensors get saved" is a statement in the source instead of a
+    walk over whatever happens to be registered.
+
+    Tensors come back by reference, not cloned -- torch.save materializes them.
+    During training these are the bf16 LIVE halves of the masters; the matching
+    uint16 mantissas ride in train_step.optim_state, and BOTH halves are needed
+    to resume a run without losing the low bits.
+    """
+    return {
+        "wte":            model.wte,
+        "lm_head":        model.lm_head,
+        "c_q":            model.c_q,
+        "c_k":            model.c_k,
+        "c_v":            model.c_v,
+        "attn_proj":      model.attn_proj,
+        "mlp_fc":         model.mlp_fc,
+        "mlp_proj":       model.mlp_proj,
+        "value_embeds":   model.value_embeds,
+        "ve_gate":        model.ve_gate,
+        "resid_lambdas":  model.resid_lambdas,
+        "x0_lambdas":     model.x0_lambdas,
+        "smear_gate":     model.smear_gate,
+        "smear_lambda":   model.smear_lambda,
+        "backout_lambda": model.backout_lambda,
+    }
+
+
+@torch.no_grad()
+def load_model_state(model, state):
+    """Fill the allocated parameters from a checkpoint dict.
+
+    ASSIGNS rather than copies, which is what load_state_dict(assign=True) did:
+    the checkpoint's dtype wins. That is how an inference load pulls bf16 live
+    weights into parameters that __init__ allocated fp32, with no separate cast
+    pass -- and how a training resume gets bf16 live halves that
+    init_optimizer_state then re-splits against the saved mantissas.
+
+    Every key must be present and every shape must match (the old strict=True).
+    Extra keys in `state` are reported rather than ignored, since silently
+    dropping one is how a renamed parameter stops being restored.
+    """
+    dst = model_state(model)
+    missing = [k for k in dst if k not in state]
+    unexpected = [k for k in state if k not in dst]
+    assert not missing, f"checkpoint is missing parameters: {missing}"
+    assert not unexpected, f"checkpoint has unknown parameters: {unexpected}"
+    for name, p in dst.items():
+        loaded = state[name]
+        assert tuple(loaded.shape) == tuple(p.shape), \
+            f"{name}: checkpoint holds {tuple(loaded.shape)}, model allocated {tuple(p.shape)}"
+        p.data = loaded.to(p.device)
+
 
 # -----------------------------------------------------------------------------
 # Helper for the bf16-live-params variant of the optimizers
