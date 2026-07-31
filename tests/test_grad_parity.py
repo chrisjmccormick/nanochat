@@ -28,7 +28,9 @@ def build_model(depth, model_dim, n_head, seq_len, window_pattern, device, vocab
     config = GPTConfig(sequence_len=seq_len, vocab_size=vocab, n_layer=depth,
                        n_head=n_head, n_kv_head=n_head, n_embd=model_dim,
                        window_pattern=window_pattern)
-    model = GPT(config, device=device)
+    with torch.device("meta"):
+        model = GPT(config)
+    model.to_empty(device=device)
     torch.manual_seed(0)
     model.init_weights()
     return model

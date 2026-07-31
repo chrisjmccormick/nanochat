@@ -50,61 +50,25 @@ from nanochat.schedules import Ramp, MuonCoeffs, _as_table, _bias_correction, _t
 
 def init_grad_buffers(model, dtype=None):
     """Attach a full-size, zeroed `.grad32` to every parameter. Call once, after
-    allocation; zero with zero_grad32() between steps.
+    the model is on its device; zero with zero_grad32() between steps.
 
-    Written out one tensor per block so the dtype choice and the memory cost of
-    every gradient buffer are readable here rather than implied by a rule.
-
-    Gradients are fp32 everywhere EXCEPT the token/value embeddings, which
-    accumulate in bf16: they are the two biggest tensors in the model, fp32
-    grads would double their scatter traffic and (world>1) comm bytes, and bf16
-    matches the autograd baseline's numerics anyway (bf16 params -> bf16 .grad).
-    An explicit `dtype` overrides everything -- that is the fp64 parity tier.
-
-    The 3-D banks also get `grad32_slices`: per-slice VIEWS built OUTSIDE any
-    graph. The forward/backward bodies accumulate through these, never through
-    `grad32[i]` -- an in-graph bank slice functionalizes into a whole-bank
-    select_scatter copy (10-20x the cost of the slice add at speedrun bank
-    sizes), while a view created out of graph arrives as an input and mutates
-    genuinely in place.
-    """
-    d = model.dims
-    dev = model.wte.device
-    g = torch.float32 if dtype is None else dtype     # matrix / scalar gradients
-    ge = torch.bfloat16 if dtype is None else dtype   # embedding gradients
-
-    # Embeddings and unembedding.
-    model.wte.grad32          = torch.zeros(d.vocab, d.d_model, dtype=ge, device=dev)
-    model.lm_head.grad32      = torch.zeros(d.vocab, d.d_model, dtype=g,  device=dev)
-    model.value_embeds.grad32 = torch.zeros(d.ve_slot, d.vocab, d.kv, dtype=ge, device=dev)
-    model.value_embeds.grad32_slices = list(model.value_embeds.grad32.unbind(0))
-
-    # Attention banks.
-    model.c_q.grad32       = torch.zeros(d.layer, d.q,       d.d_model, dtype=g, device=dev)
-    model.c_k.grad32       = torch.zeros(d.layer, d.kv,      d.d_model, dtype=g, device=dev)
-    model.c_v.grad32       = torch.zeros(d.layer, d.kv,      d.d_model, dtype=g, device=dev)
-    model.attn_proj.grad32 = torch.zeros(d.layer, d.d_model, d.q,       dtype=g, device=dev)
-    model.c_q.grad32_slices       = list(model.c_q.grad32.unbind(0))
-    model.c_k.grad32_slices       = list(model.c_k.grad32.unbind(0))
-    model.c_v.grad32_slices       = list(model.c_v.grad32.unbind(0))
-    model.attn_proj.grad32_slices = list(model.attn_proj.grad32.unbind(0))
-
-    # MLP banks.
-    model.mlp_fc.grad32   = torch.zeros(d.layer, d.mlp,     d.d_model, dtype=g, device=dev)
-    model.mlp_proj.grad32 = torch.zeros(d.layer, d.d_model, d.mlp,     dtype=g, device=dev)
-    model.mlp_fc.grad32_slices   = list(model.mlp_fc.grad32.unbind(0))
-    model.mlp_proj.grad32_slices = list(model.mlp_proj.grad32.unbind(0))
-
-    # VE gates.
-    model.ve_gate.grad32 = torch.zeros(d.ve_slot, d.n_kv_head, d.gate_ch, dtype=g, device=dev)
-    model.ve_gate.grad32_slices = list(model.ve_gate.grad32.unbind(0))
-
-    # Scalars.
-    model.resid_lambdas.grad32  = torch.zeros(d.layer, dtype=g, device=dev)
-    model.x0_lambdas.grad32     = torch.zeros(d.layer, dtype=g, device=dev)
-    model.smear_gate.grad32     = torch.zeros(1, d.smear_ch, dtype=g, device=dev)
-    model.smear_lambda.grad32   = torch.zeros(1, dtype=g, device=dev)
-    model.backout_lambda.grad32 = torch.zeros(1, dtype=g, device=dev)
+    Default (dtype=None): fp32 everywhere EXCEPT the token/value embeddings,
+    which accumulate in bf16 — they are the two biggest tensors in the model
+    and fp32 grads double their scatter traffic and (world>1) comm bytes; bf16
+    there matches the autograd baseline's numerics (bf16 params -> bf16 .grad).
+    An explicit dtype overrides everything (the fp64 parity tier)."""
+    embeddings = (model.wte, model.value_embeds)
+    for p in model.parameters():
+        d = dtype if dtype is not None else \
+            (torch.bfloat16 if any(p is e for e in embeddings) else torch.float32)
+        p.grad32 = torch.zeros(p.shape, dtype=d, device=p.device)
+        if p.ndim == 3:
+            # Per-slice VIEWS for the banked params. The bodies accumulate
+            # through these, never through `grad32[i]`: an in-graph bank slice
+            # functionalizes into a whole-bank select_scatter copy (10-20x the
+            # slice add at speedrun bank sizes), while views created OUTSIDE
+            # the graph arrive as inputs and mutate genuinely in place.
+            p.grad32_slices = list(p.grad32.unbind(0))
 
 
 def zero_grad32(model):
@@ -931,71 +895,39 @@ def build_schedules(model_dim, num_iterations, device,
     )
 
 
-def norm_muon_reduce_dim(out_features, in_features):
-    """NorMuon's variance-reduction axis for an (out_features, in_features)
-    slice: -1 reduces over in_features, -2 over out_features.
+def red_dim(bank):
+    """NorMuon's variance-reduction dim for a bank: tall -> -1, wide -> -2.
+    THE single source of truth — the factored second-moment buffer's shape is
+    determined by this choice, so init_optimizer_state and bank_muls must agree
+    or the kernel's lerp_ writes a (K, out, 1) update into a (K, 1, in) buffer.
+    They agreed by luck until d24: ve_gate is (n_kv_head, 12), which is wide at
+    d12/d20 but square at d24 and tall at d26."""
+    return -1 if bank.shape[-2] >= bank.shape[-1] else -2
 
-    The policy is to keep the SMALLER axis, so the factored second moment costs
-    min(out, in) floats per slice instead of max(out, in). That makes it genuine
-    shape math -- but it is called ONCE per bank, in init_optimizer_state, with
-    named dimensions, and the answer is stored on the Parameter as `.red_dim`.
 
-    Everything downstream reads that stored value. The old code re-derived it
-    from `p.shape` at two call sites that had to agree, because the second-moment
-    buffer's shape is decided by this choice: disagree and the kernel's lerp_
-    writes a (K, out, 1) update into a (K, 1, in) buffer. They agreed by luck
-    until d24, where ve_gate's (n_kv_head, gate_ch) goes wide at d12/d20, square
-    at d24 and tall at d26.
-    """
-    return -1 if out_features >= in_features else -2
+def second_moment_shape(bank, k):
+    """Shape of the factored second moment for `k` slices of `bank`."""
+    return (k, bank.shape[-2], 1) if red_dim(bank) == -1 else (k, 1, bank.shape[-1])
 
 
 def bank_muls(model, ns_steps=5):
     """Per-bank Muon call-site policy: the (K,1,1) per-slice lr/wd multipliers
-    and the NorMuon reduction axis.
-
-    The multiplier is the bank's sqrt(max(1, fan_out/fan_in)) aspect scale --
-    Muon's tall-matrix LR correction -- deliberately kept OUT of the shared
-    matrix coefficient table so that table stays one set of numbers valid for
-    every bank. Today every slice of a bank is uniform, so each multiplier is a
-    constant fill; merged banks later change these lines, not the kernels.
-
-    red_dim is READ off the Parameter here rather than recomputed -- see
-    norm_muon_reduce_dim for why that matters.
-    """
-    d = model.dims
-    dev = model.c_q.device
-
-    aspect_c_q       = max(1.0, d.q       / d.d_model) ** 0.5   # 1.0 (square)
-    aspect_c_k       = max(1.0, d.kv      / d.d_model) ** 0.5   # 1.0 (square, or wide under GQA)
-    aspect_c_v       = max(1.0, d.kv      / d.d_model) ** 0.5   # 1.0
-    aspect_attn_proj = max(1.0, d.d_model / d.q)       ** 0.5   # 1.0
-    aspect_mlp_fc    = max(1.0, d.mlp     / d.d_model) ** 0.5   # 2.0 (4x expansion)
-    aspect_mlp_proj  = max(1.0, d.d_model / d.mlp)     ** 0.5   # 1.0 (wide)
-    aspect_ve_gate   = max(1.0, d.n_kv_head / d.gate_ch) ** 0.5 # 1.0 at d12
-
+    and NorMuon reduction dim. Today every slice of a bank is uniform, so each
+    multiplier is just the bank's sqrt(max(1, fan_out/fan_in)) aspect scale —
+    the Muon tall-matrix LR correction, kept OUT of the shared matrix table.
+    Merged banks later change these lines, not the kernels."""
+    def policy(bank):
+        aspect = max(1.0, bank.shape[-2] / bank.shape[-1]) ** 0.5
+        mul = torch.full((bank.shape[0], 1, 1), aspect, dtype=torch.float32, device=bank.device)
+        return dict(lr_mul=mul, wd_mul=mul, ns_steps=ns_steps, red_dim=red_dim(bank))
     return {
-        "c_q": dict(ns_steps=ns_steps, red_dim=model.c_q.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_c_q, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_c_q, dtype=torch.float32, device=dev)),
-        "c_k": dict(ns_steps=ns_steps, red_dim=model.c_k.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_c_k, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_c_k, dtype=torch.float32, device=dev)),
-        "c_v": dict(ns_steps=ns_steps, red_dim=model.c_v.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_c_v, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_c_v, dtype=torch.float32, device=dev)),
-        "attn_proj": dict(ns_steps=ns_steps, red_dim=model.attn_proj.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_attn_proj, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_attn_proj, dtype=torch.float32, device=dev)),
-        "mlp_fc": dict(ns_steps=ns_steps, red_dim=model.mlp_fc.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_mlp_fc, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_mlp_fc, dtype=torch.float32, device=dev)),
-        "mlp_proj": dict(ns_steps=ns_steps, red_dim=model.mlp_proj.red_dim,
-                    lr_mul=torch.full((d.layer, 1, 1), aspect_mlp_proj, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.layer, 1, 1), aspect_mlp_proj, dtype=torch.float32, device=dev)),
-        "ve_gate": dict(ns_steps=ns_steps, red_dim=model.ve_gate.red_dim,
-                    lr_mul=torch.full((d.ve_slot, 1, 1), aspect_ve_gate, dtype=torch.float32, device=dev),
-                    wd_mul=torch.full((d.ve_slot, 1, 1), aspect_ve_gate, dtype=torch.float32, device=dev)),
+        "c_q":       policy(model.c_q),        # aspect 1.0, tall
+        "c_k":       policy(model.c_k),        # aspect 1.0, tall
+        "c_v":       policy(model.c_v),        # aspect 1.0, tall
+        "attn_proj": policy(model.attn_proj),  # aspect 1.0, tall
+        "mlp_fc":    policy(model.mlp_fc),     # aspect 2.0, tall
+        "mlp_proj":  policy(model.mlp_proj),   # aspect 1.0, wide
+        "ve_gate":   policy(model.ve_gate),    # aspect 1.0, wide
     }
 
 
@@ -1018,185 +950,55 @@ def _split_master(p):
     return bits.to(torch.int16).view(torch.uint16)
 
 
-def _shard_slice(axis_len, world, rank):
-    """This rank's chunk of a sharded axis (zero-padded: ceil(axis_len/world)).
-    Takes the axis LENGTH, not the tensor -- the caller names which axis it is
-    sharding, rather than this function assuming dim 0."""
-    chunk = -(-axis_len // world)
+def _muon_shard(p, world, rank):
+    """dim-0 chunk owned by this rank (zero-padded chunking: ceil(K/world))."""
+    K = p.shape[0]
+    chunk = -(-K // world)
     start = rank * chunk
-    return slice(start, min(axis_len, start + chunk))
+    return slice(start, min(K, start + chunk))
 
 
 @torch.no_grad()
 def init_optimizer_state(model, ddp_rank=0, ddp_world_size=1):
-    """Allocate every optimizer-side tensor, written out one parameter at a time.
-
-    Each block states the parameter's axes by name, which axis (if any) is
-    sharded, and the shape and dtype of each piece of state it carries. That is
-    the point of the repetition: the full memory cost of training this model,
-    and the reason behind each dtype, is readable top to bottom here rather than
-    implied by a loop over an abstract parameter list.
-
-    Runs after GPT.__init__ has allocated the weights on-device and they have
-    been filled (init_weights or load_model_state). It CONVERTS the fp32 matmul
-    weights in place into the bf16-live + uint16-mantissa master pair, so it must
-    run exactly once and after the weights hold their final values.
-
-    Sharding, at world > 1:
-      - Muon banks shard over their bank axis (`layer`, or `ve_slot` for the VE
-        gates), zero-padded by ceil division so a ragged tail is legal.
-      - AdamW params shard over `vocab` rows, which must divide evenly.
-      - `grad32` always stays FULL size on every rank -- it is the source buffer
-        for the reduce-scatter, not a shard.
-      - At world == 1 every shard IS the whole tensor and the state keeps the
-        parameter's natural shape, which is what the fused kernels expect.
-    """
+    """Attach everything the explicit step needs. Call AFTER the model is on its
+    device (never move it afterwards — state tensors don't follow .to())."""
     world, rank = ddp_world_size, ddp_rank
-    d = model.dims
-    dev = model.wte.device
     init_grad_buffers(model)
-
-    # =========================================================================
-    # Muon, sharded over the `layer` axis.
-    # =========================================================================
-    layer_sl = _shard_slice(d.layer, world, rank)
-    own_layer = layer_sl.stop - layer_sl.start
-
-    # --- c_q : query projection --- live (layer, q, d_model) bf16 --------------
-    mant = _split_master(model.c_q)
-    model.c_q.shard = layer_sl
-    model.c_q.red_dim = norm_muon_reduce_dim(d.q, d.d_model)
-    model.c_q.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.c_q.momentum = torch.zeros(own_layer, d.q, d.d_model, dtype=torch.float32, device=dev)
-    model.c_q.second_momentum = torch.zeros(
-        (own_layer, d.q, 1) if model.c_q.red_dim == -1 else (own_layer, 1, d.d_model),
-        dtype=torch.float32, device=dev)
-
-    # --- c_k : key projection --- live (layer, kv, d_model) bf16 ---------------
-    mant = _split_master(model.c_k)
-    model.c_k.shard = layer_sl
-    model.c_k.red_dim = norm_muon_reduce_dim(d.kv, d.d_model)
-    model.c_k.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.c_k.momentum = torch.zeros(own_layer, d.kv, d.d_model, dtype=torch.float32, device=dev)
-    model.c_k.second_momentum = torch.zeros(
-        (own_layer, d.kv, 1) if model.c_k.red_dim == -1 else (own_layer, 1, d.d_model),
-        dtype=torch.float32, device=dev)
-
-    # --- c_v : value projection --- live (layer, kv, d_model) bf16 -------------
-    mant = _split_master(model.c_v)
-    model.c_v.shard = layer_sl
-    model.c_v.red_dim = norm_muon_reduce_dim(d.kv, d.d_model)
-    model.c_v.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.c_v.momentum = torch.zeros(own_layer, d.kv, d.d_model, dtype=torch.float32, device=dev)
-    model.c_v.second_momentum = torch.zeros(
-        (own_layer, d.kv, 1) if model.c_v.red_dim == -1 else (own_layer, 1, d.d_model),
-        dtype=torch.float32, device=dev)
-
-    # --- attn_proj : attention output --- live (layer, d_model, q) bf16 --------
-    mant = _split_master(model.attn_proj)
-    model.attn_proj.shard = layer_sl
-    model.attn_proj.red_dim = norm_muon_reduce_dim(d.d_model, d.q)
-    model.attn_proj.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.attn_proj.momentum = torch.zeros(own_layer, d.d_model, d.q, dtype=torch.float32, device=dev)
-    model.attn_proj.second_momentum = torch.zeros(
-        (own_layer, d.d_model, 1) if model.attn_proj.red_dim == -1 else (own_layer, 1, d.q),
-        dtype=torch.float32, device=dev)
-
-    # --- mlp_fc : MLP up-projection --- live (layer, mlp, d_model) bf16 --------
-    mant = _split_master(model.mlp_fc)
-    model.mlp_fc.shard = layer_sl
-    model.mlp_fc.red_dim = norm_muon_reduce_dim(d.mlp, d.d_model)
-    model.mlp_fc.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.mlp_fc.momentum = torch.zeros(own_layer, d.mlp, d.d_model, dtype=torch.float32, device=dev)
-    model.mlp_fc.second_momentum = torch.zeros(
-        (own_layer, d.mlp, 1) if model.mlp_fc.red_dim == -1 else (own_layer, 1, d.d_model),
-        dtype=torch.float32, device=dev)
-
-    # --- mlp_proj : MLP down-projection --- live (layer, d_model, mlp) bf16 ----
-    mant = _split_master(model.mlp_proj)
-    model.mlp_proj.shard = layer_sl
-    model.mlp_proj.red_dim = norm_muon_reduce_dim(d.d_model, d.mlp)
-    model.mlp_proj.mantissa = mant[layer_sl].clone() if world > 1 else mant
-    model.mlp_proj.momentum = torch.zeros(own_layer, d.d_model, d.mlp, dtype=torch.float32, device=dev)
-    model.mlp_proj.second_momentum = torch.zeros(
-        (own_layer, d.d_model, 1) if model.mlp_proj.red_dim == -1 else (own_layer, 1, d.mlp),
-        dtype=torch.float32, device=dev)
-
-    # =========================================================================
-    # Muon, REPLICATED. ve_gate is tiny and ragged (ve_slot is half of layer),
-    # so every rank all_reduces the gradient and runs the full-size update
-    # rather than paying comm to shard a few thousand floats.
-    # =========================================================================
-
-    # --- ve_gate : value-embedding gates --- live (ve_slot, n_kv_head, gate_ch) bf16
-    model.ve_gate.red_dim = norm_muon_reduce_dim(d.n_kv_head, d.gate_ch)
-    model.ve_gate.mantissa = _split_master(model.ve_gate)
-    model.ve_gate.momentum = torch.zeros(d.ve_slot, d.n_kv_head, d.gate_ch, dtype=torch.float32, device=dev)
-    model.ve_gate.second_momentum = torch.zeros(
-        (d.ve_slot, d.n_kv_head, 1) if model.ve_gate.red_dim == -1 else (d.ve_slot, 1, d.gate_ch),
-        dtype=torch.float32, device=dev)
-
-    # =========================================================================
-    # AdamW, sharded over `vocab` rows (must divide evenly -- no zero padding
-    # here, unlike the Muon bank axis).
-    # =========================================================================
-    assert d.vocab % world == 0, \
-        f"AdamW row-sharding needs vocab % world == 0 ({d.vocab} % {world})"
-    own_vocab = d.vocab // world
-    vocab_sl = slice(rank * own_vocab, (rank + 1) * own_vocab)
-
-    # --- lm_head : unembedding --- live (vocab, d_model) bf16 ------------------
-    mant = _split_master(model.lm_head)
-    model.lm_head.mantissa = mant[vocab_sl].clone() if world > 1 else mant
-    model.lm_head.exp_avg = torch.zeros(
-        (d.vocab, d.d_model) if world == 1 else (own_vocab, d.d_model), dtype=torch.float32, device=dev)
-    model.lm_head.exp_avg_sq = torch.zeros(
-        (d.vocab, d.d_model) if world == 1 else (own_vocab, d.d_model), dtype=torch.float32, device=dev)
-
-    # --- wte : token embedding --- live (vocab, d_model) bf16 ------------------
-    # Already COMPUTE_DTYPE from allocation, so the master upcast is lossless and
-    # the mantissa starts at zero. The split still runs so the kernel sees the
-    # same live/mantissa pair as every other AdamW parameter.
-    mant = _split_master(model.wte)
-    model.wte.mantissa = mant[vocab_sl].clone() if world > 1 else mant
-    model.wte.exp_avg = torch.zeros(
-        (d.vocab, d.d_model) if world == 1 else (own_vocab, d.d_model), dtype=torch.float32, device=dev)
-    model.wte.exp_avg_sq = torch.zeros(
-        (d.vocab, d.d_model) if world == 1 else (own_vocab, d.d_model), dtype=torch.float32, device=dev)
-
-    # --- value_embeds : VE table --- live (ve_slot, vocab, kv) bf16 ------------
-    # Sharded over the FLATTENED (ve_slot * vocab) row axis, not over ve_slot:
-    # ve_slot alone is too small to divide across a world, and the rows are
-    # interchangeable for AdamW's elementwise update.
-    ve_rows = d.ve_slot * d.vocab
-    assert ve_rows % world == 0, \
-        f"AdamW row-sharding needs ve_slot*vocab % world == 0 ({ve_rows} % {world})"
-    own_ve_rows = ve_rows // world
-    ve_row_sl = slice(rank * own_ve_rows, (rank + 1) * own_ve_rows)
-    mant = _split_master(model.value_embeds)
-    model.value_embeds.mantissa = mant.view(ve_rows, d.kv)[ve_row_sl].clone() if world > 1 else mant
-    model.value_embeds.exp_avg = torch.zeros(
-        (d.ve_slot, d.vocab, d.kv) if world == 1 else (own_ve_rows, d.kv), dtype=torch.float32, device=dev)
-    model.value_embeds.exp_avg_sq = torch.zeros(
-        (d.ve_slot, d.vocab, d.kv) if world == 1 else (own_ve_rows, d.kv), dtype=torch.float32, device=dev)
-
-    # =========================================================================
-    # AdamW, REPLICATED -- the ~30 scalars. These are fp32-LIVE with NO mantissa
-    # pair: bf16-rounding the per-layer residual-stream multipliers cost +0.016
-    # val bpb early in training (diagnosed 2026-07-29, agent-ops
-    # diag_fp32_masters logs), so they are exempt from the master scheme and run
-    # through adamw_step_fused_fp32 instead.
-    # =========================================================================
-    model.resid_lambdas.exp_avg     = torch.zeros(d.layer, dtype=torch.float32, device=dev)
-    model.resid_lambdas.exp_avg_sq  = torch.zeros(d.layer, dtype=torch.float32, device=dev)
-    model.x0_lambdas.exp_avg        = torch.zeros(d.layer, dtype=torch.float32, device=dev)
-    model.x0_lambdas.exp_avg_sq     = torch.zeros(d.layer, dtype=torch.float32, device=dev)
-    model.smear_gate.exp_avg        = torch.zeros(1, d.smear_ch, dtype=torch.float32, device=dev)
-    model.smear_gate.exp_avg_sq     = torch.zeros(1, d.smear_ch, dtype=torch.float32, device=dev)
-    model.smear_lambda.exp_avg      = torch.zeros(1, dtype=torch.float32, device=dev)
-    model.smear_lambda.exp_avg_sq   = torch.zeros(1, dtype=torch.float32, device=dev)
-    model.backout_lambda.exp_avg    = torch.zeros(1, dtype=torch.float32, device=dev)
-    model.backout_lambda.exp_avg_sq = torch.zeros(1, dtype=torch.float32, device=dev)
+    # Muon sharded banks: shard-size fp32 momentum + factored second momentum
+    for p in (model.c_q, model.c_k, model.c_v, model.attn_proj, model.mlp_fc, model.mlp_proj):
+        mant = _split_master(p)
+        sl = _muon_shard(p, world, rank)
+        shard = p[sl]
+        p.mantissa = mant[sl].clone() if world > 1 else mant
+        p.momentum = torch.zeros_like(shard, dtype=torch.float32)
+        p.second_momentum = torch.zeros(second_moment_shape(p, shard.shape[0]),
+                                        dtype=torch.float32, device=p.device)
+    # Muon replicated (tiny/ragged): full-size state, every rank updates it all
+    p = model.ve_gate
+    p.mantissa = _split_master(p)
+    p.momentum = torch.zeros_like(p, dtype=torch.float32)
+    p.second_momentum = torch.zeros(second_moment_shape(p, p.shape[0]),
+                                    dtype=torch.float32, device=p.device)
+    # AdamW sharded (row-shard over dim 0 of the (rows, cols) view)
+    for p in (model.lm_head, model.wte, model.value_embeds):
+        mant = _split_master(p)
+        rows = p.data.view(-1, p.shape[-1])
+        assert rows.shape[0] % world == 0, f"AdamW row-sharding needs rows % world == 0 ({rows.shape[0]} % {world})"
+        rs = rows.shape[0] // world
+        sl = slice(rank * rs, (rank + 1) * rs)
+        p.mantissa = mant.view(-1, p.shape[-1])[sl].clone() if world > 1 else mant
+        state_shape = p.shape if world == 1 else rows[sl].shape  # world=1: kernel runs on the natural shape
+        p.exp_avg = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
+        p.exp_avg_sq = torch.zeros(state_shape, dtype=torch.float32, device=p.device)
+    # AdamW replicated (scalars) — fp32-LIVE, no mantissa split (see
+    # adamw_step_fused_fp32). The upcast covers resuming a checkpoint written
+    # while these were briefly bf16-live.
+    for p in (model.resid_lambdas, model.x0_lambdas, model.smear_gate,
+              model.smear_lambda, model.backout_lambda):
+        if p.data.dtype != torch.float32:
+            p.data = p.data.float()
+        p.exp_avg = torch.zeros_like(p, dtype=torch.float32)
+        p.exp_avg_sq = torch.zeros_like(p, dtype=torch.float32)
 
 
 def make_step_counter(device):
@@ -1231,7 +1033,7 @@ def muon_sharded_update(p, red, tabs, mul, t, world, rank, gathers):
         return
     work, shard = red
     work.wait()
-    sl = p.shard          # recorded at allocation; never re-derived from p.shape
+    sl = _muon_shard(p, world, rank)
     owned = sl.stop - sl.start
     if owned > 0:
         muon_step_fused(shard[:owned], p[sl], p.mantissa[:owned], p.momentum[:owned],
@@ -1339,94 +1141,25 @@ def optimizer_step(model, sched, muls, t):
 
 
 # -----------------------------------------------------------------------------
-# Optimizer checkpointing: written out, one line per state tensor.
+# Optimizer checkpointing: walk named params, collect the known attribute names.
+# Saved per rank (state is shard-sized at world>1) via save_checkpoint's
+# existing rank plumbing. Old (torch.optim) states don't port; fresh runs only.
 
-def optim_state(model):
-    """Every optimizer-side tensor as a flat {name: tensor} dict -- the
-    optimizer half of a checkpoint, and the manifest load_optim_state fills.
+# grad32 deliberately not saved: checkpoints happen after step+zero, so it's zeros
+_STATE_ATTRS = ("mantissa", "momentum", "second_momentum", "exp_avg", "exp_avg_sq")
 
-    Saved PER RANK: at world > 1 these are shard-sized, so each rank writes its
-    own file through save_checkpoint's existing rank plumbing.
-
-    This used to probe `hasattr(p, attr)` over named_parameters() for five
-    known attribute names. That reads as generic but is not: it silently saved
-    exactly whichever attributes happened to exist, so a state tensor that was
-    never allocated, or one renamed on the allocation side, simply vanished
-    from the checkpoint with nothing to notice. Listing them here makes the
-    save set the same kind of statement as the allocation it mirrors --
-    init_optimizer_state and this function should be read side by side.
-
-    grad32 is deliberately absent: checkpoints are taken after step+zero, so it
-    is all zeros. The bf16 LIVE halves are absent too -- they are parameters,
-    so they ride in gpt.model_state.
-
-    Old torch.optim states do not port to this layout; fresh runs only.
-    """
-    return {
-        # Muon banks, sharded over `layer`: bf16-live mantissa + moments
-        "c_q.mantissa":              model.c_q.mantissa,
-        "c_q.momentum":              model.c_q.momentum,
-        "c_q.second_momentum":       model.c_q.second_momentum,
-        "c_k.mantissa":              model.c_k.mantissa,
-        "c_k.momentum":              model.c_k.momentum,
-        "c_k.second_momentum":       model.c_k.second_momentum,
-        "c_v.mantissa":              model.c_v.mantissa,
-        "c_v.momentum":              model.c_v.momentum,
-        "c_v.second_momentum":       model.c_v.second_momentum,
-        "attn_proj.mantissa":        model.attn_proj.mantissa,
-        "attn_proj.momentum":        model.attn_proj.momentum,
-        "attn_proj.second_momentum": model.attn_proj.second_momentum,
-        "mlp_fc.mantissa":           model.mlp_fc.mantissa,
-        "mlp_fc.momentum":           model.mlp_fc.momentum,
-        "mlp_fc.second_momentum":    model.mlp_fc.second_momentum,
-        "mlp_proj.mantissa":         model.mlp_proj.mantissa,
-        "mlp_proj.momentum":         model.mlp_proj.momentum,
-        "mlp_proj.second_momentum":  model.mlp_proj.second_momentum,
-        # Muon replicated
-        "ve_gate.mantissa":          model.ve_gate.mantissa,
-        "ve_gate.momentum":          model.ve_gate.momentum,
-        "ve_gate.second_momentum":   model.ve_gate.second_momentum,
-        # AdamW sharded over `vocab` rows: mantissa + both moments
-        "lm_head.mantissa":          model.lm_head.mantissa,
-        "lm_head.exp_avg":           model.lm_head.exp_avg,
-        "lm_head.exp_avg_sq":        model.lm_head.exp_avg_sq,
-        "wte.mantissa":              model.wte.mantissa,
-        "wte.exp_avg":               model.wte.exp_avg,
-        "wte.exp_avg_sq":            model.wte.exp_avg_sq,
-        "value_embeds.mantissa":     model.value_embeds.mantissa,
-        "value_embeds.exp_avg":      model.value_embeds.exp_avg,
-        "value_embeds.exp_avg_sq":   model.value_embeds.exp_avg_sq,
-        # AdamW replicated scalars: fp32-live, so moments only -- no mantissa
-        "resid_lambdas.exp_avg":     model.resid_lambdas.exp_avg,
-        "resid_lambdas.exp_avg_sq":  model.resid_lambdas.exp_avg_sq,
-        "x0_lambdas.exp_avg":        model.x0_lambdas.exp_avg,
-        "x0_lambdas.exp_avg_sq":     model.x0_lambdas.exp_avg_sq,
-        "smear_gate.exp_avg":        model.smear_gate.exp_avg,
-        "smear_gate.exp_avg_sq":     model.smear_gate.exp_avg_sq,
-        "smear_lambda.exp_avg":      model.smear_lambda.exp_avg,
-        "smear_lambda.exp_avg_sq":   model.smear_lambda.exp_avg_sq,
-        "backout_lambda.exp_avg":    model.backout_lambda.exp_avg,
-        "backout_lambda.exp_avg_sq": model.backout_lambda.exp_avg_sq,
-    }
+def optim_state_dict(model):
+    out = {}
+    for name, p in model.named_parameters():
+        for attr in _STATE_ATTRS:
+            if hasattr(p, attr):
+                out[f"{name}.{attr}"] = getattr(p, attr)
+    return out
 
 
-@torch.no_grad()
-def load_optim_state(model, state):
-    """Restore into a model that has already been through init_optimizer_state
-    (the state tensors must already exist at the right shapes).
-
-    COPIES rather than assigns -- the opposite of load_model_state. These
-    buffers are addressed directly by the compiled kernels, so they have to stay
-    the same tensor objects; rebinding them would leave the kernels writing into
-    the old storage.
-    """
-    dst = optim_state(model)
-    missing = [k for k in dst if k not in state]
-    unexpected = [k for k in state if k not in dst]
-    assert not missing, f"optimizer checkpoint is missing: {missing}"
-    assert not unexpected, f"optimizer checkpoint has unknown entries: {unexpected}"
-    for name, t in dst.items():
-        loaded = state[name]
-        assert tuple(loaded.shape) == tuple(t.shape), \
-            f"{name}: checkpoint holds {tuple(loaded.shape)}, allocated {tuple(t.shape)}"
-        t.copy_(loaded.to(t.device))
+def load_optim_state(model, sd):
+    """Into an already init_optimizer_state()'d model (shapes must match)."""
+    for name, p in model.named_parameters():
+        for attr in _STATE_ATTRS:
+            if hasattr(p, attr):
+                getattr(p, attr).copy_(sd[f"{name}.{attr}"].to(p.device))

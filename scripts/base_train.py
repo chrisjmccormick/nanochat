@@ -27,10 +27,10 @@ import torch
 import torch.distributed as dist
 
 from nanochat import fp8
-from nanochat.gpt import GPT, GPTConfig, scaling_param_counts, model_state, load_model_state
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.train_step import (forward_backward, forward_backward_fp8, init_optimizer_state,
                                  zero_grad32, build_schedules, bank_muls, make_step_counter,
-                                 optimizer_step, optim_state, load_optim_state)
+                                 optimizer_step, optim_state_dict, load_optim_state)
 from nanochat.dataloader import tokenizing_distributed_data_loader_varlen
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -133,28 +133,31 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_config(depth):
-    """GPTConfig for a given depth. Pure config -- allocates nothing."""
+def build_model_meta(depth):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    return GPTConfig(
+    config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
+    with torch.device("meta"):
+        model_meta = GPT(config)
+    return model_meta
 
-# Allocate the model directly on the target device, uninitialized. There is no
-# meta phase and no .to(device): every tensor is created where it will live.
-model_config = build_config(args.depth)
+# Build the model, move to device, init the weights
+model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model = GPT(model_config, device=device)
+model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+model.init_weights() # 3) All tensors get initialized
 
-# Fill the weights exactly once, from RNG or from disk -- never both. (The old
-# flow always ran init_weights and then threw the result away on resume.)
+# If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
@@ -162,10 +165,8 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    load_model_state(model, model_data)
-    del model_data # free up this memory after the load
-else:
-    model.init_weights()
+    model.load_state_dict(model_data, strict=True, assign=True)
+    del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
 # Cudagraphs stays parked: it made sense wrapping autograd; it comes back (if at
@@ -205,8 +206,7 @@ quantize_weights_fn = torch.compile(fp8.quantize_weights, dynamic=False, fullgra
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
-# Get the parameter counts of our model. model.num_scaling_params() computes them
-# from the config and asserts the result against the tensors actually allocated.
+# Get the parameter counts of our model
 param_counts = model.num_scaling_params()
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
@@ -217,19 +217,18 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
 # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# Optimal Tokens is simply target-param-data-ratio * Params
-def get_scaling_params(config):
+# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
-    params_counts = scaling_param_counts(config)
+    params_counts = m.num_scaling_params()
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
-num_scaling_params = get_scaling_params(model_config)
+num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-# Pure arithmetic on a d12 config -- no d12 model is built (this is what the meta
-# device used to be for: a whole throwaway GPT allocated just to be counted).
-D_REF = args.target_param_data_ratio * get_scaling_params(build_config(12)) # compute-optimal d12 training horizon in tokens (measured empirically)
+d12_ref = build_model_meta(12) # creates the model on meta device
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
 # 2) Now that we have the token horizon, we can calculate the optimal batch size
@@ -413,8 +412,8 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            model_state(orig_model), # model parameters (bf16 live)
-            optim_state(orig_model), # per-rank optimizer state (mantissa/moments)
+            orig_model.state_dict(), # model parameters (bf16 live)
+            optim_state_dict(orig_model), # per-rank optimizer state (mantissa/moments)
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step

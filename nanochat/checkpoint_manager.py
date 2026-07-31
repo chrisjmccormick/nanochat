@@ -9,7 +9,7 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig, load_model_state
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -19,6 +19,74 @@ logger = logging.getLogger(__name__)
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
+
+def _remap_legacy_keys(model_data):
+    """Map pre-flattening checkpoint keys (modular Block/Attention/MLP GPT) to the
+    flattened GPT parameter names. New-format checkpoints pass through untouched."""
+    if not any(k.startswith("transformer.") for k in model_data):
+        return model_data
+    log0("Remapping legacy (modular GPT) checkpoint keys to the flattened layout")
+    legacy_patterns = [
+        (re.compile(r"^transformer\.wte\.weight$"), "wte"),
+        (re.compile(r"^lm_head\.weight$"), "lm_head"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_q\.weight$"), r"c_q.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_k\.weight$"), r"c_k.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_v\.weight$"), r"c_v.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.c_proj\.weight$"), r"attn_proj.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.attn\.ve_gate\.weight$"), r"ve_gate.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.mlp\.c_fc\.weight$"), r"mlp_fc.\1"),
+        (re.compile(r"^transformer\.h\.(\d+)\.mlp\.c_proj\.weight$"), r"mlp_proj.\1"),
+        (re.compile(r"^value_embeds\.(\d+)\.weight$"), r"value_embeds.\1"),
+        (re.compile(r"^smear_gate\.weight$"), "smear_gate"),
+    ]
+    remapped = {}
+    for k, v in model_data.items():
+        for pattern, repl in legacy_patterns:
+            new_k, n = pattern.subn(repl, k)
+            if n:
+                remapped[new_k] = v
+                break
+        else:
+            remapped[k] = v  # scalars etc. keep their names
+    return remapped
+
+_BANKED_ROLES = ("c_q", "c_k", "c_v", "attn_proj", "mlp_fc", "mlp_proj", "value_embeds", "ve_gate")
+_PER_LAYER_KEY = re.compile(rf"^({'|'.join(_BANKED_ROLES)})\.(\d+)$")
+
+def _stack_legacy_banks(model_data):
+    """Stack pre-bank per-layer keys (c_q.0 ... c_q.11, value_embeds.3, ...) into
+    the banked single-tensor layout. For value_embeds/ve_gate the numeric suffix
+    is the LAYER index; ascending layer order matches the model's ve_index slot
+    order. New-format (banked) checkpoints pass through untouched."""
+    if not any(_PER_LAYER_KEY.match(k) for k in model_data):
+        return model_data
+    log0("Stacking legacy per-layer checkpoint keys into parameter banks")
+    stacked = {k: v for k, v in model_data.items() if not _PER_LAYER_KEY.match(k)}
+    for role in _BANKED_ROLES:
+        keys = sorted((k for k in model_data if re.match(rf"^{role}\.\d+$", k)),
+                      key=lambda k: int(k.rsplit(".", 1)[1]))
+        if keys:
+            stacked[role] = torch.stack([model_data[k] for k in keys])
+    return stacked
+
+def _patch_missing_config_keys(model_config_kwargs):
+    """Add default values for new config keys missing in old checkpoints."""
+    # Old models were trained with full context (no sliding window)
+    if "window_pattern" not in model_config_kwargs:
+        model_config_kwargs["window_pattern"] = "L"
+        log0(f"Patching missing window_pattern in model config to 'L'")
+
+def _patch_missing_keys(model_data, model_config):
+    """Add default values for new parameters that may be missing in old checkpoints."""
+    n_layer = model_config.n_layer
+    # resid_lambdas defaults to 1.0 (identity scaling)
+    if "resid_lambdas" not in model_data:
+        model_data["resid_lambdas"] = torch.ones(n_layer)
+        log0(f"Patching missing resid_lambdas in model data to 1.0")
+    # x0_lambdas defaults to 0.0 (disabled)
+    if "x0_lambdas" not in model_data:
+        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -73,29 +141,21 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    # Support checkpoints saved before the model flattening (e.g. the HF base ckpts)
+    # and before the parameter banking (per-layer keys -> stacked banks)
+    model_data = _remap_legacy_keys(model_data)
+    model_data = _stack_legacy_banks(model_data)
     model_config_kwargs = meta_data["model_config"]
-    # Guard the one config key whose absence would be silently WRONG rather than
-    # loud: pre-sliding-window checkpoints have no window_pattern, and GPTConfig's
-    # default is "SSSL" while those models were trained at full context ("L").
-    # Falling through to the default would build a differently-attending model
-    # that still loads cleanly. Missing PARAMETERS need no guard here --
-    # load_model_state's strict key check already rejects them.
-    assert "window_pattern" in model_config_kwargs, (
-        f"{checkpoint_dir} predates sliding-window attention (no window_pattern in its meta). "
-        "Convert it once with scripts/migrate_legacy_checkpoint.py, which sets it to 'L'."
-    )
+    _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    # Allocate straight onto the target device, then fill from disk. There is no
-    # meta phase, no to_empty, and no init_weights: the weights are about to be
-    # overwritten anyway, and the rotary buffers this used to be called for are
-    # now computed for real in __init__.
-    #
-    # Checkpoints predating the model flattening or the parameter banking are NOT
-    # read here any more -- convert them once with
-    # scripts/migrate_legacy_checkpoint.py, which owns those key remaps.
-    model = GPT(model_config, device=device)
-    load_model_state(model, model_data)
+    _patch_missing_keys(model_data, model_config)
+    with torch.device("meta"):
+        model = GPT(model_config)
+    # Load the model state
+    model.to_empty(device=device)
+    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
