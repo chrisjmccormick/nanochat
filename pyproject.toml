@@ -5,12 +5,19 @@ description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "datasets>=4.0.0",
+    # `datasets` (and its transitive HF stack) is gone: tasks/ now reads the hub's
+    # auto-generated parquet exports directly via tasks.common.load_hub_dataset,
+    # which needs only filelock + pyarrow. dev/repackage_data_reference.py still
+    # imports `datasets` and is expected to install it separately -- upstream does
+    # the same and says so in that file's docstring.
     "fastapi>=0.117.1",
+    "filelock>=3.19.0",
     "ipykernel>=7.1.0",
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
+    "numpy>=1.26.0",
     "psutil>=7.1.0",
+    "pyarrow>=21.0.0",
     "python-dotenv>=1.2.1",
     "regex>=2025.9.1",
     "rustbpe>=0.1.0",

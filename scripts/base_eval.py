@@ -344,25 +344,6 @@ def main():
             print0(f"\nResults written to: {output_csv_path}")
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
-    # --- Log to report ---
-    from nanochat.report import get_report
-    report_data = [{"model": model_name}]
-
-    if core_results:
-        report_data[0]["CORE metric"] = core_results["core_metric"]
-        report_data.append(core_results["centered_results"])
-
-    if bpb_results:
-        report_data[0]["train bpb"] = bpb_results.get("train")
-        report_data[0]["val bpb"] = bpb_results.get("val")
-
-    if samples:
-        report_data.append({f"sample {i}": s for i, s in enumerate(samples)})
-    if unconditioned_samples:
-        report_data.append({f"unconditioned {i}": s for i, s in enumerate(unconditioned_samples)})
-
-    get_report().log(section="Base model evaluation", data=report_data)
-
     compute_cleanup()
 
 

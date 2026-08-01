@@ -244,6 +244,21 @@ class GPT(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        # Smear / backout: these MUST be set here, not just in __init__. The training
+        # scripts build on the meta device and call to_empty() before init_weights(),
+        # which leaves __init__'s values behind as uninitialized memory -- so anything
+        # init_weights() does not touch is trained from garbage. (Upstream fixed the
+        # same bug in 94b73ad.)
+        #
+        # All three are ZERO here, which is what the DecoderStack run that produced
+        # d24_decoderstack used -- explicitly, and for this exact reason. That means
+        # smear and backout both start DISABLED and the model learns its way into
+        # them. Upstream instead starts backout_lambda at 0.2 and smear_gate.weight
+        # at uniform(0, 0.02); we deliberately do not, so that runs on this branch
+        # stay comparable to the checkpoint they warm-start from.
+        torch.nn.init.zeros_(self.smear_gate.weight)
+        torch.nn.init.zeros_(self.smear_lambda)
+        torch.nn.init.zeros_(self.backout_lambda)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
