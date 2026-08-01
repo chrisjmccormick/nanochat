@@ -23,15 +23,21 @@ GSM8K train problems through the captured graphs, (2) grade with the `#### <n>`
 regex reward, (3) take ONE REINFORCE (DAPO global token-mean) optimizer step on
 ALL parameters.
 
-ALGORITHMIC PARITY with scripts/chat_rl.py — a fast-vs-baseline A/B measures
-the engine, not a different algorithm. Both sides: sampler temp 1.0 / top-k 50,
-advantage r - mean per problem group (zero-signal groups contribute nothing),
-loss on every completion token except the terminal, gradient = sum(-A*logp)
-over all ranks / all-reduced loss-token count, flat LR at INIT_LR_FRAC x the
-pretraining LRs inherited through the checkpoint chain, no grad clip, no tool
-use. The remaining differences are engine-only: paged prefix-shared KV,
-captured decode graphs, in-graph Gumbel-max sampling, compiled packed-varlen
-training forward (stock runs it eager), bf16 params with fp32 masters.
+ALGORITHMIC PARITY with scripts/chat_rl.py — the baseline is stock nanochat
+(minus tool use, removed repo-wide) and is NOT modified; this script reproduces
+its learning behavior so a fast-vs-baseline A/B measures the engine, not a
+different algorithm. Reproduced exactly: sampler temp 1.0 / top-k 50, advantage
+r - mean per problem group, loss on every completion token except the terminal,
+chat_rl's loss normalizer (each group split into passes of DEVICE_BATCH_SIZE
+rollouts, pass loss summed and divided by that pass's own completion-token
+count x num_passes x examples_per_rank — emulated host-side as a per-doc
+advantage scale, see train_step), chat_rl's LR defaults with linear rampdown to
+zero, unconditional optimizer step, no grad clip. Zero-signal groups produce
+exactly-zero gradients in the baseline; we skip their docs outright (identical
+gradient, less compute). The remaining differences are engine-only: paged
+prefix-shared KV, captured decode graphs, in-graph Gumbel-max sampling,
+compiled packed-varlen training forward (stock runs it eager), bf16 params
+with fp32 masters.
 
 Train-only: no in-loop eval (a pass@k round is more concurrent rows than the
 pool admits in one wave) — score the SAVE_EVERY checkpoints offline.
@@ -65,7 +71,7 @@ assert USE_FA, "flash_attention resolved to the SDPA fallback — unsupported fo
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
 from nanochat.dataloader import build_reinforce_packs, assemble_balanced_rounds
-from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_step
+from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
@@ -82,11 +88,6 @@ def _env_float(name, default):
     return float(os.environ.get(name, default))
 
 
-def _env_opt_float(name):
-    v = os.environ.get(name)
-    return float(v) if v not in (None, "") else None
-
-
 def _env_flag(name, default):
     return os.environ.get(name, str(default)) == "1"
 
@@ -100,24 +101,25 @@ MAX_TOKENS   = _env_int("MAX_TOKENS", 256)
 # Sampler (chat_rl's: temp 1.0, top-k 50, no nucleus)
 TEMPERATURE  = _env_float("TEMPERATURE", 1.0)
 TOP_K        = _env_int("TOP_K", 50)              # baked into the captured graph
-# LR args are RAW pretraining-style values (setup_fp32_optimizer applies the
-# usual 1/sqrt(dmodel) scale to the AdamW groups). Unset (the default) = inherit
-# the pretraining run's raw args through the checkpoint chain (§2); set to pin
-# an absolute value (how the pre-2026-07-25 launchers fixed a flat 3e-5 — which
-# for Muon is ~1000x colder than pretraining's effective matrix LR, and trained
-# ~nothing: see agent-ops rl-engine-baseline pool30).
-UNEMBEDDING_LR = _env_opt_float("UNEMBEDDING_LR")
-EMBEDDING_LR   = _env_opt_float("EMBEDDING_LR")
-MATRIX_LR      = _env_opt_float("MATRIX_LR")
-SCALAR_LR      = _env_opt_float("SCALAR_LR")      # resid/x0/smear scalar groups
+# chat_rl's --device-batch-size: in the baseline this is a memory knob, but it
+# also shapes the LOSS — each group of K rollouts trains in K/B passes, each
+# normalized by its own token count. We reproduce that pass partition
+# host-side, so this must match the baseline run being compared against.
+DEVICE_BATCH_SIZE = _env_int("DEVICE_BATCH_SIZE", 8)
+assert K_DRAWS % DEVICE_BATCH_SIZE == 0, "K must divide into chat_rl-style passes"
+# LRs: chat_rl's own CLI defaults, so both sides train identically by default.
+# Env-overridable the same way chat_rl's args are — override BOTH or NEITHER.
+UNEMBEDDING_LR = _env_float("UNEMBEDDING_LR", 0.004)
+EMBEDDING_LR   = _env_float("EMBEDDING_LR", 0.2)
+MATRIX_LR      = _env_float("MATRIX_LR", 0.02)
+SCALAR_LR      = _env_float("SCALAR_LR", 0.5)     # setup_optimizer's default (chat_rl leaves it)
 # FREEZE_SCALARS=1: zero the LR on ALL per-layer scalar groups (resid_lambdas,
 # x0_lambdas, smear_gate/smear_lambda/backout_lambda). Their pretraining
 # trajectories are smooth and deliberate — RL should not touch them (Chris).
 FREEZE_SCALARS = _env_flag("FREEZE_SCALARS", 0)
 WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
-# The one RL temperature knob: every group trains at INIT_LR_FRAC x its
-# pretraining LR (chat_rl's design, keeping its 0.05), held flat for the whole
-# run (the RL-paper norm; chat_rl matches).
+# chat_rl's --init-lr-frac; the LR then ramps down linearly to zero over the
+# run, exactly as the baseline schedules it.
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
 TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384,)
@@ -240,57 +242,14 @@ print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
 # -----------------------------------------------------------------------------
 # §2. Optimizer (fp32 master/state) -> bf16 cast -> engine + graph capture
 # -----------------------------------------------------------------------------
-# RL trains at INIT_LR_FRAC x the pretraining LRs: raw args inherited through
-# the checkpoint chain, with setup_fp32_optimizer applying the same
-# 1/sqrt(dmodel) AdamW scale pretraining used. base_train's sqrt(B/B_ref)
-# batch_lr_scale is NOT applied — that rule is for token batches; an RL round is
-# ~25k branch tokens, and neither chat_sft nor chat_rl carries it either.
-def _pretrain_user_config():
-    """The user_config of the PRETRAINING run behind the loaded checkpoint.
-    An SFT meta snapshots user_config before its inheritance step resolves the
-    LR args (they stay null), so walk one hop back to the base checkpoint it
-    trained from."""
-    uc = meta.get("user_config", {})
-    if uc.get("matrix_lr") is not None:
-        return uc, "checkpoint user_config"
-    base_tag = uc.get("model_tag")
-    if base_tag:
-        ckpt_dir = os.path.join(get_base_dir(), "base_checkpoints", base_tag)
-        step = uc.get("model_step") or find_last_step(ckpt_dir)
-        with open(os.path.join(ckpt_dir, f"meta_{step:06d}.json")) as f:
-            base_uc = json.load(f).get("user_config", {})
-        if base_uc.get("matrix_lr") is not None:
-            return base_uc, f"base checkpoint {base_tag} step {step}"
-    return {}, "none"
-
-
-_pt_uc, _lr_source = _pretrain_user_config()
-_LR_FALLBACKS = dict(unembedding_lr=0.008, embedding_lr=0.3, matrix_lr=0.02, scalar_lr=0.5)
-
-
-def _resolve_lr(env_val, key):
-    if env_val is not None:
-        return env_val  # pinned absolute by env (legacy launchers)
-    if _pt_uc.get(key) is not None:
-        return float(_pt_uc[key])
-    print0(f"WARNING: {key} not recorded in checkpoint chain — "
-           f"falling back to base_train default {_LR_FALLBACKS[key]}")
-    return _LR_FALLBACKS[key]
-
-
-unembedding_lr = _resolve_lr(UNEMBEDDING_LR, "unembedding_lr")
-embedding_lr   = _resolve_lr(EMBEDDING_LR, "embedding_lr")
-matrix_lr      = _resolve_lr(MATRIX_LR, "matrix_lr")
-scalar_lr      = _resolve_lr(SCALAR_LR, "scalar_lr")
-print0(f"[{TAG}] raw LRs (source: {_lr_source}; env pins: "
-       f"{[k for k, v in dict(UNEMBEDDING_LR=UNEMBEDDING_LR, EMBEDDING_LR=EMBEDDING_LR, MATRIX_LR=MATRIX_LR, SCALAR_LR=SCALAR_LR).items() if v is not None] or 'none'}): "
-       f"unembedding {unembedding_lr:g} | embedding {embedding_lr:g} | "
-       f"matrix {matrix_lr:g} | scalar {scalar_lr:g}")
+print0(f"[{TAG}] raw LRs (chat_rl defaults unless env-pinned): "
+       f"unembedding {UNEMBEDDING_LR:g} | embedding {EMBEDDING_LR:g} | "
+       f"matrix {MATRIX_LR:g} | scalar {SCALAR_LR:g}")
 
 # Snapshot fp32 masters from the checkpoint weights BEFORE the bf16 cast.
-optimizer = setup_fp32_optimizer(model, unembedding_lr=unembedding_lr,
-                                 embedding_lr=embedding_lr, matrix_lr=matrix_lr,
-                                 weight_decay=WEIGHT_DECAY, scalar_lr=scalar_lr)
+optimizer = setup_fp32_optimizer(model, unembedding_lr=UNEMBEDDING_LR,
+                                 embedding_lr=EMBEDDING_LR, matrix_lr=MATRIX_LR,
+                                 weight_decay=WEIGHT_DECAY, scalar_lr=SCALAR_LR)
 if FREEZE_SCALARS:
     _scalar_ids = {id(model.resid_lambdas), id(model.x0_lambdas),
                    id(model.smear_gate.weight), id(model.smear_lambda),
@@ -301,12 +260,13 @@ if FREEZE_SCALARS:
     print0("FREEZE_SCALARS: resid/x0/smear/backout groups at lr 0")
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * INIT_LR_FRAC
+    group["initial_lr"] = group["lr"]
 # setup_fp32_optimizer's fixed group order: the 6 AdamW groups, then Muon
 # shape-groups (all at matrix_lr).
 _GROUP_NAMES = ["unembed", "embed", "value_emb", "resid", "x0", "smear"]
 _eff = {(_GROUP_NAMES[i] if i < 6 else "muon"): g["lr"]
         for i, g in enumerate(optimizer.param_groups)}
-print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, flat): "
+print0(f"[{TAG}] initial LRs (x{INIT_LR_FRAC:g}, linear rampdown to 0 like chat_rl): "
        + " | ".join(f"{k} {v:.3g}" for k, v in _eff.items()))
 
 cast_model_bf16(model)
@@ -398,8 +358,12 @@ def grade_rows(rows) -> list[float]:
 
 
 def train_step(groups: list[dict]) -> dict:
-    """One REINFORCE optimizer step over the round's problem groups: chat_rl's
-    advantages and loss-token set, DAPO global token-mean normalizer."""
+    """One REINFORCE optimizer step over the round's problem groups, computing
+    the gradient chat_rl computes. Its normalizer is per-PASS: each group's K
+    rollouts train in chunks of DEVICE_BATCH_SIZE, and every pass's loss is
+    sum(-A*logp) / (that pass's completion-token count x num_passes x
+    examples_per_rank). That is linear in the per-token advantage, so it folds
+    into a per-doc advantage scale here — the packed forward then just sums."""
     _t0 = time.perf_counter()
     docs = []
     n_groups_used = n_excluded = 0
@@ -413,14 +377,25 @@ def train_step(groups: list[dict]) -> dict:
                 n_dead += 1                           # every rollout wrong
             continue
         n_groups_used += 1
-        for k, comp in enumerate(g["completions"]):
+        bodies = []
+        for comp in g["completions"]:
             comp = list(comp)
             if comp and comp[-1] in (ASSISTANT_END, BOS):
                 comp = comp[:-1]  # terminal token is never trained (chat_rl strips it)
-            if not comp:
-                n_excluded += 1
-                continue
-            docs.append((g["prompt_ids"], comp, float(adv[k])))
+            bodies.append(comp)
+        # chat_rl's pass partition, in rollout order. (Which rollouts share a
+        # pass is arbitrary in both scripts — samples are exchangeable — but
+        # the partition SHAPE and per-pass token counts are what set the scale.)
+        n_pass = len(bodies) // DEVICE_BATCH_SIZE
+        for p0 in range(0, len(bodies), DEVICE_BATCH_SIZE):
+            chunk = range(p0, p0 + DEVICE_BATCH_SIZE)
+            num_valid = max(1, sum(len(bodies[k]) for k in chunk))  # chat_rl clamps min=1
+            scale = 1.0 / (num_valid * n_pass * ppr_rank)
+            for k in chunk:
+                if not bodies[k]:
+                    n_excluded += 1
+                    continue
+                docs.append((g["prompt_ids"], bodies[k], float(adv[k]) * scale))
     total_tokens = 0
     total_loss = 0.0
     n_packs = 0
@@ -451,28 +426,19 @@ def train_step(groups: list[dict]) -> dict:
                     print0(f"      pack {n_packs}b{pk.input_ids.numel()}: {_now - _pk_t:.3f}s", flush=True)
                     _pk_t = _now
         _t_fwd = time.perf_counter() - _t0 - _t_build
-    # DAPO token-level mean across ALL ranks' loss tokens
-    tok_t = torch.tensor(float(total_tokens), device=device)
-    if ddp:
-        dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
-    global_tokens = float(tok_t.item())
+    # The normalization already rode in on the per-doc advantage scale, and the
+    # optimizer AVG-reduces per-rank grads exactly as the baseline relies on.
+    # chat_rl steps UNconditionally every round (an all-zero-grad step still
+    # moves Muon via momentum), so we do too — materialize zero grads for any
+    # params that saw no docs so the (sharded) collectives stay well-formed.
     gnorm = 0.0
-    stepped = False
-    with record_function("train/clip+opt"):
-        if global_tokens > 0:
-            # A rank can have zero local docs while others train: materialize zero
-            # grads so the (sharded) optimizer's collectives stay well-formed.
-            for prm in model.parameters():
-                if prm.grad is None:
-                    prm.grad = torch.zeros_like(prm)
-            inv = world_size / global_tokens  # optimizer AVG-reduces grads across ranks
-            params = [p for p in model.parameters() if p.grad is not None]
-            for prm in params:
-                prm.grad.mul_(inv)
-            if not ddp:  # grad-norm telemetry only — no clipping (chat_rl has none)
-                gnorm = float(torch.nn.utils.clip_grad_norm_(params, float("inf")))
-            optimizer.step()
-            stepped = True
+    with record_function("train/opt"):
+        for prm in model.parameters():
+            if prm.grad is None:
+                prm.grad = torch.zeros_like(prm)
+        if not ddp:  # grad-norm telemetry only — no clipping (chat_rl has none)
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
+        optimizer.step()
         model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
     # approximate wall split (host clocks; the per-pack .item() syncs make t_fwd
@@ -483,8 +449,8 @@ def train_step(groups: list[dict]) -> dict:
                 n_groups_sat=n_sat, n_groups_dead=n_dead,
                 n_docs=len(docs), n_excluded=n_excluded, n_packs=n_packs,
                 pstats=pstats, n_loss_tokens=total_tokens,
-                loss_token_mean=(total_loss / total_tokens) if total_tokens else 0.0,
-                grad_norm=gnorm, stepped=stepped)
+                loss_total=total_loss,  # == chat_rl's summed per-pass losses for the step
+                grad_norm=gnorm)
 
 
 # -----------------------------------------------------------------------------
@@ -513,8 +479,8 @@ METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
                "n_groups_dead", "n_docs", "n_loss_tokens",
-               "train_tok_per_s", "loss_token_mean",
-               "grad_norm", "wnorm", "mem_gb", "round_s"]
+               "train_tok_per_s", "loss_total",
+               "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
 mf = open(metrics_path, "w", newline="") if master else None
 mw = None
@@ -535,14 +501,13 @@ def save_ckpt(step: int) -> None:
     base_dir = get_base_dir()
     ckpt_dir = os.path.join(base_dir, "chatrl_checkpoints", OUT_TAG)
     opt_data = optimizer.state_dict() if SAVE_OPT else None
-    # user_config carries the RESOLVED raw LRs so a chain off this checkpoint
-    # inherits them directly (an SFT meta's snapshot has them null instead).
+    # user_config records the LRs this run actually trained at, for provenance.
     meta_data = {"model_config": model.config.__dict__,
                  "user_config": dict(source=SOURCE, model_tag=MODEL_TAG,
                                      model_step=MODEL_STEP,
-                                     unembedding_lr=unembedding_lr,
-                                     embedding_lr=embedding_lr,
-                                     matrix_lr=matrix_lr, scalar_lr=scalar_lr,
+                                     unembedding_lr=UNEMBEDDING_LR,
+                                     embedding_lr=EMBEDDING_LR,
+                                     matrix_lr=MATRIX_LR, scalar_lr=SCALAR_LR,
                                      init_lr_frac=INIT_LR_FRAC)}
     if master or opt_data is not None:
         save_checkpoint(ckpt_dir, step, model.state_dict() if master else None,
@@ -583,6 +548,9 @@ try:
             ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
+        lrm = 1.0 - rnd / num_rounds  # chat_rl's linear rampdown to zero
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
         _t = time.perf_counter()
         with record_function("round/train"):
             tstats = train_step(groups)
@@ -611,8 +579,8 @@ try:
             n_docs=tstats["n_docs"],
             n_loss_tokens=tstats["n_loss_tokens"],
             train_tok_per_s=round(tstats["n_loss_tokens"] / train_s, 1) if train_s else 0.0,
-            loss_token_mean=round(tstats["loss_token_mean"], 6),
-            grad_norm=round(tstats["grad_norm"], 6),
+            loss_total=round(tstats["loss_total"], 6),
+            grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
             wnorm=round(wnorm, 2),
             mem_gb=_device_mem_gb(rnd),
             round_s=round(time.perf_counter() - r_t0, 1))
@@ -642,9 +610,9 @@ try:
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
                f"grp {tstats['n_groups_used']}/{tstats['n_groups_total']} "
                f"(sat {tstats['n_groups_sat']} dead {tstats['n_groups_dead']}) | "
-               f"gnorm {tstats['grad_norm']:.3f} | "
-               f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
-               + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
+               f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
+               f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}",
+               flush=True)
 
         # per-epoch rollup: solve over the whole pass + avg round wall. Fires at
         # each pass boundary and, if ROUNDS_CAP cut the run mid-pass, at the end
@@ -708,9 +676,9 @@ finally:
         tag=TAG, k=K_DRAWS, problems_per_round=PPR, rounds_run=len(curve),
         budget=MAX_TOKENS, world_size=world_size, source=SOURCE,
         temperature=TEMPERATURE, top_k=TOP_K, init_lr_frac=INIT_LR_FRAC,
-        lr_source=_lr_source,
-        raw_lrs=dict(unembedding=unembedding_lr, embedding=embedding_lr,
-                     matrix=matrix_lr, scalar=scalar_lr),
+        device_batch_size=DEVICE_BATCH_SIZE,
+        raw_lrs=dict(unembedding=UNEMBEDDING_LR, embedding=EMBEDDING_LR,
+                     matrix=MATRIX_LR, scalar=SCALAR_LR),
         error=run_error,
         solve_rate_first=(curve[0]["solve_rate"] if curve else None),
         solve_rate_last=(curve[-1]["solve_rate"] if curve else None),
