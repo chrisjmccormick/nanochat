@@ -6,8 +6,15 @@ simpler and more similar to just REINFORCE:
 
 1) Delete trust region, so there is no KL regularization to a reference model
 2) We are on policy, so there's no need for PPO ratio+clip.
-3) We use DAPO style normalization that is token-level, not sequence-level.
+3) We use DAPO style normalization that is token-level, not sequence-level:
+   sum(-A * logp) over every completion token in the step, divided once by the
+   all-reduced global loss-token count.
 4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
+
+This is the reference implementation the fast engine (scripts/chat_rl_fast.py)
+is A/B'd against, so the two run the SAME algorithm: no tool use, sampler
+temp 1.0 / top-k 50, flat LR at init_lr_frac x the pretraining LRs inherited
+through the checkpoint chain, terminal token untrained, no grad clip.
 
 1 GPU:
 python -m scripts.chat_rl
@@ -17,13 +24,14 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 """
 
 import argparse
+import json
 import os
 import itertools
 import wandb
 import torch
 import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_step
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
@@ -47,12 +55,15 @@ parser.add_argument("--num-samples", type=int, default=16, help="number of sampl
 parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
-# Optimization
-parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+# Optimization. LR args are RAW pretraining-style values; None (the default) =
+# inherit the pretraining run's raw args through the checkpoint chain, exactly
+# as chat_rl_fast does.
+parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit)")
+parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit)")
+parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit)")
+parser.add_argument("--scalar-lr", type=float, default=None, help="learning rate for the scalar parameter groups (default: inherit)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
-parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
+parser.add_argument("--init-lr-frac", type=float, default=0.05, help="LR as fraction of base LR (held flat)")
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
@@ -73,6 +84,45 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
 engine = Engine(model, tokenizer) # for sampling rollouts
+
+# Resolve raw pretraining LRs through the checkpoint chain (same logic as
+# chat_rl_fast, so the two scripts train at identical LRs by default).
+def _pretrain_user_config():
+    """The user_config of the PRETRAINING run behind the loaded checkpoint.
+    An SFT meta snapshots user_config before its inheritance step resolves the
+    LR args (they stay null), so walk one hop back to the base checkpoint it
+    trained from."""
+    uc = meta.get("user_config", {})
+    if uc.get("matrix_lr") is not None:
+        return uc, "checkpoint user_config"
+    base_tag = uc.get("model_tag")
+    if base_tag:
+        ckpt_dir = os.path.join(get_base_dir(), "base_checkpoints", base_tag)
+        step = uc.get("model_step") or find_last_step(ckpt_dir)
+        with open(os.path.join(ckpt_dir, f"meta_{step:06d}.json")) as f:
+            base_uc = json.load(f).get("user_config", {})
+        if base_uc.get("matrix_lr") is not None:
+            return base_uc, f"base checkpoint {base_tag} step {step}"
+    return {}, "none"
+
+_pt_uc, _lr_source = _pretrain_user_config()
+_LR_FALLBACKS = dict(unembedding_lr=0.008, embedding_lr=0.3, matrix_lr=0.02, scalar_lr=0.5)
+
+def _resolve_lr(arg_val, key):
+    if arg_val is not None:
+        return arg_val  # pinned absolute on the command line
+    if _pt_uc.get(key) is not None:
+        return float(_pt_uc[key])
+    print0(f"WARNING: {key} not recorded in checkpoint chain — "
+           f"falling back to base_train default {_LR_FALLBACKS[key]}")
+    return _LR_FALLBACKS[key]
+
+unembedding_lr = _resolve_lr(args.unembedding_lr, "unembedding_lr")
+embedding_lr   = _resolve_lr(args.embedding_lr, "embedding_lr")
+matrix_lr      = _resolve_lr(args.matrix_lr, "matrix_lr")
+scalar_lr      = _resolve_lr(args.scalar_lr, "scalar_lr")
+print0(f"raw LRs (source: {_lr_source}): unembedding {unembedding_lr:g} | "
+       f"embedding {embedding_lr:g} | matrix {matrix_lr:g} | scalar {scalar_lr:g}")
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -199,21 +249,17 @@ def run_gsm8k_eval(task, tokenizer, engine,
 
 # Init the optimizer
 optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
     weight_decay=args.weight_decay,
+    scalar_lr=scalar_lr,
 )
 
-# Set the initial learning rate as a fraction of the base learning rate
+# Set the learning rate as a fraction of the base learning rate; it is held
+# flat for the whole run (chat_rl_fast matches).
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
-
-# Learning rate scheduler: simple rampdown to zero over num_steps
-def get_lr_multiplier(it):
-    lrm = 1.0 - it / num_steps
-    return lrm
 
 # Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
@@ -249,6 +295,7 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    num_loss_tokens = torch.zeros((), dtype=torch.long, device=device) # tokens carrying advantage
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, cu_seqlens_all, rewards_all, advantages_all = next(batch_iterator)
@@ -274,16 +321,21 @@ for step in range(num_steps):
             for i in range(b1 - b0):
                 s, e = cu_seqlens[i].item(), cu_seqlens[i+1].item()
                 token_advantages[s:e] = advantages[i]
-            # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
-            pg_obj = (logp * token_advantages).sum()
-            # normalize by the number of valid tokens, number of passes, and examples_per_rank
-            num_valid = (targets >= 0).sum().clamp(min=1)
-            pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+            # Calculate the PG objective, UNNORMALIZED: the DAPO token-mean divides
+            # once by the all-reduced global loss-token count, after all passes have
+            # accumulated (below). Note that ignore_index=-1 ensures that invalid
+            # tokens have loss 0.
+            pg_sum = (logp * token_advantages).sum()
+            # Count the tokens that carry loss: completion tokens of groups with
+            # signal (a zero-signal group has advantage 0 everywhere).
+            n_tok = ((targets >= 0) & (token_advantages != 0)).sum()
+            num_loss_tokens += n_tok
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
-            loss = -pg_obj
+            loss = -pg_sum
             loss.backward()
-            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
+            pass_mean = (loss / n_tok.clamp(min=1)).item() # per-pass token-mean, logging only
+            print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss/tok: {pass_mean:.6f} | Average reward: {rewards.mean().item()}")
         # For logging
         rewards_list.append(rewards_all.mean().item())
         sequence_lengths.extend(len(seq) for seq in sequences_all)
@@ -305,15 +357,23 @@ for step in range(num_steps):
         "sequence_length": mean_sequence_length,
     })
 
-    # Update the model parameters
-    lrm = get_lr_multiplier(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-    optimizer.step()
+    # DAPO token-mean: scale the accumulated gradients by world_size / global
+    # loss-token count (the optimizer AVG-reduces gradients across ranks, so the
+    # world_size factor turns that average back into the global sum).
+    tok_t = num_loss_tokens.float()
+    if ddp:
+        dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+    global_tokens = tok_t.item()
+    if global_tokens > 0:
+        inv = ddp_world_size / global_tokens
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(inv)
+        optimizer.step()
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
-        "lrm": lrm,
+        "num_loss_tokens": global_tokens,
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
@@ -330,6 +390,11 @@ for step in range(num_steps):
             None, # note: we don't bother to save the optimizer state
             {
                 "model_config": model_config_kwargs,
+                # resolved raw LRs, so a chain off this checkpoint inherits them
+                "user_config": dict(model_tag=args.model_tag, model_step=args.model_step,
+                                    unembedding_lr=unembedding_lr, embedding_lr=embedding_lr,
+                                    matrix_lr=matrix_lr, scalar_lr=scalar_lr,
+                                    init_lr_frac=args.init_lr_frac),
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

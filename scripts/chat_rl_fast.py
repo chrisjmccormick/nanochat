@@ -20,18 +20,21 @@ fp32-state Muon/AdamW, no reload / re-capture between rounds.
 
 Per ROUND: (1) decode K fresh natural rollouts for each of PROBLEMS_PER_ROUND
 GSM8K train problems through the captured graphs, (2) grade with the `#### <n>`
-regex reward, (3) take ONE branch-masked REINFORCE (DAPO token-mean) optimizer
-step on ALL parameters. Differences from stock chat_rl.py, per the locked plan:
-  * masked-token branch REINFORCE: loss only on the policy's OWN T=1.0 nucleus>1
-    positions; group-normalized advantage (r-mean)/std (ADV_STD=0 -> stock r-mean);
-    truncated-incorrect excluded from the loss but kept in the baseline.
-  * sampler: temp 0.6 / top-k 512 / top-p 0.95, in-graph Gumbel-max.
-  * NO tool use: the calculator force-injection of the stock Engine is dropped —
-    the policy must emit <|output_start|>...<|output_end|> contents itself.
-  * training forward = nanochat's GPT.forward on packed varlen buckets,
-    torch.compile'd fullgraph with static shapes (stock runs it eager).
-  * terminal set {<|assistant_end|>, <|bos|>}; completions DO train on the
-    terminal token (stock never reinforces emitting it).
+regex reward, (3) take ONE REINFORCE (DAPO global token-mean) optimizer step on
+ALL parameters.
+
+ALGORITHMIC PARITY with scripts/chat_rl.py — a fast-vs-baseline A/B measures
+the engine, not a different algorithm. Both sides: sampler temp 1.0 / top-k 50,
+advantage r - mean per problem group (zero-signal groups contribute nothing),
+loss on every completion token except the terminal, gradient = sum(-A*logp)
+over all ranks / all-reduced loss-token count, flat LR at INIT_LR_FRAC x the
+pretraining LRs inherited through the checkpoint chain, no grad clip, no tool
+use. The remaining differences are engine-only: paged prefix-shared KV,
+captured decode graphs, in-graph Gumbel-max sampling, compiled packed-varlen
+training forward (stock runs it eager), bf16 params with fp32 masters.
+
+Train-only: no in-loop eval (a pass@k round is more concurrent rows than the
+pool admits in one wave) — score the SAVE_EVERY checkpoints offline.
 
 1 GPU:   python -m scripts.chat_rl_fast <tag>
 8 GPUs:  torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl_fast <tag>
@@ -44,7 +47,6 @@ Config via env (speedrun runner convention), see §0 below.
 # -----------------------------------------------------------------------------
 import csv
 import json
-import math
 import os
 import sys
 import time
@@ -67,7 +69,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model, find_last_s
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
-from tasks.gsm8k import GSM8K, extract_answer, GSM_RE
+from tasks.gsm8k import GSM8K
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -95,29 +97,9 @@ PPR          = _env_int("PROBLEMS_PER_ROUND", 16) # global, across ranks
 EPOCHS       = _env_int("EPOCHS", 1)
 ROUNDS_CAP   = _env_int("ROUNDS", 0)              # 0 = full EPOCHS horizon
 MAX_TOKENS   = _env_int("MAX_TOKENS", 256)
-# Sampler (speedrun house sampler)
-TEMPERATURE  = _env_float("TEMPERATURE", 0.6)
-TOP_P        = _env_float("TOP_P", 0.95)
-TOP_K        = _env_int("TOP_K", 512)
-# Trainer
-ADV_STD      = _env_flag("ADV_STD", 1)            # 0 -> stock (r - mean)
-# TRAIN_TERMINAL=1 (speedrun): the emitted <|assistant_end|> is a trained token.
-# 0 (stock chat_rl): exclude it from the loss — with negative advantages on
-# failing problems, training the terminal actively suppresses termination and
-# produces a truncation/rambling spiral (observed in run ep1).
-TRAIN_TERMINAL = _env_flag("TRAIN_TERMINAL", 1)
-# CLIP_ANSWER=1: answer-then-ramble guard. A CORRECT completion that keeps
-# generating past its `#### <answer>` is cut right after the answer and
-# terminated with <|assistant_end|> BEFORE becoming a training doc, so positive
-# advantage reinforces answer->stop rather than the ramble. Without it the loop
-# amplifies: truncated-correct rollouts train the ramble at positive advantage
-# (only truncated-INCORRECT are excluded), and their tails eventually burst the
-# KV pool — how pool30_lr05 died at r109. 0 = pre-2026-07-26 behavior
-# (div4/div5/pool30/pool30_lr05). Incorrect rollouts are never clipped.
-CLIP_ANSWER    = _env_flag("CLIP_ANSWER", 1)
-TRAIN_BRANCH_TEMP  = _env_float("TRAIN_BRANCH_TEMP", 1.0)
-TRAIN_BRANCH_TOP_P = _env_float("TRAIN_BRANCH_TOP_P", 0.95)
-GRAD_CLIP    = _env_float("GRAD_CLIP", 1.0)       # exact on 1 GPU; skipped under DDP
+# Sampler (chat_rl's: temp 1.0, top-k 50, no nucleus)
+TEMPERATURE  = _env_float("TEMPERATURE", 1.0)
+TOP_K        = _env_int("TOP_K", 50)              # baked into the captured graph
 # LR args are RAW pretraining-style values (setup_fp32_optimizer applies the
 # usual 1/sqrt(dmodel) scale to the AdamW groups). Unset (the default) = inherit
 # the pretraining run's raw args through the checkpoint chain (§2); set to pin
@@ -134,11 +116,9 @@ SCALAR_LR      = _env_opt_float("SCALAR_LR")      # resid/x0/smear scalar groups
 FREEZE_SCALARS = _env_flag("FREEZE_SCALARS", 0)
 WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
 # The one RL temperature knob: every group trains at INIT_LR_FRAC x its
-# pretraining LR (chat_rl's design, keeping its 0.05). LR_SCHEDULE "flat" holds
-# it there (the RL-paper norm); "linear" is chat_rl's rampdown to zero.
+# pretraining LR (chat_rl's design, keeping its 0.05), held flat for the whole
+# run (the RL-paper norm; chat_rl matches).
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
-LR_SCHEDULE    = os.environ.get("LR_SCHEDULE", "flat")
-assert LR_SCHEDULE in ("flat", "linear"), f"bad LR_SCHEDULE {LR_SCHEDULE!r}"
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
 TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384,)
 MAX_NUM_DOCS  = _env_int("MAX_NUM_DOCS", 64)
@@ -154,15 +134,7 @@ PREFILL_SEQS = _env_int("PREFILL_SEQS", 12)
 COMPILE      = _env_flag("COMPILE", 1)
 PREFILL_COMPILE = _env_flag("PREFILL_COMPILE", 1)
 PREFILL_FULLGRAPH = _env_flag("PREFILL_FULLGRAPH", 1)
-STOP_DETECT  = _env_flag("STOP_DETECT", 1)
-STOP = (json.loads(os.environ["STOP"]) if os.environ.get("STOP")
-        else ["\nQuestion:", " Question:", "\nProblem:"])
-# Eval / checkpoint
-EVAL_EVERY    = _env_int("EVAL_EVERY", 60)        # 0 = off
-EVAL_EXAMPLES = _env_int("EVAL_EXAMPLES", 400)
-EVAL_K        = _env_int("EVAL_K", 8)
-EVAL_TEMP     = _env_float("EVAL_TEMP", 1.0)
-EVAL_MAX_TOKENS = _env_int("EVAL_MAX_TOKENS", MAX_TOKENS)
+# Checkpoint
 SAVE_EVERY    = _env_int("SAVE_EVERY", 60)        # 0 = only at end
 SAVE_OPT      = _env_flag("SAVE_OPT", 0)          # fp32 optimizer state is resumable
 SAVE_ROLLOUTS = _env_flag("SAVE_ROLLOUTS", 0)
@@ -190,13 +162,6 @@ MODEL_STEP    = int(os.environ["MODEL_STEP"]) if os.environ.get("MODEL_STEP") el
 PUSH          = _env_flag("PUSH", 0)
 MODEL_REPO    = os.environ.get("MODEL_REPO", "ChrisMcCormick/nanochat-varlen-d24-2026-03-22")
 
-# PrefillAllEngine is train-only: an eval round (EVAL_EXAMPLES x EVAL_K against the
-# full test split) is far more concurrent rows than the pool can admit in one wave.
-assert EVAL_EVERY == 0, (
-    "chat_rl_fast is train-only — its single-wave round can't admit an eval "
-    "round. Set EVAL_EVERY=0 and score checkpoints offline with agent-ops "
-    "eval_trajectory.py.")
-
 HERE = Path.cwd()
 
 # -----------------------------------------------------------------------------
@@ -217,18 +182,12 @@ PAD_ID = BOS
 SEQ_CAP = model.config.sequence_len
 
 train_task = GSM8K(subset="main", split="train")
-val_task = GSM8K(subset="main", split="test")
 
 print0("rendering prompts ...", flush=True)
 train_convs = [train_task[i] for i in range(len(train_task))]
 train_prompts = [tokenizer.render_for_completion(c) for c in train_convs]
-n_eval = min(EVAL_EXAMPLES, len(val_task)) if EVAL_EVERY else 0
-val_convs = [val_task[i] for i in range(n_eval)]
-val_prompts = [tokenizer.render_for_completion(c) for c in val_convs]
-max_prompt = max(max(len(p) for p in train_prompts),
-                 max((len(p) for p in val_prompts), default=0))
-assert max_prompt + 1 + max(MAX_TOKENS, EVAL_MAX_TOKENS) <= SEQ_CAP, \
-    "prompt+budget exceeds model context"
+max_prompt = max(len(p) for p in train_prompts)
+assert max_prompt + 1 + MAX_TOKENS <= SEQ_CAP, "prompt+budget exceeds model context"
 pool = POOL_PROBLEMS if POOL_PROBLEMS is not None else list(range(len(train_task)))
 shard = pool[rank::world_size]
 if FIXED_PROBLEMS is not None:
@@ -276,8 +235,7 @@ if PROFILE:
            f"(wait {PROF_WAIT} + warmup 1 + active {PROF_ACTIVE})")
 print0(f"[{TAG}] {PPR} problems x K={K_DRAWS} = {PPR * K_DRAWS} rollouts/round "
        f"x {num_rounds} rounds @ budget {MAX_TOKENS} | max prompt {max_prompt} tok "
-       f"| train buckets {TRAIN_BUCKETS} | stop-detect "
-       f"{'ON ' + str(STOP) if STOP_DETECT else 'OFF'}", flush=True)
+       f"| train buckets {TRAIN_BUCKETS}", flush=True)
 
 # -----------------------------------------------------------------------------
 # §2. Optimizer (fp32 master/state) -> bf16 cast -> engine + graph capture
@@ -343,13 +301,12 @@ if FREEZE_SCALARS:
     print0("FREEZE_SCALARS: resid/x0/smear/backout groups at lr 0")
 for group in optimizer.param_groups:
     group["lr"] = group["lr"] * INIT_LR_FRAC
-    group["initial_lr"] = group["lr"]
 # setup_fp32_optimizer's fixed group order: the 6 AdamW groups, then Muon
 # shape-groups (all at matrix_lr).
 _GROUP_NAMES = ["unembed", "embed", "value_emb", "resid", "x0", "smear"]
 _eff = {(_GROUP_NAMES[i] if i < 6 else "muon"): g["lr"]
         for i, g in enumerate(optimizer.param_groups)}
-print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, {LR_SCHEDULE}): "
+print0(f"[{TAG}] effective LRs (x{INIT_LR_FRAC:g} of pretrain, flat): "
        + " | ".join(f"{k} {v:.3g}" for k, v in _eff.items()))
 
 cast_model_bf16(model)
@@ -357,11 +314,11 @@ model.eval()
 
 engine = PrefillAllEngine(
     model, tokenizer,
-    kv_pool_gb=KV_POOL_GB, max_seqs=MAX_SEQS, max_tokens=max(MAX_TOKENS, EVAL_MAX_TOKENS),
+    kv_pool_gb=KV_POOL_GB, max_seqs=MAX_SEQS, max_tokens=MAX_TOKENS,
     max_prompt_len=max_prompt, macro_n=MACRO_N, buckets=BUCKETS,
     prefill_t=PREFILL_T, prefill_seqs=PREFILL_SEQS,
-    temperature=TEMPERATURE, top_p=TOP_P, top_k=TOP_K,
-    stop_detect=STOP_DETECT, stop_strings=tuple(STOP),
+    temperature=TEMPERATURE, top_p=1.0, top_k=TOP_K,
+    stop_detect=False, stop_strings=(),
     compile_decode=COMPILE, compile_prefill=PREFILL_COMPILE,
     prefill_fullgraph=PREFILL_FULLGRAPH,
     extra_compile_slots=len(TRAIN_BUCKETS) + 8,
@@ -381,46 +338,30 @@ print0(f"  [vmm] pool permanent ({_pool_gb:.1f} GB mapped through warmup + round
        flush=True)
 
 # -----------------------------------------------------------------------------
-# §3. Trainer — group advantage + branch-masked REINFORCE over compiled
-#      fixed-shape packs (speedrun §3; forward = nanochat's own GPT.forward)
+# §3. Trainer — group advantage + REINFORCE over compiled fixed-shape packs
+#      (forward = nanochat's own GPT.forward)
 # -----------------------------------------------------------------------------
 ADV_EPS = 1e-6
 
-def group_advantages(rewards: np.ndarray, resolved: np.ndarray | None = None,
-                     use_std: bool = True) -> np.ndarray | None:
-    """(r - mean)/std over one problem's RESOLVED rewards; None for a std=0 group
-    (all-correct / all-incorrect — no signal, skip). use_std=False gives stock
-    nanochat's plain (r - mean) advantage (still skipping zero-signal groups)."""
+def group_advantages(rewards: np.ndarray) -> np.ndarray | None:
+    """chat_rl's advantage: plain (r - mean) over one problem's rewards; None
+    for an all-equal group (all-correct / all-incorrect — zero advantage
+    everywhere, hence zero gradient, so the docs are skipped outright)."""
     r = np.asarray(rewards, dtype=np.float64)
-    res = (np.ones(len(r), dtype=bool) if resolved is None
-           else np.asarray(resolved, dtype=bool))
-    rr = r[res]
-    if rr.size < 2:
+    if r.size < 2 or r.std() < ADV_EPS:
         return None
-    std = rr.std()
-    if std < ADV_EPS:
-        return None
-    adv = np.zeros(len(r), dtype=np.float64)
-    adv[res] = (rr - rr.mean()) / std if use_std else (rr - rr.mean())
-    return adv
+    return r - r.mean()
 
 
-def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv_tok,
-                           branch_temperature: float, branch_top_p: float):
+def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv_tok):
     """Compile target (fullgraph, static shapes): nanochat packed forward ->
-    Σ -A·logπ over kept BRANCH tokens (the policy's own T=1.0 nucleus>1
-    positions). Returns (loss_sum, n_loss_tokens, n_branch, n_comp); only
+    Σ -A·logπ over completion tokens. Returns (loss_sum, n_loss_tokens); only
     loss_sum carries grad."""
     logits = model(input_ids, targets=None, cu_seqlens=cu_seqlens)  # (1, T, V) fp32 softcapped
-    logits = logits[0]
-    logp = -F.cross_entropy(logits, targets, reduction="none")
-    z = logits / branch_temperature
-    log_pmax = z.amax(-1) - z.logsumexp(-1)
-    branch = log_pmax <= math.log(branch_top_p)
+    logp = -F.cross_entropy(logits[0], targets, reduction="none")
     comp = comp_mask.bool()
-    tok_mask = comp & branch
-    loss_sum = (-(adv_tok * logp) * tok_mask).sum()
-    return loss_sum, tok_mask.sum(), tok_mask.sum(), comp.sum()
+    loss_sum = (-(adv_tok * logp) * comp).sum()
+    return loss_sum, comp.sum()
 
 
 # TRAIN warmup: compile fwd+bwd per bucket on a dummy pack (weights untouched).
@@ -435,8 +376,8 @@ for tb in TRAIN_BUCKETS:
                                      max_num_docs=MAX_NUM_DOCS, pad_id=PAD_ID,
                                      max_doc_len=SEQ_CAP)
     pk = packs[0]
-    loss_sum, *_ = TRAIN_FN(model, pk.input_ids, pk.cu_seqlens, pk.targets,
-                            pk.comp_mask, pk.adv_tok, TRAIN_BRANCH_TEMP, TRAIN_BRANCH_TOP_P)
+    loss_sum, _ = TRAIN_FN(model, pk.input_ids, pk.cu_seqlens, pk.targets,
+                           pk.comp_mask, pk.adv_tok)
     loss_sum.backward()
     model.zero_grad(set_to_none=True)
     del packs, pk, loss_sum
@@ -456,37 +397,15 @@ def grade_rows(rows) -> list[float]:
     return [train_task.reward(train_convs[r["meta"]], r["completion_text"]) for r in rows]
 
 
-def clip_post_answer(comp_ids: list[int], text: str) -> list[int]:
-    """The CLIP_ANSWER surgery for one correct completion: token-granular cut at
-    the first token whose decode covers the `#### <answer>` regex match end,
-    plus <|assistant_end|>. `text` is the row's completion_text (trailing
-    terminal token already excluded by the engine, so a clean answer-then-stop
-    has nothing after the match). Returns comp_ids ITSELF when already clean —
-    callers identity-check to see whether surgery happened. Token boundaries
-    don't split, so the cut token may carry a merged trailing char."""
-    m = GSM_RE.search(text)
-    if m is None or not text[m.end():].strip():
-        return comp_ids
-    lo, hi = 1, len(comp_ids)      # smallest prefix whose decode covers the answer
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if len(tokenizer.decode(comp_ids[:mid])) >= m.end():
-            hi = mid
-        else:
-            lo = mid + 1
-    return comp_ids[:lo] + [ASSISTANT_END]
-
-
 def train_step(groups: list[dict]) -> dict:
-    """One branch-masked REINFORCE optimizer step over the round's problem
-    groups. Same advantages/exclusions/DAPO token-mean as the speedrun; no
-    'unresolved' verdicts (regex reward always resolves)."""
+    """One REINFORCE optimizer step over the round's problem groups: chat_rl's
+    advantages and loss-token set, DAPO global token-mean normalizer."""
     _t0 = time.perf_counter()
     docs = []
     n_groups_used = n_excluded = 0
     n_sat = n_dead = 0
     for g in groups:
-        adv = group_advantages(np.asarray(g["rewards"], dtype=np.float64), use_std=ADV_STD)
+        adv = group_advantages(np.asarray(g["rewards"], dtype=np.float64))
         if adv is None:                               # zero-signal group: no gradient
             if np.mean(g["rewards"]) >= 1.0:
                 n_sat += 1                            # every rollout correct
@@ -495,18 +414,14 @@ def train_step(groups: list[dict]) -> dict:
             continue
         n_groups_used += 1
         for k, comp in enumerate(g["completions"]):
-            # truncated-incorrect stays in the baseline but is excluded from loss
-            if (g["truncated"][k] and g["rewards"][k] == 0) or not comp:
+            comp = list(comp)
+            if comp and comp[-1] in (ASSISTANT_END, BOS):
+                comp = comp[:-1]  # terminal token is never trained (chat_rl strips it)
+            if not comp:
                 n_excluded += 1
                 continue
-            comp = list(comp)
-            if not TRAIN_TERMINAL and comp[-1] in (ASSISTANT_END, BOS):
-                comp = comp[:-1]
-                if not comp:
-                    n_excluded += 1
-                    continue
             docs.append((g["prompt_ids"], comp, float(adv[k])))
-    total_tokens = total_branch = total_comp = 0
+    total_tokens = 0
     total_loss = 0.0
     n_packs = 0
     pstats = None
@@ -522,11 +437,9 @@ def train_step(groups: list[dict]) -> dict:
         _pk_t = time.perf_counter()
         with record_function("train/fwd+bwd"):
             for pk in packs:
-                loss_sum, n_tok, n_branch, n_comp = TRAIN_FN(
+                loss_sum, n_tok = TRAIN_FN(
                     model, pk.input_ids, pk.cu_seqlens, pk.targets, pk.comp_mask,
-                    pk.adv_tok, TRAIN_BRANCH_TEMP, TRAIN_BRANCH_TOP_P)
-                total_comp += int(n_comp.item())
-                total_branch += int(n_branch.item())
+                    pk.adv_tok)
                 nt = int(n_tok.item())
                 if nt > 0:
                     loss_sum.backward()               # unnormalized; accumulates
@@ -556,8 +469,8 @@ def train_step(groups: list[dict]) -> dict:
             params = [p for p in model.parameters() if p.grad is not None]
             for prm in params:
                 prm.grad.mul_(inv)
-            if GRAD_CLIP > 0 and not ddp:  # exact clip; skipped under DDP (sharded reduce)
-                gnorm = float(torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP))
+            if not ddp:  # grad-norm telemetry only — no clipping (chat_rl has none)
+                gnorm = float(torch.nn.utils.clip_grad_norm_(params, float("inf")))
             optimizer.step()
             stepped = True
         model.zero_grad(set_to_none=True)
@@ -569,57 +482,13 @@ def train_step(groups: list[dict]) -> dict:
                 n_groups_used=n_groups_used, n_groups_total=len(groups),
                 n_groups_sat=n_sat, n_groups_dead=n_dead,
                 n_docs=len(docs), n_excluded=n_excluded, n_packs=n_packs,
-                pstats=pstats,
-                n_loss_tokens=total_tokens, n_comp_tokens=total_comp,
-                branch_frac=(total_branch / total_comp) if total_comp else 0.0,
+                pstats=pstats, n_loss_tokens=total_tokens,
                 loss_token_mean=(total_loss / total_tokens) if total_tokens else 0.0,
                 grad_norm=gnorm, stepped=stepped)
 
 
 # -----------------------------------------------------------------------------
-# §5. Eval — pass@k on the test split through the fast engine
-# -----------------------------------------------------------------------------
-def run_eval(rnd: int) -> dict:
-    engine.set_sampling(temperature=EVAL_TEMP, top_p=TOP_P)
-    specs = [(("eval", i), val_prompts[i], EVAL_K, EVAL_MAX_TOKENS)
-             for i in range(rank, n_eval, world_size)]
-    nodes = engine.make_nodes(specs)
-    rows, gstats = engine.run_round(nodes, rnd)
-    engine.set_sampling(temperature=TEMPERATURE, top_p=TOP_P)
-    by_idx: dict[int, list[int]] = {}
-    for r in rows:
-        i = r["meta"][1]
-        ok = val_task.evaluate(val_convs[i], r["completion_text"])
-        by_idx.setdefault(i, []).append(ok)
-    passk = torch.zeros(EVAL_K, device=device)
-    for outcomes in by_idx.values():
-        for k in range(1, EVAL_K + 1):
-            passk[k - 1] += float(any(outcomes[:k]))
-    n_rec = torch.tensor(len(by_idx), dtype=torch.long, device=device)
-    # rollout-level eval diagnostics: truncation rate (hit the token budget) and
-    # correct-formatting rate (emitted an extractable `#### n`, right or wrong) —
-    # so a flat pass@k can be attributed to format/truncation vs actual wrongness.
-    n_roll = torch.tensor(float(len(rows)), device=device)
-    n_trunc = torch.tensor(float(sum(r["terminal"] == "truncated" for r in rows)), device=device)
-    n_fmt = torch.tensor(float(sum(extract_answer(r["completion_text"]) is not None for r in rows)), device=device)
-    if ddp:
-        for _t in (n_rec, passk, n_roll, n_trunc, n_fmt):
-            dist.all_reduce(_t, op=dist.ReduceOp.SUM)
-    passk = (passk / n_rec.item()).tolist()
-    trunc_rate = (n_trunc / n_roll).item()
-    fmt_rate = (n_fmt / n_roll).item()
-    print0(f"  [eval r{rnd}] " + ", ".join(f"pass@{k+1}: {v:.4f}" for k, v in enumerate(passk))
-           + f" | fmt {100*fmt_rate:.1f}% | trunc {100*trunc_rate:.1f}%"
-           + f" | {gstats['gen_tok']:,} tok in {gstats['gen_s']:.1f}s "
-           f"({gstats['gen_tok']/gstats['gen_s']:,.0f} tok/s)", flush=True)
-    return {f"pass@{k+1}": round(v, 4) for k, v in enumerate(passk)} | {
-        "round": rnd, "n": int(n_rec.item()),
-        "fmt_rate": round(fmt_rate, 4), "trunc_rate": round(trunc_rate, 4),
-        "gen_s": round(gstats["gen_s"], 1), "gen_tok": gstats["gen_tok"]}
-
-
-# -----------------------------------------------------------------------------
-# §6. Rounds
+# §5. Rounds
 # -----------------------------------------------------------------------------
 # Device-memory telemetry is SAMPLED, not per-round: cudaMemGetInfo measured
 # ~125 ms a call against this process (trace_prof4) — ~1.4% of a 9 s round, for a
@@ -641,27 +510,23 @@ def _device_mem_gb(rnd: int) -> float:
 
 
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
-               "n_clipped",
-               "n_stop", "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
+               "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
                "n_groups_dead", "n_docs", "n_loss_tokens",
-               "n_comp_tok", "train_tok_per_s", "branch_frac", "loss_token_mean",
-               "grad_norm", "lrm", "wnorm", "mem_gb", "round_s"]
+               "train_tok_per_s", "loss_token_mean",
+               "grad_norm", "wnorm", "mem_gb", "round_s"]
 metrics_path = HERE / f"metrics_{TAG}.csv"
-passk_path = HERE / f"passk_{TAG}.csv"
 mf = open(metrics_path, "w", newline="") if master else None
 mw = None
 if master:
     mw = csv.DictWriter(mf, fieldnames=METRIC_COLS)
     mw.writeheader()
-pf = pw = None
 
 RUN_DIR = Path(os.environ.get("RUN_DIR", str(Path.home() / ".cache" / "nanochat" / "fastrl_runs"))) / TAG
 if master:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 curve: list[dict] = []
-eval_curve: list[dict] = []
 run_error = None
 run_t0 = time.perf_counter()
 
@@ -678,8 +543,7 @@ def save_ckpt(step: int) -> None:
                                      unembedding_lr=unembedding_lr,
                                      embedding_lr=embedding_lr,
                                      matrix_lr=matrix_lr, scalar_lr=scalar_lr,
-                                     init_lr_frac=INIT_LR_FRAC,
-                                     lr_schedule=LR_SCHEDULE)}
+                                     init_lr_frac=INIT_LR_FRAC)}
     if master or opt_data is not None:
         save_checkpoint(ckpt_dir, step, model.state_dict() if master else None,
                         opt_data, meta_data, rank=rank)
@@ -700,17 +564,6 @@ try:
     for rnd in range(num_rounds):
         r_t0 = time.perf_counter()
 
-        if EVAL_EVERY and rnd % EVAL_EVERY == 0:
-            ev = run_eval(rnd)
-            eval_curve.append(ev)
-            if master:
-                if pw is None:
-                    pf = open(passk_path, "w", newline="")
-                    pw = csv.DictWriter(pf, fieldnames=list(ev.keys()))
-                    pw.writeheader()
-                pw.writerow(ev)
-                pf.flush()
-
         # -- generation ------------------------------------------------------
         idxs = FIXED_PROBLEMS if FIXED_PROBLEMS is not None else round_schedule[rnd]
         specs = [(i, train_prompts[i], K_DRAWS, MAX_TOKENS) for i in idxs]
@@ -720,37 +573,16 @@ try:
         # -- grade -----------------------------------------------------------
         with record_function("round/grade+group"):
             rewards = grade_rows(rows)
-            n_clipped = 0
-            comps, truncs = [], []
-            for r, rw in zip(rows, rewards):
-                comp = r["completion_token_ids"]
-                trunc = r["terminal"] == "truncated"
-                if CLIP_ANSWER and rw == 1.0:
-                    # A stop-string retire cuts completion_text BEFORE the
-                    # marker but comp keeps the ids through it — decide on the
-                    # ids' own decode so the marker lead-in gets clipped too.
-                    text = (tokenizer.decode(comp) if r["terminal"] == "stop_string"
-                            else r["completion_text"])
-                    clipped = clip_post_answer(comp, text)
-                    if clipped is not comp:      # surgery happened: now ends in EOS
-                        comp, trunc = clipped, False
-                        n_clipped += 1
-                comps.append(comp)
-                truncs.append(trunc)
             by_pid: dict[int, list[int]] = {}
             for i, r in enumerate(rows):
                 by_pid.setdefault(r["meta"], []).append(i)
             groups = [dict(
                 prompt_ids=train_prompts[pid],
-                completions=[comps[i] for i in idl],
+                completions=[rows[i]["completion_token_ids"] for i in idl],
                 rewards=[rewards[i] for i in idl],
-                truncated=[truncs[i] for i in idl],
             ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
-        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
         _t = time.perf_counter()
         with record_function("round/train"):
             tstats = train_step(groups)
@@ -768,8 +600,6 @@ try:
             round=rnd, n_rollouts=int(agg[1]), n_correct=int(agg[0]),
             solve_rate=round(solve_rate, 4),
             n_truncated=sum(r["terminal"] == "truncated" for r in rows),
-            n_clipped=n_clipped,
-            n_stop=gstats["stop_fires"],
             n_eos=sum(r["terminal"] == "emitted_eos" for r in rows),
             gen_s=round(gstats["gen_s"], 1), gen_tok=gstats["gen_tok"],
             gen_tok_per_s=round(gstats["gen_tok"] / gstats["gen_s"], 1),
@@ -779,11 +609,10 @@ try:
             n_groups_used=tstats["n_groups_used"],
             n_groups_sat=tstats["n_groups_sat"], n_groups_dead=tstats["n_groups_dead"],
             n_docs=tstats["n_docs"],
-            n_loss_tokens=tstats["n_loss_tokens"], n_comp_tok=tstats["n_comp_tokens"],
-            train_tok_per_s=round(tstats["n_comp_tokens"] / train_s, 1) if train_s else 0.0,
-            branch_frac=round(tstats["branch_frac"], 4),
+            n_loss_tokens=tstats["n_loss_tokens"],
+            train_tok_per_s=round(tstats["n_loss_tokens"] / train_s, 1) if train_s else 0.0,
             loss_token_mean=round(tstats["loss_token_mean"], 6),
-            grad_norm=round(tstats["grad_norm"], 6), lrm=round(lrm, 4),
+            grad_norm=round(tstats["grad_norm"], 6),
             wnorm=round(wnorm, 2),
             mem_gb=_device_mem_gb(rnd),
             round_s=round(time.perf_counter() - r_t0, 1))
@@ -805,16 +634,15 @@ try:
                   if tstats.get("pstats") else 0.0)
         print0(f"  [round {rnd:3d}] gen   {gstats['gen_s']:5.1f}s ({row['gen_tok_per_s']:>7,.0f} tok/s) | "
                f"solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
-               f"eos {row['n_eos']:3d} stop {gstats['stop_fires']:2d} trunc {row['n_truncated']:2d} "
-               f"clip {n_clipped:2d} | "
+               f"eos {row['n_eos']:3d} trunc {row['n_truncated']:2d} | "
                f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% | "
                f"kv peak {gstats.get('peak_blocks', 0)}/{engine.pool.num_blocks}", flush=True)
         print0(f"              train {train_s:5.1f}s ({row['train_tok_per_s']:>7,.0f} tok/s) | "
-               f"{tstats['n_loss_tokens']:,} br-tok | "
+               f"{tstats['n_loss_tokens']:,} loss-tok | "
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
                f"grp {tstats['n_groups_used']}/{tstats['n_groups_total']} "
                f"(sat {tstats['n_groups_sat']} dead {tstats['n_groups_dead']}) | "
-               f"gnorm {tstats['grad_norm']:.3f} | lrm {lrm:.3f} | "
+               f"gnorm {tstats['grad_norm']:.3f} | "
                f"build+fwd+opt {tstats['t_build']:.2f}+{tstats['t_fwd']:.2f}+{tstats['t_opt']:.2f}"
                + ("" if tstats["stepped"] else " [SKIPPED no signal]"), flush=True)
 
@@ -854,21 +682,18 @@ finally:
             print(f"  !! trace export failed: {pe}", flush=True)
     if master and mf:
         mf.close()
-    if master and pf:
-        pf.close()
     total_s = time.perf_counter() - run_t0
     if curve:
         save_ckpt(len(curve))
 
     # ------------------------------------------------------------------
-    # §7. Results — summary + save (+ optional HF push)
+    # §6. Results — summary + save (+ optional HF push)
     # ------------------------------------------------------------------
     checklist = {
         "decode_body_compiled": bool(COMPILE),
         "decode_cuda_graphs_captured": len(engine.gd.graphs),
         "prefill_varlen_packed_graph": engine.pfg is not None and engine.pfg.graph is not None,
         "prefill_body_compiled": bool(PREFILL_COMPILE),
-        "stop_string_detection": bool(STOP_DETECT),
         "prefix_sharing_active": True,
         "train_forward_compiled": bool(COMPILE_TRAIN),
         "train_static_buckets": list(TRAIN_BUCKETS),
@@ -876,13 +701,14 @@ finally:
         "same_process_gen_train": True,
         "bf16_params_fp32_opt_state": True,
         "kv_pool_permanent_gb": round((engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30, 1),
+        "chat_rl_aligned_algorithm": True,
         "tool_use": False,
     }
     result = dict(
         tag=TAG, k=K_DRAWS, problems_per_round=PPR, rounds_run=len(curve),
         budget=MAX_TOKENS, world_size=world_size, source=SOURCE,
-        temperature=TEMPERATURE, adv_std=ADV_STD, init_lr_frac=INIT_LR_FRAC,
-        lr_schedule=LR_SCHEDULE, lr_source=_lr_source,
+        temperature=TEMPERATURE, top_k=TOP_K, init_lr_frac=INIT_LR_FRAC,
+        lr_source=_lr_source,
         raw_lrs=dict(unembedding=unembedding_lr, embedding=embedding_lr,
                      matrix=matrix_lr, scalar=scalar_lr),
         error=run_error,
@@ -893,7 +719,6 @@ finally:
                            if curve else None),
         train_s_med=(sorted(c["train_s"] for c in curve)[len(curve) // 2] if curve else None),
         round_s_med=(sorted(c["round_s"] for c in curve)[len(curve) // 2] if curve else None),
-        passk_curve=eval_curve,
         total_s=round(total_s, 1), build_s=round(build_s, 1), warm_s=round(warm_s, 1),
         peak_mem_gb=round(torch.cuda.max_memory_reserved() / 2 ** 30, 1),
         kv_pool_gb=KV_POOL_GB, buckets=",".join(map(str, engine.buckets)),
@@ -907,19 +732,15 @@ finally:
         print("  checklist: " + json.dumps(checklist), flush=True)
         try:
             from tabulate import tabulate
-            md = tabulate([[k, v] for k, v in result.items() if k not in ("checklist", "passk_curve")],
+            md = tabulate([[k, v] for k, v in result.items() if k != "checklist"],
                           headers=["metric", "value"], tablefmt="github")
             cmd = tabulate([[c["round"], c["n_correct"], c["solve_rate"], c["gen_s"],
                              c["train_s"], c["grad_norm"], c["wnorm"]] for c in curve],
                            headers=["round", "correct", "rate", "gen_s", "train_s",
                                     "gnorm", "|w|"], tablefmt="github")
-            pk = (tabulate([[e["round"]] + [e[f"pass@{k+1}"] for k in range(EVAL_K)]
-                            for e in eval_curve],
-                           headers=["round"] + [f"pass@{k+1}" for k in range(EVAL_K)],
-                           tablefmt="github") if eval_curve else "(no evals)")
             (HERE / f"result_{TAG}.md").write_text(
                 f"# chat_rl_fast `{TAG}`\n\n{md}\n\nChecklist: `{json.dumps(checklist)}`\n\n"
-                f"## Round curve\n\n{cmd}\n\n## pass@k\n\n{pk}\n")
+                f"## Round curve\n\n{cmd}\n")
         except ImportError:
             pass
         import shutil
