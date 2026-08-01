@@ -36,10 +36,15 @@ def extract_answer(completion):
 
 class GSM8K(Task):
 
-    def __init__(self, subset, split, **kwargs):
+    def __init__(self, subset, split, tools=True, **kwargs):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
+        # tools=False: strip the << >> calculator annotations and render the
+        # assistant message as plain supervised text (no python/python_output
+        # parts). Used to train a model that computes inline, for RL without
+        # the tool-forcing state machine.
+        self.tools = tools
         self.ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
 
     @property
@@ -57,6 +62,16 @@ class GSM8K(Task):
         # Create and return the Conversation object
         # This is tricky because GSM8K uses tool calls, which we need to parse here.
         assistant_message_parts = []
+        if not self.tools:
+            # Plain-text rendering: drop the calculator annotations entirely.
+            # (Kept as a single-element parts list so evaluate() stays uniform.)
+            answer_clean = re.sub(r'<<[^>]+>>', '', answer)
+            assistant_message_parts.append({"type": "text", "text": answer_clean})
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": assistant_message_parts},
+            ]
+            return {"messages": messages}
         parts = re.split(r'(<<[^>]+>>)', answer)
         for part in parts:
             if part.startswith('<<') and part.endswith('>>'):

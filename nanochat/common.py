@@ -63,6 +63,10 @@ def setup_default_logging():
         level=logging.INFO,
         handlers=[handler]
     )
+    # Quiet noisy third-party per-request loggers: httpx/httpcore log every HF
+    # dataset/hub HEAD/GET at INFO, which floods run logs. Keep them at WARNING+.
+    for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 setup_default_logging()
 logger = logging.getLogger(__name__)
