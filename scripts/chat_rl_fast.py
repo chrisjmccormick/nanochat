@@ -132,7 +132,7 @@ MACRO_N      = _env_int("MACRO_N", 8)
 _BK_ENV = os.environ.get("BUCKETS")
 BUCKETS      = tuple(int(x) for x in _BK_ENV.split(",")) if _BK_ENV else None
 PREFILL_T    = _env_int("PREFILL_T", 0)           # 0/unset -> auto-size (see §1)
-PREFILL_SEQS = _env_int("PREFILL_SEQS", 12)
+PREFILL_SEQS = _env_int("PREFILL_SEQS", 0)        # 0/unset -> auto: contexts per round
 COMPILE      = _env_flag("COMPILE", 1)
 PREFILL_COMPILE = _env_flag("PREFILL_COMPILE", 1)
 PREFILL_FULLGRAPH = _env_flag("PREFILL_FULLGRAPH", 1)
@@ -222,6 +222,14 @@ else:
 # positions through the dense layers every replay whether or not they hold real
 # tokens, and pads the tail into one attended segment. Setting PREFILL_T in the env
 # pins it instead (to reproduce an earlier run's shape).
+# Prefill graph row count: a round prefills one context per problem, so cover
+# exactly that many unless the env pins it (to reproduce an earlier run's shape).
+_ctx_per_round = len(FIXED_PROBLEMS) if FIXED_PROBLEMS is not None else ppr_rank
+if not PREFILL_SEQS:
+    PREFILL_SEQS = _ctx_per_round
+assert PREFILL_SEQS >= _ctx_per_round, \
+    f"PREFILL_SEQS={PREFILL_SEQS} < {_ctx_per_round} contexts per round"
+
 prefill_need = max(round_max, max_prompt)
 if PREFILL_T:
     assert PREFILL_T >= prefill_need, (
