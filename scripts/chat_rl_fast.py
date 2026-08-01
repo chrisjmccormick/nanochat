@@ -204,6 +204,14 @@ else:
     round_schedule, _sched = assemble_balanced_rounds(
         [(i, len(train_prompts[i]) - 1) for i in shard], ppr_rank, epochs=EPOCHS)
     num_rounds = len(round_schedule)
+    if ddp:
+        # Rank shards differ by up to 1 problem, so per-rank round counts can
+        # differ by 1 — every rank must run the SAME count or the round loop's
+        # collectives deadlock. Take the min (chat_sft does the same).
+        _nr = torch.tensor([num_rounds], dtype=torch.long, device=device)
+        dist.all_reduce(_nr, op=dist.ReduceOp.MIN)
+        num_rounds = int(_nr.item())
+        round_schedule = round_schedule[:num_rounds]
     round_max = _sched["max"]
     print0(f"[{TAG}] balanced rounds: per-round context tokens "
            f"min/mean/max {_sched['min']}/{_sched['mean']:.0f}/{_sched['max']}", flush=True)
