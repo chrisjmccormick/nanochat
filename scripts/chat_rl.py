@@ -135,8 +135,8 @@ def get_batch():
             tgt = seq_t[1:].clone() # clone to avoid in-place modification:
             tgt[mask_t[1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index
             target_seqs.append(tgt)
-        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
-        # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
+        # NOTE also that the Engine returns mask=0 for the prompt tokens,
+        # so we will (correctly) end up not training on the prompt tokens.
         # Concatenate the sequences and masks into 1D PyTorch tensors
         inputs = torch.cat(input_seqs)
         targets = torch.cat(target_seqs)

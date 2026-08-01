@@ -11,7 +11,9 @@ Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.
 Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.
 #### 10
 
-Notice that GSM8K uses tool calls inside << >> tags.
+The source dataset annotates calculations with << >> calculator tags; we strip
+them and render the answer as plain supervised text. This line of the project
+trains models that compute inline -- no tool use is taught or allowed.
 """
 
 import re
@@ -35,15 +37,10 @@ def extract_answer(completion):
 
 class GSM8K(Task):
 
-    def __init__(self, subset, split, tools=True, **kwargs):
+    def __init__(self, subset, split, **kwargs):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
-        # tools=False: strip the << >> calculator annotations and render the
-        # assistant message as plain supervised text (no python/python_output
-        # parts). Used to train a model that computes inline, for RL without
-        # the tool-forcing state machine.
-        self.tools = tools
         self.ds = load_hub_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
 
     @property
@@ -58,45 +55,14 @@ class GSM8K(Task):
         row = self.ds[index]
         question = row['question'] # string of the question prompt
         answer = row['answer'] # string of the full solution and the answer after #### marker
-        # Create and return the Conversation object
-        # This is tricky because GSM8K uses tool calls, which we need to parse here.
-        assistant_message_parts = []
-        if not self.tools:
-            # Plain-text rendering: drop the calculator annotations entirely.
-            # (Kept as a single-element parts list so evaluate() stays uniform.)
-            answer_clean = re.sub(r'<<[^>]+>>', '', answer)
-            assistant_message_parts.append({"type": "text", "text": answer_clean})
-            messages = [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": assistant_message_parts},
-            ]
-            return {"messages": messages}
-        parts = re.split(r'(<<[^>]+>>)', answer)
-        for part in parts:
-            if part.startswith('<<') and part.endswith('>>'):
-                # This is a calculator tool call
-                inner = part[2:-2]  # Remove << >>
-                # Split on = to get expression and result
-                if '=' in inner:
-                    expr, result = inner.rsplit('=', 1)
-                else:
-                    expr, result = inner, ""
-                # Add the tool call as a part
-                assistant_message_parts.append({"type": "python", "text": expr})
-                # Add the result as a part
-                assistant_message_parts.append({"type": "python_output", "text": result})
-            else:
-                # Regular text in between tool calls
-                assistant_message_parts.append({"type": "text", "text": part})
-        # Now put it all together
+        # Drop the << >> calculator annotations and render the answer as plain text.
+        # (Kept as a single-element parts list so evaluate() stays uniform.)
+        answer_clean = re.sub(r'<<[^>]+>>', '', answer)
         messages = [
-            {"role": "user", "content": question}, # note: simple string
-            {"role": "assistant", "content": assistant_message_parts}, # note: list of parts (as dicts)
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": [{"type": "text", "text": answer_clean}]},
         ]
-        conversation = {
-            "messages": messages,
-        }
-        return conversation
+        return {"messages": messages}
 
     def evaluate(self, conversation, assistant_response):
         """
