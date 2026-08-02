@@ -167,6 +167,11 @@ PROF_WAIT   = _env_int("PROF_WAIT", 3)
 PROF_ACTIVE = _env_int("PROF_ACTIVE", 1)
 OUT_TAG       = os.environ.get("OUT_TAG", "d24-fastrl")
 SOURCE        = os.environ.get("SOURCE", "sft")
+TRAIN_TASK    = os.environ.get("TRAIN_TASK", "gsm8k")   # gsm8k | orca
+# In-loop benchmark eval (GSM8K test) — 0 = off, else every N rounds.
+EVAL_EVERY    = _env_int("EVAL_EVERY", 0)
+EVAL_PROBLEMS = _env_int("EVAL_PROBLEMS", 512)
+EVAL_K        = _env_int("EVAL_K", 4)
 # FIXED_PROBLEMS: csv of train indices — every round trains on exactly these
 # problems (single/multi-problem overfit smoke, like the speedrun's sp1).
 FIXED_PROBLEMS = [int(x) for x in os.environ.get("FIXED_PROBLEMS", "").split(",") if x] or None
@@ -199,7 +204,16 @@ BOS = tokenizer.get_bos_token_id()
 PAD_ID = BOS
 SEQ_CAP = model.config.sequence_len
 
-train_task = GSM8K(subset="main", split="train")
+if TRAIN_TASK == "gsm8k":
+    train_task = GSM8K(subset="main", split="train")
+elif TRAIN_TASK == "orca":
+    # ~102k unseen word problems vs GSM8K train's 7.4k — and unlike GSM8K train,
+    # not the pool our distilled SFT checkpoints were trained on. Grading is
+    # identical (`#### n`); see tasks/orca_math.py for the gold-answer filter.
+    from tasks.orca_math import OrcaMath
+    train_task = OrcaMath()
+else:
+    raise ValueError(f"unknown TRAIN_TASK {TRAIN_TASK!r} (gsm8k|orca)")
 
 print0("rendering prompts ...", flush=True)
 train_convs = [train_task[i] for i in range(len(train_task))]
@@ -589,6 +603,76 @@ def save_ckpt(step: int) -> None:
         print(f"  saved checkpoint -> {ckpt_dir} (step {step})", flush=True)
 
 
+# -----------------------------------------------------------------------------
+# In-loop benchmark eval. A full offline trajectory eval costs ~3 min per
+# checkpoint, so a long run gives no signal until it ends — this runs a FIXED
+# subset of GSM8K test through the already-captured graphs every EVAL_EVERY
+# rounds instead. It reports mean solve (the low-variance one-shot metric; use
+# the offline eval for pass@k) plus the fmt% channel, which is where RL damage
+# on this substrate shows up first.
+#
+# ALWAYS GSM8K test, whatever TRAIN_TASK is: when training on another pool this
+# IS the transfer measurement.
+#
+# It does not touch the optimizer, and the sampler RNG is saved/restored around
+# it so the training rollout stream is bit-identical to a run with eval off.
+eval_task = eval_convs = eval_prompts = eval_waves = None
+if EVAL_EVERY:
+    eval_task = GSM8K(subset="main", split="test")
+    n_eval = min(EVAL_PROBLEMS, len(eval_task))
+    eval_convs = [eval_task[i] for i in range(n_eval)]
+    eval_prompts = [tokenizer.render_for_completion(c) for c in eval_convs]
+    # Waves must satisfy the same static-prefill invariants as a train round:
+    # <= prefill_seqs contexts, <= prefill_t context tokens, <= max_seqs rows.
+    eval_waves, cur, cur_tok = [], [], 0
+    for i, p in enumerate(eval_prompts):
+        ctx = len(p) - 1
+        if cur and (len(cur) + 1 > engine.pfg.prefill_seqs
+                    or cur_tok + ctx > engine.pfg.prefill_t
+                    or (len(cur) + 1) * EVAL_K > engine.max_seqs):
+            eval_waves.append(cur)
+            cur, cur_tok = [], 0
+        cur.append(i)
+        cur_tok += ctx
+    if cur:
+        eval_waves.append(cur)
+    print0(f"[{TAG}] in-loop eval: GSM8K test {n_eval} x K={EVAL_K} every "
+           f"{EVAL_EVERY} rounds ({len(eval_waves)} waves)", flush=True)
+
+eval_rows_csv = []
+
+
+def run_inloop_eval(rnd):
+    """Fixed GSM8K-test subset through the captured graphs; no optimizer touch."""
+    rng_state = torch.cuda.get_rng_state()
+    t0 = time.perf_counter()
+    n_ok = n_fmt = n_trunc = n_roll = 0
+    for wave in eval_waves:
+        specs = [(i, eval_prompts[i], EVAL_K, MAX_TOKENS) for i in wave]
+        rows_e, _ = engine.run_round(engine.make_nodes(specs), rnd)
+        for r in rows_e:
+            n_roll += 1
+            n_ok += eval_task.evaluate(eval_convs[r["meta"]], r["completion_text"])
+            n_fmt += extract_answer(r["completion_text"]) is not None
+            n_trunc += r["terminal"] == "truncated"
+    torch.cuda.set_rng_state(rng_state)
+    el = time.perf_counter() - t0
+    row = dict(round=rnd, eval_rollouts=n_roll,
+               eval_solve=round(100 * n_ok / max(1, n_roll), 2),
+               eval_fmt=round(100 * n_fmt / max(1, n_roll), 1),
+               eval_trunc=round(100 * n_trunc / max(1, n_roll), 1),
+               eval_s=round(el, 1))
+    eval_rows_csv.append(row)
+    if master:
+        print(f"  [eval {rnd:4d}] gsm8k test: solve {row['eval_solve']:5.2f}% | "
+              f"fmt {row['eval_fmt']:5.1f}% | trunc {row['eval_trunc']:4.1f}% | "
+              f"{n_roll:,} rolls in {el:.1f}s", flush=True)
+        with open(HERE / f"evals_{TAG}.csv", "w", newline="") as ef:
+            w = csv.DictWriter(ef, fieldnames=list(eval_rows_csv[0].keys()))
+            w.writeheader()
+            w.writerows(eval_rows_csv)
+
+
 profiler = None
 if PROFILE and master:
     profiler = torch_profile(
@@ -600,6 +684,10 @@ if PROFILE and master:
 
 try:
     for rnd in range(num_rounds):
+        # rnd 0 evaluates the untouched starting checkpoint, so the trajectory
+        # carries its own baseline rather than borrowing one from another run.
+        if EVAL_EVERY and rnd % EVAL_EVERY == 0:
+            run_inloop_eval(rnd)
         r_t0 = time.perf_counter()
 
         # -- generation ------------------------------------------------------
@@ -725,6 +813,8 @@ try:
             save_ckpt(rnd)
         if profiler is not None:
             profiler.step()
+    if EVAL_EVERY:
+        run_inloop_eval(num_rounds)   # the end state, which the loop's stride can miss
 except BaseException as e:
     run_error = f"{type(e).__name__}: {e}"
     raise
