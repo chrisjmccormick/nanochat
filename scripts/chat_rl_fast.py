@@ -664,9 +664,16 @@ def run_inloop_eval(rnd):
                eval_s=round(el, 1))
     eval_rows_csv.append(row)
     if master:
-        print(f"  [eval {rnd:4d}] gsm8k test: solve {row['eval_solve']:5.2f}% | "
-              f"fmt {row['eval_fmt']:5.1f}% | trunc {row['eval_trunc']:4.1f}% | "
-              f"{n_roll:,} rolls in {el:.1f}s", flush=True)
+        # sem on solve is ~sqrt(p(1-p)/n_roll) -- 0.7pp at the 512x4 default. That
+        # plus the subset's own difficulty offset (its baseline read 0.5pp above
+        # the full test's) means moves of 1-2pp here are NOISE. Read this line for
+        # DIRECTION and for collapse (fmt%/trunc%); score checkpoints offline.
+        sem = 100 * (row['eval_solve'] / 100 * (1 - row['eval_solve'] / 100)
+                     / max(1, n_roll)) ** 0.5
+        print(f"  [eval {rnd:4d}] gsm8k test subset: solve {row['eval_solve']:5.2f}% "
+              f"(+-{sem:.2f} sem) | fmt {row['eval_fmt']:5.1f}% | "
+              f"trunc {row['eval_trunc']:4.1f}% | {n_roll:,} rolls in {el:.1f}s",
+              flush=True)
         with open(HERE / f"evals_{TAG}.csv", "w", newline="") as ef:
             w = csv.DictWriter(ef, fieldnames=list(eval_rows_csv[0].keys()))
             w.writeheader()
