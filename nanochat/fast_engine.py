@@ -827,7 +827,17 @@ class PrefillAllEngine:
         rolls_done = tok_total = 0
         stop_fires = bnd_copies = 0
         n_target = sum(len(n.cand_jobs) for n in nodes_all)
-        print_every = self.print_every or max(1, n_target // 8)
+        # Per-roll progress lines are opt-in (print_every set explicitly). The
+        # shape they used to show — fast while the batch is full, then a long
+        # thin drain — is carried by two summary stats instead (see below).
+        print_every = self.print_every
+        # occ: kept tokens / token-slots PAID FOR (every window replays the whole
+        # bucket, live or not), i.e. how full the decode graph actually ran.
+        # t50/t90: wall at which half / nine-tenths of the rollouts had retired —
+        # gen_s - t90 is what the last 10% of rollouts cost.
+        paid_slots = 0
+        t50 = t90 = None
+        n_half, n_ninety = (n_target + 1) // 2, (n_target * 9 + 9) // 10
 
         # -- preconditions: one prefill replay, whole round resident (no fallback)
         row_cap = min(self.max_seqs, max(self.buckets))
@@ -1014,6 +1024,7 @@ class PrefillAllEngine:
                                    dtype=torch.int64).to("cuda", non_blocking=True)
                 gd.block_table.view(-1)[upd[0]] = upd[1].to(torch.int32)
             min_free = min(min_free, len(pool.free))
+            paid_slots += bucket * MACRO_N
             gd.replay_window(bucket)
             toks_np = gd.collect_np(bucket)   # the window's single host sync
             # event scan: rows with a terminal / stop-gate / budget crossing go
@@ -1069,9 +1080,15 @@ class PrefillAllEngine:
             if any_done:
                 park_dirty = True
             w += 1
-            if rolls_done - last_roll_print >= print_every:
+            # drain marks — host-side clock only, no GPU sync, no throughput cost
+            if t90 is None and rolls_done >= n_ninety:
+                t90 = time.perf_counter() - t0
+                if t50 is None:
+                    t50 = t90
+            elif t50 is None and rolls_done >= n_half:
+                t50 = time.perf_counter() - t0
+            if print_every and rolls_done - last_roll_print >= print_every:
                 el = time.perf_counter() - t0
-                # all Python-side counters — no GPU sync, no throughput cost
                 print(f"    [r{rnd}] roll {rolls_done:4d}/{n_target} | tok {tok_total:>10,} | "
                       f"{tok_total / max(el, 1e-9):7,.0f} tok/s | rows {int(live.sum()):3d} | "
                       f"free {len(pool.free):4d} | {el:6.1f}s", flush=True)
@@ -1084,7 +1101,10 @@ class PrefillAllEngine:
         return rows, dict(
             gen_s=gen_s, gen_tok=tok_total, replays=pfg.replays,
             prefill_tok=pfg.real_tok, bnd_copies=bnd_copies, stop_fires=stop_fires,
-            peak_blocks=self.pool.num_blocks - 1 - min_free)
+            peak_blocks=self.pool.num_blocks - 1 - min_free,
+            occ=tok_total / max(1, paid_slots),
+            t50=(t50 if t50 is not None else gen_s),
+            t90=(t90 if t90 is not None else gen_s))
 
     # -- eager debug path (parity gate) ---------------------------------------
     @torch.no_grad()

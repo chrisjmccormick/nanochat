@@ -549,6 +549,7 @@ def _device_mem_gb(rnd: int) -> float:
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
                "n_clipped",
                "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
+               "gen_occ", "gen_t50", "gen_t90", "gen_tail10",
                "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
                "n_groups_dead", "n_docs", "n_loss_tokens",
                "train_tok_per_s", "loss_total",
@@ -655,6 +656,11 @@ try:
             gen_s=round(gstats["gen_s"], 1), gen_tok=gstats["gen_tok"],
             gen_tok_per_s=round(gstats["gen_tok"] / gstats["gen_s"], 1),
             rolls_per_min=round(len(rows) / gstats["gen_s"] * 60, 1),
+            gen_occ=round(100 * gstats.get("occ", 0.0), 1),
+            gen_t50=round(gstats.get("t50", 0.0), 2),
+            gen_t90=round(gstats.get("t90", 0.0), 2),
+            gen_tail10=round(100 * (1 - gstats.get("t90", gstats["gen_s"])
+                                    / max(gstats["gen_s"], 1e-9)), 1),
             peak_blocks=gstats.get("peak_blocks", 0),
             train_s=round(train_s, 1),
             n_groups_used=tstats["n_groups_used"],
@@ -687,7 +693,11 @@ try:
                f"solve {int(agg[0]):3d}/{int(agg[1])} ({100*solve_rate:5.1f}%) | "
                f"eos {row['n_eos']:3d} trunc {row['n_truncated']:2d} | "
                f"prefill {gstats.get('replays', 0)}r {pf_pack:.0f}% | "
-               f"kv peak {gstats.get('peak_blocks', 0)}/{engine.pool.num_blocks}", flush=True)
+               f"kv peak {gstats.get('peak_blocks', 0)}/{engine.pool.num_blocks} | "
+               # the drain, in two numbers: how full the decode graph ran, and
+               # what share of the wall the last 10% of rollouts took.
+               f"occ {100 * gstats.get('occ', 0):.0f}% tail10 {row['gen_tail10']:.0f}%",
+               flush=True)
         print0(f"              train {train_s:5.1f}s ({row['train_tok_per_s']:>7,.0f} tok/s) | "
                f"{tstats['n_loss_tokens']:,} loss-tok | "
                f"{tstats.get('n_packs', 0)} packs pad {tr_pad:.0f}% | "
@@ -762,7 +772,7 @@ finally:
         budget=MAX_TOKENS, world_size=world_size, source=SOURCE,
         temperature=TEMPERATURE, top_k=TOP_K, init_lr_frac=INIT_LR_FRAC,
         adv_std=ADV_STD, clip_answer=CLIP_ANSWER, freeze_scalars=FREEZE_SCALARS,
-        lr_schedule=LR_SCHEDULE, loss_norm=LOSS_NORM,
+        lr_schedule=LR_SCHEDULE, loss_norm=LOSS_NORM, fmt_reward=FMT_REWARD,
         device_batch_size=DEVICE_BATCH_SIZE,
         raw_lrs=dict(unembedding=UNEMBEDDING_LR, embedding=EMBEDDING_LR,
                      matrix=MATRIX_LR, scalar=SCALAR_LR),
@@ -772,6 +782,9 @@ finally:
         solve_rate_max=(max(c["solve_rate"] for c in curve) if curve else None),
         gen_tok_per_s_med=(sorted(c["gen_tok_per_s"] for c in curve)[len(curve) // 2]
                            if curve else None),
+        gen_occ_med=(sorted(c["gen_occ"] for c in curve)[len(curve) // 2] if curve else None),
+        gen_tail10_med=(sorted(c["gen_tail10"] for c in curve)[len(curve) // 2]
+                        if curve else None),
         train_s_med=(sorted(c["train_s"] for c in curve)[len(curve) // 2] if curve else None),
         round_s_med=(sorted(c["round_s"] for c in curve)[len(curve) // 2] if curve else None),
         total_s=round(total_s, 1), build_s=round(build_s, 1), warm_s=round(warm_s, 1),
