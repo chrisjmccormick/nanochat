@@ -75,7 +75,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
-from tasks.gsm8k import GSM8K, GSM_RE
+from tasks.gsm8k import GSM8K, GSM_RE, extract_answer
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -131,6 +131,12 @@ LR_SCHEDULE = os.environ.get("LR_SCHEDULE", "linear")  # chat_rl rampdown | "fla
 assert LR_SCHEDULE in ("linear", "flat"), f"bad LR_SCHEDULE {LR_SCHEDULE!r}"
 LOSS_NORM   = os.environ.get("LOSS_NORM", "chat_rl")   # per-pass | "token_mean" (DAPO)
 assert LOSS_NORM in ("chat_rl", "token_mean"), f"bad LOSS_NORM {LOSS_NORM!r}"
+# Partial credit for a FORMATTED (`#### n`) but wrong answer. The binary reward
+# scores formatted-wrong == unformatted, so wrong answers push the format
+# tokens down with the rest — measured on test as the policy unlearning the
+# `####` convention (fmt 94 -> ~55%) while its answers stay right. >0 makes
+# unformatted strictly worst.
+FMT_REWARD  = _env_float("FMT_REWARD", 0.0)
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
 TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384,)
 MAX_NUM_DOCS  = _env_int("MAX_NUM_DOCS", 64)
@@ -381,8 +387,15 @@ print0(f"  capture+compile+warmup {warm_s:.0f}s | peak mem "
 # §4. Grading + trainer step
 # -----------------------------------------------------------------------------
 def grade_rows(rows) -> list[float]:
-    """GSM8K regex reward, inline (microseconds per row — no fork pool needed)."""
-    return [train_task.reward(train_convs[r["meta"]], r["completion_text"]) for r in rows]
+    """GSM8K regex reward, inline (microseconds per row — no fork pool needed).
+    FMT_REWARD>0 (fix ladder) grants a wrong-but-formatted answer partial credit."""
+    out = []
+    for r in rows:
+        rw = train_task.reward(train_convs[r["meta"]], r["completion_text"])
+        if rw == 0.0 and FMT_REWARD and extract_answer(r["completion_text"]) is not None:
+            rw = FMT_REWARD
+        out.append(rw)
+    return out
 
 
 def clip_post_answer(comp_ids: list[int], text: str) -> list[int]:
