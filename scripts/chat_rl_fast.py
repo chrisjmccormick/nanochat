@@ -75,7 +75,7 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.gpt import cast_model_bf16, setup_fp32_optimizer
 from nanochat.fast_engine import PrefillAllEngine
 
-from tasks.gsm8k import GSM8K
+from tasks.gsm8k import GSM8K, GSM_RE
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
@@ -121,6 +121,16 @@ WEIGHT_DECAY   = _env_float("WEIGHT_DECAY", 0.0)
 # chat_rl's --init-lr-frac; the LR then ramps down linearly to zero over the
 # run, exactly as the baseline schedules it.
 INIT_LR_FRAC   = _env_float("INIT_LR_FRAC", 0.05)
+# ---- Fix-ladder knobs — ALL default OFF (= exact chat_rl-aligned behavior).
+# Each reintroduces ONE mechanism the alignment removed, for the one-variable-
+# at-a-time repair experiments off the ep1-ppr32 collapse (agent-ops
+# rl-align-remove): the stock algorithm shortness-spirals to 0% solve.
+ADV_STD     = _env_flag("ADV_STD", 0)      # z-score group advantage (r-mean)/std
+CLIP_ANSWER = _env_flag("CLIP_ANSWER", 0)  # cut CORRECT completions after `#### n`
+LR_SCHEDULE = os.environ.get("LR_SCHEDULE", "linear")  # chat_rl rampdown | "flat"
+assert LR_SCHEDULE in ("linear", "flat"), f"bad LR_SCHEDULE {LR_SCHEDULE!r}"
+LOSS_NORM   = os.environ.get("LOSS_NORM", "chat_rl")   # per-pass | "token_mean" (DAPO)
+assert LOSS_NORM in ("chat_rl", "token_mean"), f"bad LOSS_NORM {LOSS_NORM!r}"
 _TB_ENV = os.environ.get("TRAIN_BUCKETS")
 TRAIN_BUCKETS = tuple(int(x) for x in _TB_ENV.split(",")) if _TB_ENV else (16384,)
 MAX_NUM_DOCS  = _env_int("MAX_NUM_DOCS", 64)
@@ -322,11 +332,13 @@ ADV_EPS = 1e-6
 def group_advantages(rewards: np.ndarray) -> np.ndarray | None:
     """chat_rl's advantage: plain (r - mean) over one problem's rewards; None
     for an all-equal group (all-correct / all-incorrect — zero advantage
-    everywhere, hence zero gradient, so the docs are skipped outright)."""
+    everywhere, hence zero gradient, so the docs are skipped outright).
+    ADV_STD=1 (fix ladder) divides by the group std (z-score)."""
     r = np.asarray(rewards, dtype=np.float64)
     if r.size < 2 or r.std() < ADV_EPS:
         return None
-    return r - r.mean()
+    adv = r - r.mean()
+    return adv / r.std() if ADV_STD else adv
 
 
 def reinforce_forward_loss(model, input_ids, cu_seqlens, targets, comp_mask, adv_tok):
@@ -373,6 +385,25 @@ def grade_rows(rows) -> list[float]:
     return [train_task.reward(train_convs[r["meta"]], r["completion_text"]) for r in rows]
 
 
+def clip_post_answer(comp_ids: list[int], text: str) -> list[int]:
+    """CLIP_ANSWER (fix ladder) surgery for one CORRECT completion: token-
+    granular cut at the first token whose decode covers the `#### <answer>`
+    match end, plus <|assistant_end|> — so positive advantage reinforces
+    answer->stop rather than any post-answer ramble. Returns comp_ids ITSELF
+    when already clean (callers identity-check)."""
+    m = GSM_RE.search(text)
+    if m is None or not text[m.end():].strip():
+        return comp_ids
+    lo, hi = 1, len(comp_ids)      # smallest prefix whose decode covers the answer
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(tokenizer.decode(comp_ids[:mid])) >= m.end():
+            hi = mid
+        else:
+            lo = mid + 1
+    return comp_ids[:lo] + [ASSISTANT_END]
+
+
 def train_step(groups: list[dict]) -> dict:
     """One REINFORCE optimizer step over the round's problem groups, computing
     the gradient chat_rl computes. Its normalizer is per-PASS: each group's K
@@ -406,7 +437,10 @@ def train_step(groups: list[dict]) -> dict:
         for p0 in range(0, len(bodies), DEVICE_BATCH_SIZE):
             chunk = range(p0, p0 + DEVICE_BATCH_SIZE)
             num_valid = max(1, sum(len(bodies[k]) for k in chunk))  # chat_rl clamps min=1
-            scale = 1.0 / (num_valid * n_pass * ppr_rank)
+            # LOSS_NORM=token_mean (fix ladder): raw advantage here; the DAPO
+            # global token-mean divides the gradients once, after the pack loop.
+            scale = (1.0 if LOSS_NORM == "token_mean"
+                     else 1.0 / (num_valid * n_pass * ppr_rank))
             for k in chunk:
                 if not bodies[k]:
                     n_excluded += 1
@@ -452,6 +486,14 @@ def train_step(groups: list[dict]) -> dict:
         for prm in model.parameters():
             if prm.grad is None:
                 prm.grad = torch.zeros_like(prm)
+        if LOSS_NORM == "token_mean":
+            tok_t = torch.tensor(float(total_tokens), device=device)
+            if ddp:
+                dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+            if tok_t.item() > 0:
+                inv = world_size / float(tok_t.item())  # optimizer AVG-reduces
+                for prm in model.parameters():
+                    prm.grad.mul_(inv)
         if not ddp:  # grad-norm telemetry only — no clipping (chat_rl has none)
             gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
         optimizer.step()
@@ -492,6 +534,7 @@ def _device_mem_gb(rnd: int) -> float:
 
 
 METRIC_COLS = ["round", "n_rollouts", "n_correct", "solve_rate", "n_truncated",
+               "n_clipped",
                "n_eos", "gen_s", "gen_tok", "gen_tok_per_s", "rolls_per_min",
                "peak_blocks", "train_s", "n_groups_used", "n_groups_sat",
                "n_groups_dead", "n_docs", "n_loss_tokens",
@@ -554,17 +597,27 @@ try:
         # -- grade -----------------------------------------------------------
         with record_function("round/grade+group"):
             rewards = grade_rows(rows)
+            comps = []
+            n_clipped = 0
+            for r, rw in zip(rows, rewards):
+                comp = r["completion_token_ids"]
+                if CLIP_ANSWER and rw == 1.0:
+                    clipped = clip_post_answer(comp, r["completion_text"])
+                    if clipped is not comp:      # surgery happened: now ends in EOS
+                        comp = clipped
+                        n_clipped += 1
+                comps.append(comp)
             by_pid: dict[int, list[int]] = {}
             for i, r in enumerate(rows):
                 by_pid.setdefault(r["meta"], []).append(i)
             groups = [dict(
                 prompt_ids=train_prompts[pid],
-                completions=[rows[i]["completion_token_ids"] for i in idl],
+                completions=[comps[i] for i in idl],
                 rewards=[rewards[i] for i in idl],
             ) for pid, idl in by_pid.items()]
 
         # -- train -----------------------------------------------------------
-        lrm = 1.0 - rnd / num_rounds  # chat_rl's linear rampdown to zero
+        lrm = 1.0 if LR_SCHEDULE == "flat" else 1.0 - rnd / num_rounds
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
         _t = time.perf_counter()
@@ -584,6 +637,7 @@ try:
             round=rnd, n_rollouts=int(agg[1]), n_correct=int(agg[0]),
             solve_rate=round(solve_rate, 4),
             n_truncated=sum(r["terminal"] == "truncated" for r in rows),
+            n_clipped=n_clipped,
             n_eos=sum(r["terminal"] == "emitted_eos" for r in rows),
             gen_s=round(gstats["gen_s"], 1), gen_tok=gstats["gen_tok"],
             gen_tok_per_s=round(gstats["gen_tok"] / gstats["gen_s"], 1),
@@ -685,13 +739,17 @@ finally:
         "same_process_gen_train": True,
         "bf16_params_fp32_opt_state": True,
         "kv_pool_permanent_gb": round((engine.pool.k_buf.size + engine.pool.v_buf.size) / 2 ** 30, 1),
-        "chat_rl_aligned_algorithm": True,
+        "chat_rl_aligned_algorithm": not (ADV_STD or CLIP_ANSWER or FREEZE_SCALARS
+                                          or LR_SCHEDULE != "linear"
+                                          or LOSS_NORM != "chat_rl"),
         "tool_use": False,
     }
     result = dict(
         tag=TAG, k=K_DRAWS, problems_per_round=PPR, rounds_run=len(curve),
         budget=MAX_TOKENS, world_size=world_size, source=SOURCE,
         temperature=TEMPERATURE, top_k=TOP_K, init_lr_frac=INIT_LR_FRAC,
+        adv_std=ADV_STD, clip_answer=CLIP_ANSWER, freeze_scalars=FREEZE_SCALARS,
+        lr_schedule=LR_SCHEDULE, loss_norm=LOSS_NORM,
         device_batch_size=DEVICE_BATCH_SIZE,
         raw_lrs=dict(unembedding=UNEMBEDDING_LR, embedding=EMBEDDING_LR,
                      matrix=MATRIX_LR, scalar=SCALAR_LR),
