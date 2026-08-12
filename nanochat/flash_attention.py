@@ -20,17 +20,32 @@ import torch.nn.functional as F
 # =============================================================================
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
+def _ensure_hf_hub_can_download():
+    """Disable hf_transfer fast-download if the optional package isn't installed."""
+    import importlib.util
+    import os
+    if importlib.util.find_spec("hf_transfer") is not None:
+        return
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    try:
+        import huggingface_hub.constants as hf_constants
+        hf_constants.HF_HUB_ENABLE_HF_TRANSFER = False
+    except ImportError:
+        pass
+
+
 def _load_flash_attention_3():
     """Try to load Flash Attention 3."""
     if not torch.cuda.is_available():
         return None
     try:
+        import os
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        _ensure_hf_hub_can_download()
+        from kernels import get_kernel, has_kernel
         major, _ = torch.cuda.get_device_capability()
         # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel, has_kernel
         # The varunneal kernel obtains better results for H100/Hopper
         if major == 9:
             hf_kernel = "varunneal/flash-attention-3"
@@ -42,7 +57,9 @@ def _load_flash_attention_3():
             else:
                 return None
 
-    except Exception:
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Failed to load Flash Attention 3, using SDPA fallback: {e}")
         return None
 
 
