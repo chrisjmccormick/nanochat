@@ -50,6 +50,9 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--n-kv-head", type=int, default=-1, help="number of KV heads for GQA (-1 = same as query heads, i.e. MHA)")
+parser.add_argument("--normuon-fix", type=str, default="none", choices=["none", "kv", "kv_vegate"], help="tag GQA kv (and optionally ve_gate) params with an explicit NorMuon red_dim instead of the shape heuristic")
+parser.add_argument("--seed", type=int, default=42, help="init seed (weight init only; data order is unaffected)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -83,7 +86,7 @@ user_config = vars(args).copy()  # for logging
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type, seed=args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -133,9 +136,12 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    n_kv_head = num_heads if args.n_kv_head == -1 else args.n_kv_head
+    assert n_kv_head <= num_heads and num_heads % n_kv_head == 0, \
+        f"n_kv_head={n_kv_head} must divide n_head={num_heads}"
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
@@ -313,6 +319,8 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    # NorMuon reduction-dim handling (see GPT.setup_optimizer)
+    normuon_fix=args.normuon_fix,
 )
 
 if resuming:

@@ -416,8 +416,27 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, normuon_fix="none"):
         model_dim = self.config.n_embd
+
+        # NorMuon reduction-dim tags. The optimizer's default heuristic reduces the
+        # second moment over the smaller matrix dim, assuming the per-neuron scales
+        # live on the larger one. That holds for the MLP (expansion >= 1) and is moot
+        # for square attention matrices, but with GQA the kv projections are
+        # (n_kv_head * head_dim, n_embd) — fan-in is the larger dim — so the heuristic
+        # keeps one scale per *input channel* instead of per output neuron. Same story
+        # for ve_gate (n_kv_head, 12) whenever n_kv_head < 12. Tag those params with an
+        # explicit red_dim = -1 (reduce over fan-in, keep one scale per output neuron);
+        # untagged params fall back to the heuristic in the optimizer.
+        assert normuon_fix in ("none", "kv", "kv_vegate"), f"unknown normuon_fix: {normuon_fix}"
+        fixed_suffixes = {
+            "none": (),
+            "kv": (".c_k.weight", ".c_v.weight"),
+            "kv_vegate": (".c_k.weight", ".c_v.weight", ".ve_gate.weight"),
+        }[normuon_fix]
+        for name, p in self.transformer.h.named_parameters():
+            if fixed_suffixes and name.endswith(fixed_suffixes):
+                p.red_dim = -1
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())

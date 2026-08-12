@@ -373,14 +373,25 @@ class MuonAdamW(torch.optim.Optimizer):
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
+        # NorMuon reduction dim for the factored second moment: honor an explicit
+        # per-param red_dim tag when present (see GPT.setup_optimizer); untagged params
+        # fall back to the heuristic of reducing over the smaller dim, which assumes
+        # the per-neuron scales live on the larger one. Params are grouped by shape,
+        # so all members of a group must resolve to the same red_dim.
+        resolved = {getattr(q, "red_dim", None) or (-1 if q.shape[-2] >= q.shape[-1] else -2) for q in params}
+        assert len(resolved) == 1, f"Muon group of shape {tuple(shape)} mixes red_dim values: {resolved}"
+        red_dim = resolved.pop()
+
         # Get or create group-level state
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            # One second-moment scale per kept (non-reduced) dim entry
+            state_shape = (chunk_size, shape[-2], 1) if red_dim == -1 else (chunk_size, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+            if rank == 0:
+                print(f"Muon group {tuple(shape)} x{len(params)}: NorMuon red_dim={red_dim}")
 
         stacked_owned = None
         if num_owned > 0:
